@@ -1,0 +1,229 @@
+<!doctype html>
+<!-- Composition: THE BIG OBJECT (blueprint). A dimensioned engineering drawing of the
+     x86_64 virtual address space; the 7 course topics are callouts pinned to its parts. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Advanced Linux Kernel Programming</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@600;700&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+svg { display: block; }
+:root {
+  --canvas-w:1920px; --canvas-h:1080px;
+  --bg:#123A66; --bg-2:#0D3054;
+  --line:#D8E8F8; --line-soft:rgb(216 232 248 / 0.45);
+  --grid:rgb(216 232 248 / 0.10);
+  --ink:#EAF2FB; --ink-muted:#9FB8D4;
+  --chart-1:#3E9BD6; --chart-2:#B8860B; --chart-3:#C75B9B; --chart-4:#6F9436;
+  --de-emphasis:#2A537F;
+  --font-display:'Saira Condensed',sans-serif; --font-body:'IBM Plex Mono',monospace;
+  --space-1:8px; --space-2:16px; --space-3:24px; --space-4:40px; --space-5:56px;
+}
+html, body { background:var(--bg); }
+body { width:var(--canvas-w); font-family:var(--font-body); color:var(--ink); }
+.canvas { position:relative; width:var(--canvas-w); height:var(--canvas-h); overflow:hidden;
+  background:
+    radial-gradient(ellipse at 45% 45%, rgb(255 255 255 / 0.05), transparent 65%),
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+    var(--bg);
+  background-size: 100% 100%, 40px 40px, 40px 40px, auto; }
+.frame { position:absolute; inset:12px; border:2px solid var(--line); pointer-events:none; }
+.frame::after { content:""; position:absolute; inset:5px; border:1px solid var(--line-soft); }
+.abs { position:absolute; }
+.display { font-family:var(--font-display); font-weight:700; text-transform:uppercase; letter-spacing:.04em; line-height:.95; }
+.kicker { font:500 16px/1.4 var(--font-body); color:var(--ink-muted); letter-spacing:.12em; text-transform:uppercase; }
+.title { font-size:92px; color:var(--ink); }
+.stand { font:400 19px/1.55 var(--font-body); color:var(--ink-muted); width:600px; }
+.hero-num { font-family:var(--font-display); font-weight:700; font-size:230px; line-height:.85; color:var(--ink); letter-spacing:.01em; }
+.hero-cap { font:500 16px/1.5 var(--font-body); color:var(--ink-muted); letter-spacing:.06em; text-transform:uppercase; }
+.addr { font:400 14px/1 var(--font-body); color:var(--ink-muted); text-align:right; width:250px; }
+.zone { font:500 13px/1.2 var(--font-body); color:var(--ink); text-align:center; width:196px; letter-spacing:.04em; }
+.zone.muted { color:var(--ink-muted); }
+.co { width:660px; height:96px; }
+.co-num { font-family:var(--font-display); font-weight:700; font-size:44px; color:var(--ink-muted); position:absolute; left:0; top:4px; }
+.co-title { font-family:var(--font-display); font-weight:600; font-size:28px; text-transform:uppercase; letter-spacing:.04em; color:var(--ink); position:absolute; left:64px; top:6px; width:380px; line-height:1; }
+.co-sub { font:400 14px/1.4 var(--font-body); color:var(--ink-muted); position:absolute; left:64px; top:42px; width:360px; }
+.inst { position:absolute; left:450px; top:4px; width:210px; }
+.inst-lbl { font:500 13px/1.2 var(--font-body); color:var(--ink); }
+.inst-lbl.m { color:var(--ink-muted); }
+.tb { position:absolute; left:1432px; top:858px; width:432px; height:178px; background:var(--bg-2);
+  border:2px solid var(--line); outline:1px solid var(--line-soft); outline-offset:3px; }
+.tb-row { display:flex; border-bottom:1px solid var(--line-soft); height:35px; align-items:center; }
+.tb-row:last-child { border-bottom:0; }
+.tb-k { width:100px; padding-left:12px; font:500 12px/1 var(--font-body); color:var(--ink-muted); letter-spacing:.08em; }
+.tb-v { flex:1; font:500 13px/1 var(--font-body); color:var(--ink); border-left:1px solid var(--line-soft); padding-left:12px; height:100%; display:flex; align-items:center; }
+.tb-v.big { font-family:var(--font-display); font-weight:700; font-size:17px; letter-spacing:.04em; }
+</style>
+</head>
+<body>
+<div class="canvas">
+
+<!-- ================= LINEWORK (drawing, dimensions, leaders) ================= -->
+<svg class="abs" style="left:0;top:0" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0 1 L10 5 L0 9 z" fill="#D8E8F8"/></marker>
+    <pattern id="hatch2" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="1.5" height="7" fill="#B8860B"/></pattern>
+    <pattern id="hatch1" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="1.5" height="7" fill="#3E9BD6"/></pattern>
+    <pattern id="hatchS" width="9" height="9" patternUnits="userSpaceOnUse" patternTransform="rotate(-45)">
+      <rect width="1" height="9" fill="rgb(216 232 248 / 0.35)"/></pattern>
+  </defs>
+
+  <!-- registration crosses (3 corners) -->
+  <g stroke="rgb(216 232 248 / 0.45)" stroke-width="1">
+    <path d="M40 60 h40 M60 40 v40"/><path d="M1840 60 h40 M1860 40 v40"/><path d="M40 1020 h40 M60 1000 v40"/>
+  </g>
+
+  <!-- ===== THE ADDRESS-SPACE COLUMN (x 900-1100) ===== -->
+  <!-- kernel space 90-390 -->
+  <rect x="900" y="90" width="200" height="300" fill="none" stroke="#D8E8F8" stroke-width="2.5"/>
+  <rect x="900" y="90" width="200" height="80" fill="url(#hatch2)" opacity=".85"/>
+  <line x1="900" y1="170" x2="1100" y2="170" stroke="#D8E8F8" stroke-width="1.25"/>
+  <line x1="900" y1="260" x2="1100" y2="260" stroke="#D8E8F8" stroke-width="1.25"/>
+  <!-- vsyscall tick near the top -->
+  <line x1="1060" y1="98" x2="1100" y2="98" stroke="#D8E8F8" stroke-width="2"/>
+  <!-- non-canonical hole 390-540 : break lines -->
+  <path d="M900 390 v150 M1100 390 v150" stroke="rgb(216 232 248 / 0.45)" stroke-width="1.25" stroke-dasharray="6 6"/>
+  <rect x="900" y="400" width="200" height="130" fill="url(#hatchS)"/>
+  <path d="M900 398 L920 392 L940 404 L960 392 L980 404 L1000 392 L1020 404 L1040 392 L1060 404 L1080 392 L1100 404" fill="none" stroke="#D8E8F8" stroke-width="1.25"/>
+  <path d="M900 532 L920 526 L940 538 L960 526 L980 538 L1000 526 L1020 538 L1040 526 L1060 538 L1080 526 L1100 538" fill="none" stroke="#D8E8F8" stroke-width="1.25"/>
+  <!-- user space 540-1000 -->
+  <rect x="900" y="540" width="200" height="460" fill="none" stroke="#D8E8F8" stroke-width="2.5"/>
+  <rect x="900" y="540" width="200" height="56" fill="url(#hatch1)" opacity=".9"/>
+  <g stroke="#D8E8F8" stroke-width="1.25">
+    <line x1="900" y1="596" x2="1100" y2="596"/><line x1="900" y1="700" x2="1100" y2="700"/>
+    <line x1="900" y1="880" x2="1100" y2="880"/><line x1="900" y1="936" x2="1100" y2="936"/>
+  </g>
+  <!-- growth arrows: stack down, heap up -->
+  <line x1="1000" y1="712" x2="1000" y2="760" stroke="rgb(216 232 248 / 0.45)" stroke-width="1.25" marker-end="url(#arr)"/>
+  <line x1="1000" y1="868" x2="1000" y2="820" stroke="rgb(216 232 248 / 0.45)" stroke-width="1.25" marker-end="url(#arr)"/>
+  <!-- ground line under the drawing -->
+  <line x1="860" y1="1016" x2="1140" y2="1016" stroke="rgb(216 232 248 / 0.45)" stroke-width="1"/>
+
+  <!-- ===== DIMENSION LINES (left of column, x 870) ===== -->
+  <g stroke="#D8E8F8" stroke-width="1">
+    <line x1="872" y1="92" x2="872" y2="388" marker-start="url(#arr)" marker-end="url(#arr)"/>
+    <line x1="872" y1="542" x2="872" y2="998" marker-start="url(#arr)" marker-end="url(#arr)"/>
+    <path d="M862 90 h36 M862 390 h36 M862 540 h36 M862 1000 h36" stroke="rgb(216 232 248 / 0.45)"/>
+  </g>
+  <!-- hero leader: from user-space dimension to the hero figure -->
+  <line x1="872" y1="770" x2="712" y2="770" stroke="#D8E8F8" stroke-width="1"/>
+  <circle cx="872" cy="770" r="4" fill="#D8E8F8"/>
+
+  <!-- ===== LEADERS to callouts (anchor on column right edge -> callout rows) ===== -->
+  <g fill="none" stroke="#D8E8F8" stroke-width="1">
+    <path d="M1100 98  H1150 L1172 118 H1196"/>
+    <path d="M1100 130 H1140 L1172 228 H1196"/>
+    <path d="M1100 160 H1130 L1172 338 H1196"/>
+    <path d="M1100 320 H1130 L1172 448 H1196"/>
+    <path d="M1100 465 H1130 L1172 558 H1196"/>
+    <path d="M1100 568 H1140 L1172 668 H1196"/>
+    <path d="M1100 650 H1140 L1172 778 H1196"/>
+  </g>
+  <g fill="#D8E8F8">
+    <circle cx="1100" cy="98" r="4"/><circle cx="1100" cy="130" r="4"/><circle cx="1100" cy="160" r="4"/>
+    <circle cx="1100" cy="320" r="4"/><circle cx="1100" cy="465" r="4"/><circle cx="1100" cy="568" r="4"/><circle cx="1100" cy="650" r="4"/>
+  </g>
+
+  <!-- ===== INSTRUMENTS (inside callout rows; callouts start x=1200) ===== -->
+  <!-- 01 row top=180: vmlinuz 15 MB vs ~50 MB in RAM. scale 200px = 50 MB -> 15 MB = 60px -->
+  <g transform="translate(1650 180)">
+    <rect x="0" y="22" width="60" height="14" fill="#3E9BD6" opacity=".85" stroke="#D8E8F8" stroke-width="1.5"/>
+    <rect x="0" y="62" width="200" height="14" fill="url(#hatch1)" stroke="#D8E8F8" stroke-width="1.5"/>
+  </g>
+  <!-- 07 row top=290: GPL-only exports 18,053 / 30,363 = 59.5% -> 0.595*200 = 119px -->
+  <g transform="translate(1650 290)">
+    <rect x="0" y="22" width="200" height="14" fill="none" stroke="#D8E8F8" stroke-width="1.5"/>
+    <rect x="0" y="22" width="119" height="14" fill="#B8860B" opacity=".9"/>
+    <line x1="119" y1="16" x2="119" y2="42" stroke="#D8E8F8" stroke-width="1.5"/>
+  </g>
+  <!-- 05 row top=400: 110 kernel threads as ticks, 2 rows x 55, pitch 3.6px -->
+  <g transform="translate(1650 400)" stroke="#6F9436" stroke-width="2">
+    <path id="ticks" d="M1 22v14M4.6 22v14M8.2 22v14M11.8 22v14M15.4 22v14M19 22v14M22.6 22v14M26.2 22v14M29.8 22v14M33.4 22v14M37 22v14M40.6 22v14M44.2 22v14M47.8 22v14M51.4 22v14M55 22v14M58.6 22v14M62.2 22v14M65.8 22v14M69.4 22v14M73 22v14M76.6 22v14M80.2 22v14M83.8 22v14M87.4 22v14M91 22v14M94.6 22v14M98.2 22v14M101.8 22v14M105.4 22v14M109 22v14M112.6 22v14M116.2 22v14M119.8 22v14M123.4 22v14M127 22v14M130.6 22v14M134.2 22v14M137.8 22v14M141.4 22v14M145 22v14M148.6 22v14M152.2 22v14M155.8 22v14M159.4 22v14M163 22v14M166.6 22v14M170.2 22v14M173.8 22v14M177.4 22v14M181 22v14M184.6 22v14M188.2 22v14M191.8 22v14M195.4 22v14"/>
+    <use href="#ticks" y="20"/>
+  </g>
+</svg>
+
+<!-- ================= TEXT ================= -->
+<div class="frame"></div>
+
+<!-- title zone -->
+<div class="abs kicker" style="left:96px;top:92px">Revision notes · DWG 01 · x86_64</div>
+<h1 class="abs display title" style="left:92px;top:128px;width:640px">Advanced<br>Linux Kernel<br>Programming</h1>
+<p class="abs stand" style="left:96px;top:420px">Rough class notes, turned into dimensioned revision sheets: boot images, address spaces, the vDSO, kernel threads, headers and modules.</p>
+
+<!-- hero -->
+<div class="abs" data-hero style="left:88px;top:640px;width:640px">
+  <div class="hero-num">128 TiB</div>
+</div>
+<div class="abs hero-cap" style="left:96px;top:866px;width:560px">User space per process<br>47-bit virtual addresses · 4-level paging</div>
+
+<!-- address labels -->
+<div class="abs addr" style="left:600px;top:83px">0xffff ffff ffff ffff</div>
+<div class="abs addr" style="left:600px;top:383px">0xffff 8000 0000 0000</div>
+<div class="abs addr" style="left:600px;top:533px">0x0000 7fff ffff ffff</div>
+<div class="abs addr" style="left:600px;top:993px">0x0000 0000 0000 0000</div>
+<div class="abs addr" style="left:600px;top:232px;color:var(--ink)">KERNEL · 128 TiB</div>
+
+<!-- zone labels inside the column -->
+<div class="abs zone" style="left:902px;top:120px;background:var(--bg);width:150px;margin-left:25px;padding:2px 0">TEXT · MODULES</div>
+<div class="abs zone muted" style="left:902px;top:206px">vmalloc · vmemmap</div>
+<div class="abs zone muted" style="left:902px;top:317px">direct map</div>
+<div class="abs zone" style="left:902px;top:446px;background:var(--bg);width:170px;margin-left:15px;padding:3px 0">NON-CANONICAL<br><span style="color:var(--ink-muted)">access → #GP</span></div>
+<div class="abs zone" style="left:902px;top:560px;background:var(--bg);width:150px;margin-left:25px;padding:2px 0">[stack] [vdso]</div>
+<div class="abs zone muted" style="left:902px;top:640px">mmap · libc.so.6</div>
+<div class="abs zone muted" style="left:902px;top:900px">[heap]</div>
+<div class="abs zone muted" style="left:902px;top:960px">text · data</div>
+
+<!-- callouts: rows at top = 70 + 110*i, x = 1200 -->
+<div class="abs co" style="left:1200px;top:70px">
+  <div class="co-num">02</div><div class="co-title">Distro vs vendor kernels</div>
+  <div class="co-sub">kernel.org → Ubuntu / BSP (qcom, mtk) → GKI + vendor modules</div>
+</div>
+<div class="abs co" style="left:1200px;top:180px">
+  <div class="co-num">01</div><div class="co-title">/boot &amp; kernel images</div>
+  <div class="co-sub">bzImage = PE32+ · zstd · System.map vs kallsyms</div>
+  <div class="inst"><div class="inst-lbl" style="position:absolute;left:68px;top:20px">15 MB vmlinuz</div>
+    <div class="inst-lbl m" style="position:absolute;left:0;top:82px">≈50 MB image in RAM</div></div>
+</div>
+<div class="abs co" style="left:1200px;top:290px">
+  <div class="co-num">07</div><div class="co-title">Loadable modules</div>
+  <div class="co-sub">MODULE_LICENSE · .modinfo · vermagic · 94 loaded</div>
+  <div class="inst"><div class="inst-lbl" style="position:absolute;left:0;top:44px">59% of exports GPL-only</div></div>
+</div>
+<div class="abs co" style="left:1200px;top:400px">
+  <div class="co-num">05</div><div class="co-title">PID 0 · 1 · 2</div>
+  <div class="co-sub">idle → systemd, kthreadd → every kernel thread</div>
+  <div class="inst"><div class="inst-lbl" style="position:absolute;left:0;top:64px">110 kernel threads</div></div>
+</div>
+<div class="abs co" style="left:1200px;top:510px">
+  <div class="co-num">03</div><div class="co-title">User / kernel split</div>
+  <div class="co-sub">mapped vs unmapped · page faults · copy_from_user()</div>
+</div>
+<div class="abs co" style="left:1200px;top:620px">
+  <div class="co-num">04</div><div class="co-title">vDSO &amp; vsyscall</div>
+  <div class="co-sub">clock_gettime() with no syscall · legacy 0xffffffffff600000</div>
+</div>
+<div class="abs co" style="left:1200px;top:730px">
+  <div class="co-num">06</div><div class="co-title">Kernel headers</div>
+  <div class="co-sub">include/linux · linux-headers package · UAPI → libc</div>
+</div>
+
+<!-- title block (footer device) -->
+<div class="tb">
+  <div class="tb-row"><div class="tb-k">TITLE</div><div class="tb-v big">ADVANCED LINUX KERNEL PROGRAMMING</div></div>
+  <div class="tb-row"><div class="tb-k">DWG NO</div><div class="tb-v">ALKP-01 · SECTIONS 1–7</div></div>
+  <div class="tb-row"><div class="tb-k">SCALE</div><div class="tb-v">NOT TO SCALE (hole ≈ 2^64 − 2^48)</div></div>
+  <div class="tb-row"><div class="tb-k">SOURCE</div><div class="tb-v">Ubuntu 24.04 test box · 6.8 · 2026-09</div></div>
+  <div class="tb-row"><div class="tb-k">NOTES</div><div class="tb-v">see NOTES.md</div></div>
+</div>
+
+</div>
+</body>
+</html>
