@@ -56,3 +56,11 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Secrets and private files: never commit
+.env.*
+*.pem
+*.key
+id_*
+CLAUDE.md
+.claude/
