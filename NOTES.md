@@ -9,6 +9,7 @@
 - [5. The First Processes: PID 0, PID 1 (`init`) and PID 2 (`kthreadd`)](#5-the-first-processes-pid-0-pid-1-init-and-pid-2-kthreadd)
 - [6. Kernel Headers: In-Tree, Module-Build and UAPI](#6-kernel-headers-in-tree-module-build-and-uapi)
 - [7. Loadable Kernel Modules (LKMs)](#7-loadable-kernel-modules-lkms)
+- [8. Linux Capabilities](#8-linux-capabilities)
 - [Labs & Exercises](#labs--exercises)
 - [Quick Reference](#quick-reference)
 - [Glossary](#glossary)
@@ -1138,6 +1139,124 @@ awk '{print $4}' /lib/modules/$(uname -r)/build/Module.symvers | sort | uniq -c 
 
 ---
 
+## 8. Linux Capabilities
+
+*Raw notes: "kernel capabilities and where to find them and what they do". Interpreted as **Linux (POSIX) capabilities** (`CAP_*`). **⚠️ Verify**: if the instructor meant kernel features/config options, see `/boot/config-$(uname -r)` (Section 1).*
+
+### Overview
+
+Traditional UNIX has two privilege levels: root (UID 0, bypasses all checks) and everyone else. **Capabilities** split root's power into ~41 independent privileges (`CAP_NET_ADMIN`, `CAP_SYS_MODULE`, …) that can be given to a process or file individually. The kernel checks **the specific capability** an operation needs, not "is this root?". This is the basis of least privilege for daemons, containers and `setcap` binaries.
+
+### Key concepts
+
+- Each thread has **five capability sets** (bitmasks, visible in `/proc/<pid>/status`):
+
+| Set | Field | Meaning |
+| --- | ----- | ------- |
+| **Effective** | `CapEff` | What the kernel actually checks right now |
+| **Permitted** | `CapPrm` | Upper limit the thread may raise into Effective |
+| **Inheritable** | `CapInh` | May be passed across `execve()` (only with matching file caps) |
+| **Bounding** | `CapBnd` | Hard ceiling: can never be gained, even via setuid-root/file caps |
+| **Ambient** | `CapAmb` | Kept across `execve()` of non-privileged programs (4.3+) |
+
+- **File capabilities** (xattr `security.capability`) give a binary specific capabilities at `exec` without setuid root. Test box: `/usr/bin/ping cap_net_raw=ep` (e = effective, p = permitted).
+- Capabilities are **per user namespace**: root in a container has capabilities only over resources owned by its namespace (`ns_capable()`).
+- `CAP_SYS_ADMIN` is the overloaded "new root": avoid depending on it in new code; prefer a specific capability.
+
+Test box, 28 Sep 2026 (`cap_last_cap` = 40, i.e. 41 capabilities, bits 0–40 → mask `0x1ffffffffff`):
+
+| Process | `CapEff` | Meaning |
+| ------- | -------- | ------- |
+| Normal shell (user `alex`) | `0000000000000000` | No capabilities |
+| PID 1 (systemd, root) | `000001ffffffffff` | All 41 |
+| Everyone | `CapBnd` `000001ffffffffff` | Nothing removed from the bounding set |
+
+### Capabilities met so far in the course
+
+| Capability | # | Grants | Section |
+| ---------- | - | ------ | ------- |
+| `CAP_SYS_MODULE` | 16 | Load/unload kernel modules (`init_module`, `finit_module`, `delete_module`) | 7 |
+| `CAP_SYSLOG` | 34 | See real kernel addresses when `kptr_restrict=1`; read `dmesg` when `dmesg_restrict=1` | 1 |
+| `CAP_NET_RAW` | 13 | Raw/packet sockets (`ping`) | — |
+| `CAP_NET_ADMIN` | 12 | Network configuration (interfaces, routes, firewall) | — |
+| `CAP_NET_BIND_SERVICE` | 10 | Bind ports < 1024 | — |
+| `CAP_SYS_ADMIN` | 21 | Catch-all: mount, many ioctls, … | — |
+| `CAP_SYS_PTRACE` | 19 | `ptrace` any process, read others' `/proc/<pid>/mem` | — |
+| `CAP_PERFMON` / `CAP_BPF` | 38 / 39 | Performance monitoring / BPF, split from `CAP_SYS_ADMIN` in 5.8 | — |
+| `CAP_CHECKPOINT_RESTORE` | 40 | CRIU checkpoint/restore (last one, `CAP_LAST_CAP`) | — |
+
+### Key APIs / structures (kernel side)
+
+| API | Header | Purpose | Context |
+| --- | ------ | ------- | ------- |
+| `capable(CAP_X)` | `<linux/capability.h>` | Does `current` have `CAP_X` in the **initial** user namespace? Sets `PF_SUPERPRIV`, runs LSM hooks | Process context |
+| `ns_capable(ns, CAP_X)` | `<linux/capability.h>` | Same, relative to user namespace `ns` | Process context |
+| `file_ns_capable(file, ns, CAP_X)` | `<linux/capability.h>` | Check against the credentials of whoever **opened** `file` | Process context |
+| `has_capability(task, CAP_X)` | `<linux/capability.h>` | Check another task without auditing | Process context |
+| `struct cred` (`cap_effective`, …) | `<linux/cred.h>` | Where the sets live (`current_cred()`) | Any (RCU) |
+
+### Code example
+
+Typical permission check in a driver's `ioctl` handler (fragment):
+
+```c
+#include <linux/capability.h>	/* capable(), CAP_* constants */
+#include <linux/fs.h>		/* struct file */
+
+static long demo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) /* ioctl entry point */
+{							/* start of demo_ioctl() */
+	if (!capable(CAP_SYS_ADMIN))			/* privileged operation: require CAP_SYS_ADMIN (initial userns) */
+		return -EPERM;				/* caller lacks it: "Operation not permitted" */
+	/* ... privileged work goes here ... */	/* only reached by sufficiently privileged callers */
+	return 0;					/* success */
+}							/* end of demo_ioctl() */
+```
+
+Check the **narrowest** capability that fits (e.g. `CAP_NET_ADMIN` for network settings). Return `-EPERM` for a missing capability (`-EACCES` is for file permission bits).
+
+### Commands / debugging
+
+```sh
+grep ^Cap /proc/$$/status                 # the five sets of the current shell (hex bitmasks)
+capsh --decode=000001ffffffffff           # hex mask → capability names
+capsh --print                             # current process's capabilities, readable
+cat /proc/sys/kernel/cap_last_cap         # highest capability number this kernel knows (40)
+getcap /usr/bin/ping                      # file capabilities of a binary
+sudo setcap cap_net_bind_service=ep ./srv # give a binary one capability (ask first on the test box)
+getpcaps <pid>                            # capabilities of another process
+man 7 capabilities                        # full list and rules
+```
+
+### Pitfalls
+
+- Checking `uid == 0` in kernel code instead of `capable()`: breaks with namespaces and bypasses LSMs.
+- Using `capable()` when the resource belongs to a user namespace (should be `ns_capable()`), or vice versa. A container root could get host-wide power.
+- Checking capabilities at `read`/`write` time rather than at `open` (use `file_ns_capable()` with the opener's creds). Otherwise a privileged process can be tricked into writing to an fd for an unprivileged one.
+- Many capabilities are **root-equivalent** in practice (`CAP_SYS_MODULE`: load any code into the kernel; `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_DAC_OVERRIDE`…). Granting them is not "least privilege".
+
+### Revision questions
+
+1. What is the difference between the Permitted, Effective and Bounding sets?
+2. Why can `ping` send raw ICMP packets without being setuid root on Ubuntu?
+3. Which capability does `insmod` need, and why is it effectively root-equivalent?
+
+<details>
+<summary>Answers</summary>
+
+1. Effective = what is checked now; Permitted = what may be raised into Effective; Bounding = absolute ceiling that no `exec` can exceed.
+2. The binary has the file capability `cap_net_raw=ep`, so it gains only `CAP_NET_RAW` at exec. (Many systems also allow unprivileged ICMP sockets via `net.ipv4.ping_group_range`.)
+3. `CAP_SYS_MODULE`. A module runs arbitrary code in kernel mode, so it can grant itself anything.
+
+</details>
+
+### Source pointers
+
+- `include/uapi/linux/capability.h` (the `CAP_*` numbers), `include/linux/capability.h`
+- `kernel/capability.c` (`capable()`, `ns_capable()`), `security/commoncap.c` (exec-time rules, `cap_capable()`)
+- `include/linux/cred.h`, `man 7 capabilities`, `man 7 user_namespaces`
+
+---
+
 ## Labs & Exercises
 
 *None yet.*
@@ -1180,6 +1299,10 @@ awk '{print $4}' /lib/modules/$(uname -r)/build/Module.symvers | sort | uniq -c 
 | `.modinfo` / `modinfo` | Embedded module metadata: license, parm, vermagic, depends, alias |
 | `EXPORT_SYMBOL_GPL` | Only usable by GPL-compatible modules (~60 % of exports on 6.8) |
 | sched_ext (`CONFIG_SCHED_CLASS_EXT`, 6.12+) | Custom scheduler policies via BPF, not modules |
+| `grep ^Cap /proc/$$/status` / `capsh --decode=<hex>` | Show and decode capability sets |
+| `getcap` / `setcap` | Read/set file capabilities |
+| `capable(CAP_X)` / `ns_capable()` | Kernel-side capability checks; return `-EPERM` if missing |
+| `CAP_SYS_MODULE` (16) | Needed to load/unload modules |
 | `ps --ppid 2` | List kernel threads (children of `kthreadd`) |
 | `[name]` in `ps`, `VSZ 0` | Kernel thread: no cmdline, no user `mm` |
 | `kthread_run()` / `kthread_stop()` / `kthread_should_stop()` | Kernel thread lifecycle |
@@ -1245,6 +1368,9 @@ awk '{print $4}' /lib/modules/$(uname -r)/build/Module.symvers | sort | uniq -c 
 | **`.modinfo`** | ELF section of a `.ko` holding `key=value` module metadata. |
 | **modversions** | Per-symbol CRC checking of module imports against the kernel (`CONFIG_MODVERSIONS`). |
 | **vermagic** | Module string recording kernel version and key config; must match the running kernel. |
+| **Capability** | One independent slice of root's privileges (`CAP_*`), checked by the kernel per operation. |
+| **Capability sets** | Effective, Permitted, Inheritable, Bounding, Ambient bitmasks per thread. |
+| **File capabilities** | Capabilities attached to an executable (`security.capability` xattr) and granted at `exec`. |
 | **Idle task (PID 0)** | Static `init_task` (`swapper`); per-CPU idle loop; parent of PIDs 1 and 2. |
 | **`init` (PID 1)** | First user-space process (systemd); adopts orphans; its exit panics the kernel. |
 | **Kernel thread** | Task running only in kernel mode with no user address space (`mm == NULL`). |
@@ -1275,4 +1401,5 @@ awk '{print $4}' /lib/modules/$(uname -r)/build/Module.symvers | sort | uniq -c 
 - vsyscall as "wrapper for all syscalls, choosing int/syscall/sysenter": is this about the 32-bit `__kernel_vsyscall` (vDSO), rather than the x86_64 vsyscall page? And is `syscall` (not `sysenter`) the modern x86_64 instruction?
 - Licensing of out-of-tree proprietary modules: what is the course's position (derivative work or not)?
 - Modules "cannot affect low-level scheduling (until 7.1/7.2)": what changed in 7.1/7.2? sched_ext (BPF) has existed since 6.12.
+- "Kernel capabilities and where to find them": POSIX capabilities (`CAP_*`), or kernel features/config options?
 - Does the course expect us to boot custom kernels via `vng` only, or also install them into `/boot` on the test box?
