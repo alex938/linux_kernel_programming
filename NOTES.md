@@ -1032,21 +1032,16 @@ MODULE_AUTHOR("Advanced Linux Kernel Programming course");	/* shown by modinfo *
 ```
 
 ```make
-# Kbuild: build hello.c into the loadable module hello.ko
+# Build hello.c as a loadable kernel module (hello.ko)
 obj-m += hello.o
 
-# Kernel build tree to build against; defaults to the running kernel's headers
-KDIR ?= /lib/modules/$(shell uname -r)/build
-
-# Default target: invoke the kernel's build system for this external module
+# Default target: use the running kernel's build tree to compile this directory
 all:
-# -C: run make in the kernel tree; M=: location of this module's sources
-	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 
-# Remove all build artefacts (.o, .ko, .mod.c, ...)
+# Remove all build artefacts
 clean:
-# Let the kernel build system clean this module directory
-	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
 ```
 
 `modinfo hello.ko` on the test box: `license: GPL`, `vermagic: 6.8.0-139-generic SMP preempt mod_unload modversions`, `parm: count:… (int)`. The build prints "Skipping BTF generation … unavailability of vmlinux", which is harmless.
