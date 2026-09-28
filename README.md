@@ -21,6 +21,7 @@ Revision notes from an Advanced Linux Kernel Programming course: rough class not
 5. PID 0, PID 1 and PID 2 (`kthreadd`), kernel threads
 6. Kernel headers: in-tree, module-build and UAPI
 7. Loadable kernel modules
+8. Linux capabilities
 
 ## Building an example
 

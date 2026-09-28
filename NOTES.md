@@ -1,7 +1,10 @@
 # Advanced Linux Kernel Programming: Revision Notes
 
+**How to use these notes:** read the **Remember** box at the top of each section first. It holds the facts you must know. The rest of the section explains them. Blocks marked ▶ are optional deep dives: skip them on a first pass. Test yourself with the revision questions at the end of each section.
+
 ## Contents
 
+- [Big Picture](#big-picture)
 - [1. Where the Kernel Lives: `/boot` and Kernel Images](#1-where-the-kernel-lives-boot-and-kernel-images)
 - [2. Where Kernels Come From: Distribution vs Vendor (BSP) Kernels](#2-where-kernels-come-from-distribution-vs-vendor-bsp-kernels)
 - [3. Virtual Address Space: User/Kernel Split](#3-virtual-address-space-userkernel-split)
@@ -17,61 +20,115 @@
 
 ---
 
+## Big Picture
+
+How the topics so far fit together:
+
+```text
+power on → firmware → bootloader (GRUB)
+                          └─ loads /boot/vmlinuz + initramfs ........................ §1
+                                └─ kernel decompresses itself, start_kernel()
+                                      └─ PID 0 (idle) creates PID 1 (init/systemd)
+                                         and PID 2 (kthreadd → all kernel threads) .. §5
+
+every process sees one virtual address space:
+      low half  = user space (private per process) .................................. §3
+      high half = kernel space (shared, kernel mode only) ........................... §3
+      a few kernel pages mapped into user space: [vdso], [vsyscall] ................. §4
+
+extending the running kernel:
+      module source ── built against the matching headers (§6) ──> .ko ── insmod ─> §7
+      permission to load it (and other privileged operations): capabilities ......... §8
+
+where the running kernel came from: kernel.org → distro / vendor BSP / Android GKI .. §2
+```
+
+**Golden rule so far:** *installed ≠ running*. Everything you build (modules, headers) must match the **running** kernel: `uname -r`.
+
+---
+
 ## 1. Where the Kernel Lives: `/boot` and Kernel Images
+
+> **Remember**
+>
+> - The kernel is a **file in `/boot`**, loaded once at boot by the **bootloader**. It is not a process.
+> - Several kernels can be **installed**, but only one is **running**. Check with `uname -r`.
+> - `vmlinuz` = compressed, bootable image. `vmlinux` = uncompressed ELF with symbols, used by debuggers.
+> - The **initramfs** is a temporary RAM root filesystem. Its job is to mount the real root filesystem.
+> - `System.map` = static, link-time symbol addresses. `/proc/kallsyms` = live addresses (these include the KASLR offset), hidden from non-root by `kptr_restrict`.
+> - Modules are **not** in `/boot`. They are in `/lib/modules/$(uname -r)/`.
 
 ### Overview
 
-On a typical distribution the kernel is an ordinary file in **`/boot`**. The **bootloader** (GRUB on x86_64) loads it, plus an **initramfs**, into memory and jumps to it. Knowing which files sit there, and how they relate to the *running* kernel, is the first step before building modules or custom kernels: they must match the running kernel's version and config.
+On a typical distribution the kernel is an ordinary file in **`/boot`**. The **bootloader** (GRUB on x86_64) loads it, plus an **initramfs**, into memory and jumps to it. Before you build modules or custom kernels, you need to know which files are there and how they relate to the *running* kernel, because everything you build must match it.
 
-### Key concepts
+### What is in `/boot`
 
-- The kernel is **not** a process or a program started from a filesystem at runtime. It is loaded once at boot by the bootloader and runs until shutdown.
-- `/boot` holds **one set of files per installed kernel version**, suffixed with the release string (`uname -r`), e.g. `6.8.0-139-generic`.
-- **Installed ≠ running.** Several kernels can be installed; only one is running. Always check `uname -r`.
-- Loadable modules do **not** live in `/boot`; they live in `/lib/modules/$(uname -r)/`.
-
-### How it works
-
-Contents of `/boot` on the test box (Ubuntu 24.04):
+One set of files per installed kernel, suffixed with the release string (e.g. `6.8.0-139-generic`):
 
 | File | What it is |
 | ---- | ---------- |
-| `vmlinuz-<ver>` | **Compressed, bootable kernel image** (on x86 a **bzImage**: real-mode setup code + a self-decompressing payload). This is what GRUB loads. |
-| `initrd.img-<ver>` | **initramfs**: compressed `cpio` archive unpacked into a RAM-based root filesystem. Contains the drivers and scripts needed to find and mount the real root filesystem (e.g. LVM, disk encryption, storage drivers built as modules). |
-| `System.map-<ver>` | Kernel **symbol table**: address, type, name for every kernel symbol. Used for debugging when `/proc/kallsyms` is not available. |
-| `config-<ver>` | The `.config` the kernel was built with (all `CONFIG_*` options). |
-| `vmlinuz`, `initrd.img` | Symlinks to the **newest installed** kernel (default boot entry). |
-| `vmlinuz.old`, `initrd.img.old` | Symlinks to the previous kernel (fallback). |
-| `grub/` | GRUB configuration (`grub.cfg` is generated by `update-grub`; do not edit by hand). |
+| `vmlinuz-<ver>` | **Compressed, bootable kernel image** (on x86 a **bzImage**). GRUB loads this. |
+| `initrd.img-<ver>` | **initramfs**: compressed `cpio` archive unpacked into RAM as the first root filesystem. Holds the drivers and scripts needed to mount the real root (storage drivers, LVM, disk encryption). |
+| `System.map-<ver>` | Kernel **symbol table** (address, type, name) at link-time addresses |
+| `config-<ver>` | The `.config` the kernel was built with (every `CONFIG_*` option) |
+| `vmlinuz`, `initrd.img` | Symlinks to the **newest installed** kernel (default boot entry) |
+| `vmlinuz.old`, `initrd.img.old` | Symlinks to the previous kernel (fallback) |
+| `grub/` | GRUB config (`grub.cfg` is generated by `update-grub`; do not edit it by hand) |
 
-Boot flow (x86_64, BIOS/UEFI + GRUB):
+### Boot flow (x86_64)
 
 ```text
 Firmware (UEFI/BIOS)
    └─> GRUB  (reads /boot/grub/grub.cfg)
          ├─ loads /boot/vmlinuz-<ver>      (kernel image)
          ├─ loads /boot/initrd.img-<ver>   (initramfs)
-         └─ passes command line  (see /proc/cmdline)
+         └─ passes the command line        (see /proc/cmdline)
                └─> kernel decompresses itself, initialises
                      └─> unpacks initramfs as rootfs, runs /init
                            └─> mounts real root (/), switch_root
-                                 └─> /sbin/init (systemd), PID 1
+                                 └─> /sbin/init (systemd) = PID 1   (§5)
 ```
 
-`vmlinuz` vs `vmlinux`:
+**ARM64:** the build output is `arch/arm64/boot/Image` (or `Image.gz`). There is **no self-decompressor**, so the bootloader must unpack `Image.gz` itself. The Pi 5 boots `/boot/firmware/kernel_2712.img` through its own firmware (`config.txt`), not GRUB.
+
+### `vmlinuz` vs `vmlinux`
 
 | | `vmlinux` | `vmlinuz` / `bzImage` |
 | - | --------- | --------------------- |
-| Format | Uncompressed ELF with full symbols (and debug info if `CONFIG_DEBUG_INFO`) | Compressed, bootable, stripped |
-| Produced at | Top of the build tree (`linux/vmlinux`) | `arch/x86/boot/bzImage` (installed as `/boot/vmlinuz-<ver>`) |
+| Format | Uncompressed ELF, full symbols (+ debug info with `CONFIG_DEBUG_INFO`) | Compressed, bootable, stripped |
+| Built at | Top of the build tree | `arch/x86/boot/bzImage` → installed as `/boot/vmlinuz-<ver>` |
 | Used for | Debugging: `gdb`, `crash`, `perf`, `addr2line` | Booting |
-| Distro location | Debug-symbol package, e.g. `/usr/lib/debug/boot/vmlinux-<ver>` (Ubuntu `linux-image-<ver>-dbgsym`) | `/boot` |
+| On Ubuntu | Debug-symbol package (`linux-image-<ver>-dbgsym`) → `/usr/lib/debug/boot/` | `/boot` |
 
-ARM64 difference: the build output is `arch/arm64/boot/Image` (uncompressed) or `Image.gz`. On the Raspberry Pi 5 the kernel is `/boot/firmware/kernel_2712.img` (initramfs `initramfs_2712`), loaded by the Pi firmware (`config.txt`), not GRUB (checked on the note-taking Pi).
+### How the kernel is entered
 
-#### Identifying a kernel image with `file`
+The bootloader-to-kernel handoff (CPU mode, registers, where parameters are) is **architecture-specific**. On x86 one `bzImage` file is built to be several kinds of executable at once:
 
-On the test box (images are `0600`, so `file` needs root):
+| Boot path | How it enters the kernel |
+| --------- | ------------------------ |
+| **Legacy BIOS** (the test box) | GRUB loads the image, fills in the **setup header** (the "boot protocol") and jumps to the setup code or the 32/64-bit entry point |
+| **UEFI** | With `CONFIG_EFI_STUB=y` the bzImage is **also a PE32+ executable**, so UEFI firmware can run it directly as an EFI application. The **EFI stub** then calls the kernel's entry code. |
+| **ARM64** | The bootloader jumps to `Image` with the MMU off and the Device Tree's address in register `x0`. It can also be an EFI application via the EFI stub. |
+| **Android** | A raw `boot` **partition** holds `boot.img` (`ANDROID!` header + kernel `Image.gz` + ramdisk), parsed by the vendor bootloader. **⚠️ Verify** what the instructor meant (see Open Questions). |
+
+<details>
+<summary>▶ Deep dive: inside a bzImage (layout, <code>file</code> output, PE header bytes)</summary>
+
+**Layout:**
+
+```text
+offset 0x000  ┌──────────────────────────────┐  "MZ": DOS/PE header (for UEFI)
+              │ legacy boot sector (512 B)   │  now only prints "Use a boot loader."
+offset 0x1F1  │ setup header ("HdrS" @0x202) │  boot-protocol fields filled in by GRUB
+              ├──────────────────────────────┤
+              │ real-mode setup code         │  BIOS path: 16-bit → protected → long mode
+              ├──────────────────────────────┤
+              │ compressed kernel + stub     │  decompressor, then start of vmlinux
+              └──────────────────────────────┘
+```
+
+**`file` output** (test box; images are mode `0600`, so run it with `sudo`):
 
 ```text
 $ sudo file /boot/vmlinuz-6.8.0-142-generic
@@ -82,40 +139,12 @@ vmlinuz-6.8.0-142-generic: Linux kernel x86 boot executable bzImage,
 
 | Field | Meaning |
 | ----- | ------- |
-| `x86 boot executable bzImage` | x86 boot image format (setup code + compressed kernel) |
-| `version 6.8.0-142-generic (buildd@…)` | Kernel release, plus the user@host that built it (Ubuntu's build farm) |
-| `#142-Ubuntu SMP PREEMPT_DYNAMIC <date>` | Build number and key features, the same string as `uname -v`: SMP kernel, preemption model selectable at boot (`preempt=none/voluntary/full`, `CONFIG_PREEMPT_DYNAMIC=y`) |
-| `RO-rootFS`, `swap_dev 0XE`, `Normal VGA` | Values `file` decodes from the old boot-sector header (`root_flags`, a legacy field, `vid_mode`). Obsolete, ignored by modern bootloaders. **⚠️ Verify:** `file`'s "swap_dev" label for the field at offset `0x1FA`/`0x1F8`. |
+| `bzImage` | x86 boot format: setup code + compressed kernel |
+| `version … (buildd@…)` | Kernel release and the user@host that built it (Ubuntu build farm) |
+| `#142-Ubuntu SMP PREEMPT_DYNAMIC` | Same string as `uname -v`: SMP kernel, preemption model chosen at boot (`preempt=`) |
+| `RO-rootFS`, `swap_dev 0XE`, `Normal VGA` | Obsolete legacy header fields, ignored by modern bootloaders. **⚠️ Verify:** which field `file` labels `swap_dev`. |
 
-(Tip from class: `sudo !!` re-runs the previous command as root.)
-
-#### How the kernel is entered (varies by architecture)
-
-The kernel receives control from the low-level bootloader, and the **handoff contract is architecture-specific**: which CPU mode, which registers hold what, and where the boot parameters are.
-
-A single x86 `bzImage` is built to be several kinds of executable at once:
-
-```text
-bzImage file layout (x86)
-offset 0x000  ┌──────────────────────────────┐  "MZ" magic: DOS/PE header (for UEFI)
-              │ legacy boot sector (512 B)   │  once a real floppy boot sector; now only
-              │                              │  prints "Use a boot loader." if booted directly
-offset 0x1F1  │ setup header ("HdrS" @0x202) │  boot protocol fields filled in by GRUB
-              ├──────────────────────────────┤
-              │ real-mode setup code         │  BIOS path: 16-bit setup → protected → long mode
-              ├──────────────────────────────┤
-              │ compressed kernel + stub     │  decompressor, then start of vmlinux
-              └──────────────────────────────┘
-```
-
-| Boot path | How it enters the kernel |
-| --------- | ------------------------ |
-| **Legacy BIOS** (e.g. GRUB on the test box, which boots via BIOS) | GRUB loads the image, fills in the setup header ("boot protocol"), and jumps to the setup code or straight to the 32/64-bit entry point. *Raw notes said the boot executable boots from sector 0 of the disk: that was the pre-2.6.24 floppy boot sector at offset 0 of the image. It no longer works; a bootloader is always needed.* |
-| **UEFI** | With `CONFIG_EFI_STUB=y` (test box: yes) the bzImage is also a **PE32+** executable (hence the `MZ` header), so UEFI firmware, GRUB or systemd-boot can run it as an EFI application. The **EFI stub** then calls the kernel's own entry code. *Raw notes said "uefa: pe32"; correct is UEFI, PE32+ on 64-bit.* |
-| **Android** | *Raw notes said "android pe32 embedded in the /boot partition". **⚠️ Verify** what was meant.* Android devices have a raw **`boot` partition** (not a mounted `/boot` directory) holding a **boot image** (`boot.img`: `ANDROID!` magic header + kernel `Image.gz` + ramdisk; with GKI, Android 13+, the vendor ramdisk moves to `vendor_boot`). The bootloader (e.g. Qualcomm's ABL) parses that header; the kernel inside is an ARM64 `Image`, which contains a PE header only if built with the EFI stub. |
-| **ARM64** | The bootloader jumps to `Image` at EL2 (or EL1) with the MMU off and the Device Tree's physical address in `x0` (`Documentation/arch/arm64/booting.rst`). `Image` can also be a PE/COFF EFI application via the EFI stub. |
-
-**Seeing the PE header in a real image** (test box, from class):
+**Hexdump: the PE header** (from class):
 
 ```text
 $ sudo hexdump -C /boot/vmlinuz-6.8.0-142-generic | head
@@ -127,274 +156,245 @@ $ sudo hexdump -C /boot/vmlinuz-6.8.0-142-generic | head
 
 | Offset | Bytes | Meaning |
 | ------ | ----- | ------- |
-| `0x00` | `4d 5a` | `"MZ"`: DOS header magic that every Windows-style PE file starts with |
-| `0x38` | `cd 23 82 81` | `0x818223cd` = `LINUX_PE_MAGIC` (`include/linux/pe.h`), marks a Linux EFI-stub image |
-| `0x3C` | `40 00 00 00` | `e_lfanew` = `0x40`: offset of the PE header |
+| `0x00` | `4d 5a` | `"MZ"`: DOS header magic that every PE file starts with |
+| `0x38` | `cd 23 82 81` | `LINUX_PE_MAGIC` (`0x818223cd`, `include/linux/pe.h`) |
+| `0x3C` | `40 00 00 00` | `e_lfanew`: the PE header is at `0x40` |
 | `0x40` | `50 45 00 00` | `"PE\0\0"` signature |
-| `0x44` | `64 86` | Machine `0x8664` = x86-64 (AMD64) |
-| `0x46` | `04 00` | 4 sections |
-| `0x54` | `a0 00` | Size of optional header (`0xa0`) |
-| `0x58` | `0b 02` | Optional-header magic `0x020b` = **PE32+** (64-bit); plain PE32 would be `0x010b` |
+| `0x44` | `64 86` | Machine `0x8664` = x86-64 |
+| `0x58` | `0b 02` | Optional-header magic `0x020b` = **PE32+** (64-bit) |
 
 So the same file is both a bzImage (for GRUB/BIOS) and a PE32+ EFI application (for UEFI).
 
-```sh
-uname -r      # kernel release, e.g. 6.8.0-139-generic
-uname -m      # machine hardware: x86_64 (test box), aarch64 (Pi 5)
-uname -v      # build string: #139-Ubuntu SMP PREEMPT_DYNAMIC <date>
-uname -a      # everything
-[ -d /sys/firmware/efi ] && echo UEFI || echo BIOS   # how this machine booted (test box: BIOS)
-```
+</details>
 
-#### Kernel image compression
+### Kernel image compression
 
-The "z" in `vmlinuz` means *compressed*. On x86 the compression is chosen at build time with a Kconfig choice under *General setup → Kernel compression mode* (`init/Kconfig`). The `bzImage` holds a small decompressor (`arch/x86/boot/compressed/`) that unpacks the kernel in place at boot.
+The "z" in `vmlinuz` means *compressed*. The algorithm is chosen at build time (*General setup → Kernel compression mode*), and a small decompressor inside the bzImage unpacks the kernel at boot.
 
-| Option | Algorithm | Trade-off |
-| ------ | --------- | --------- |
-| `CONFIG_KERNEL_GZIP` | gzip | Historic default; moderate ratio and speed; supported everywhere |
-| `CONFIG_KERNEL_BZIP2` | bzip2 | Better ratio than gzip, slow; now rarely used |
-| `CONFIG_KERNEL_LZMA` | LZMA | Very good ratio, slow decompression |
-| `CONFIG_KERNEL_XZ` | xz (LZMA2) | Best ratio (smallest image), slow decompression; popular for embedded/size-constrained targets |
-| `CONFIG_KERNEL_LZO` | LZO | Fast, poorer ratio |
-| `CONFIG_KERNEL_LZ4` | LZ4 | Fastest decompression, largest image (Ubuntu's default 19.10 to ~23.x) |
-| `CONFIG_KERNEL_ZSTD` | Zstandard | Near-xz ratio with near-LZ4 speed; added in 5.9; **current default on Ubuntu 24.04** and many other distros |
-| `CONFIG_KERNEL_UNCOMPRESSED` | none | For bootloaders that handle compression themselves |
+| Option | Best at | Note |
+| ------ | ------- | ---- |
+| `CONFIG_KERNEL_GZIP` | Compatibility | Historic default |
+| `CONFIG_KERNEL_XZ` | **Smallest image** | Slow to decompress; popular on embedded systems |
+| `CONFIG_KERNEL_LZ4` | **Fastest decompression** | Largest image |
+| `CONFIG_KERNEL_ZSTD` | **Best trade-off** | Near-xz size at near-LZ4 speed (5.9+); **Ubuntu 24.04 default** (test box) |
 
-*Raw notes said xz is the most popular/efficient. xz gives the best compression **ratio**, but it decompresses slowly, so most desktop/server distros now use **zstd** as the best overall trade-off. The test box uses `CONFIG_KERNEL_ZSTD=y` (checked 28 Sep 2026).*
+Other choices: `BZIP2`, `LZMA`, `LZO`, `UNCOMPRESSED`. The initramfs (`CONFIG_RD_*`, test box: zstd) and modules (`CONFIG_MODULE_COMPRESS_*`, test box: `.ko.zst`) are compressed **separately**.
 
-- The **initramfs** and **modules** are compressed separately. The kernel must support the initramfs's format (`CONFIG_RD_GZIP`, `CONFIG_RD_XZ`, `CONFIG_RD_ZSTD`, …). On the test box: initramfs `COMPRESS=zstd` (`/etc/initramfs-tools/initramfs.conf`); modules `CONFIG_MODULE_COMPRESS_ZSTD=y` (files end in `.ko.zst`).
-- ARM64 has **no self-decompressor**: the bootloader (U-Boot, GRUB, Pi firmware) must decompress `Image.gz`, or it boots the raw `Image`.
+### Image size vs runtime footprint
 
-```sh
-grep -E '^CONFIG_KERNEL_(GZIP|BZIP2|LZMA|XZ|LZO|LZ4|ZSTD)' /boot/config-$(uname -r)
-grep ^COMPRESS /etc/initramfs-tools/initramfs.conf    # initramfs compression (Ubuntu/Debian)
-ls /lib/modules/$(uname -r)/kernel/fs/ | head          # note .ko.zst suffix
-```
+| Measure (test box) | Size |
+| ------------------ | ---- |
+| `/boot/vmlinuz-…` on disk (zstd) | ≈ 15 MB |
+| Decompressed image in RAM (boot log `Memory:` line: code + data + bss) | ≈ 50 MB (≈ 5 MB `init` part freed after boot) |
+| Runtime allocations (slab, stacks, page tables, vmalloc, per-CPU) | ≈ 450 MB, and grows with workload |
 
-#### Image size vs runtime footprint
+The instructor's figure of **50–70 MB** is the loaded image plus its basic data.
 
-The file on disk is much smaller than the kernel in memory. After the bootloader hands over control, the kernel **decompresses itself** into place. It then allocates its runtime data (slab caches, page tables, per-CPU areas, kernel stacks, …) on top of that.
-
-| Measure (test box, `6.8.0-139-generic`) | Size |
-| --------------------------------------- | ---- |
-| `/boot/vmlinuz-…` (compressed, zstd) | 15 MB |
-| Decompressed image in RAM, from the boot log line `Memory: … (22528K kernel code, 4441K rwdata, 14428K rodata, 4932K init, 4776K bss …)` | ≈ 50 MB (the ≈ 5 MB `init` part is freed after boot) |
-| Runtime allocations (`/proc/meminfo`: `Slab` + `KernelStack` + `PageTables` + `VmallocUsed` + `Percpu`) | ≈ 450 MB at the time of checking |
-
-- The instructor quoted a typical kernel footprint of **50–70 MB**. This matches the loaded image plus its basic data; the test box's image alone is ≈ 50 MB. Total kernel memory use grows with workload (number of threads, files cached in slab, network buffers), so it varies a lot. *Raw notes (transcript) said "vmlinux 16 megabytes": that is the compressed **`vmlinuz`**. The uncompressed `vmlinux` ELF with debug info is hundreds of MB.*
-
-```sh
-journalctl -k -b | grep 'Memory:'      # or: sudo dmesg | grep Memory:  (dmesg_restrict=1 on the test box)
-ls -l /boot/vmlinuz-$(uname -r)
-```
-
-#### Kernel symbols: `System.map`, `/proc/kallsyms` and `kptr_restrict`
+### Kernel symbols: `System.map`, `/proc/kallsyms`, `kptr_restrict`
 
 | | `System.map-<ver>` | `/proc/kallsyms` |
 | - | ------------------ | ---------------- |
-| Kind | **Static** text file, an artefact of the build | **Live** pseudo-file generated by the running kernel (`CONFIG_KALLSYMS`; data symbols too with `CONFIG_KALLSYMS_ALL`) |
-| Addresses | Link-time (no KASLR offset) | Actual runtime addresses (include KASLR offset) |
-| Includes modules | No | Yes (`[module]` suffix) |
-| Test box | `0600 root`, 9 MB | Readable, but addresses shown as zeros to non-root |
+| Kind | **Static** file produced by the build | **Live**, generated by the running kernel (`CONFIG_KALLSYMS`) |
+| Addresses | Link-time (no KASLR offset) | Real runtime addresses |
+| Modules | No | Yes (`[module]` suffix) |
+| Test box | Mode `0600`, root only | Readable, but addresses are zeros for non-root |
 
-*Raw notes (transcript) said System.map exists "in mainline (desktop/server) Linux only, not Android". More precisely, every kernel build produces `System.map`. Distros install it in `/boot`, but Android devices do not ship it on the device, and on Android `/proc/kallsyms` is also blocked by SELinux ("permission denied") for normal apps and shell.*
+**`kptr_restrict`** (sysctl `kernel.kptr_restrict`) controls whether kernel pointers are shown:
 
-**`kptr_restrict`** (`/proc/sys/kernel/kptr_restrict`, sysctl `kernel.kptr_restrict`) controls whether kernel pointers are shown in `/proc/kallsyms`, `%pK` `printk` output and similar interfaces:
+| Value | Who sees real addresses | Default on |
+| ----- | ----------------------- | ---------- |
+| `0` | Root (`CAP_SYSLOG`); unprivileged users only if `perf_event_paranoid <= 1` | Upstream |
+| `1` | Only readers with **`CAP_SYSLOG`** | **Ubuntu / test box** |
+| `2` | **Nobody**, not even root | Android |
 
-| Value | Effect | Default |
-| ----- | ------ | ------- |
-| `0` | No restriction from `kptr_restrict` itself. `/proc/kallsyms` shows real addresses to readers with `CAP_SYSLOG`; unprivileged readers see them only if `perf_event_paranoid <= 1` | Upstream default |
-| `1` | Real addresses only for readers with **`CAP_SYSLOG`** (root); others see zeros | **Test box** (Ubuntu) |
-| `2` | Zeros for **everyone, including root** | Android |
-
-- Why: an attacker with a bug that lets them overwrite a kernel pointer needs to know **where** kernel functions and data are. A leaked address defeats **KASLR**, turning a crash into kernel-mode code execution.
-- Root can always change the value (`echo 0 | sudo tee /proc/sys/kernel/kptr_restrict`). It is a **defence-in-depth** layer, not a hard barrier against root.
-- *Raw notes (transcript) said 0 = "visible to everyone". On Ubuntu, `perf_event_paranoid` is `4`, so with `kptr_restrict=0` an unprivileged user **still sees zeros**. Only root gains visibility.* (`kallsyms_show_value()` in `kernel/ksyms_common.c`)
-- The capability is checked against the credentials of whoever **opened** the file, so a root-opened fd passed to an unprivileged process still shows addresses.
-
-```sh
-cat /proc/sys/kernel/kptr_restrict          # test box: 1
-head -3 /proc/kallsyms                      # as user: 0000000000000000 ...
-sudo grep -w start_kernel /proc/kallsyms    # as root: real (KASLR-shifted) address
-sudo sysctl kernel.kptr_restrict=2          # hide from root too (not persistent)
-```
+- **Why hide them:** a leaked kernel address defeats **KASLR**, which turns a memory-corruption bug into code execution. This is defence in depth: root can always change the setting.
+- The check uses the credentials of whoever **opened** the file (§8).
 
 ### Commands / debugging
 
 ```sh
-uname -r                          # running kernel release
-cat /proc/cmdline                 # command line the running kernel was booted with
-ls -l /boot                       # installed kernels, initramfs, symlinks
-ls /lib/modules/$(uname -r)/      # modules for the running kernel
-ls -l /lib/modules/$(uname -r)/build   # headers/Kbuild tree used for out-of-tree modules
-grep CONFIG_PREEMPT /boot/config-$(uname -r)   # check a config option
-zcat /proc/config.gz              # running config, only if CONFIG_IKCONFIG_PROC=y
-sudo grep ' schedule$' /proc/kallsyms   # live symbol address (needs root; else shows 0s)
-lsinitramfs /boot/initrd.img-$(uname -r) | head   # list initramfs contents (Ubuntu/Debian)
-file /boot/vmlinuz-$(uname -r)    # needs root: images are mode 0600 on Ubuntu
+uname -r                                        # running kernel release, e.g. 6.8.0-139-generic
+uname -m                                        # architecture: x86_64 (test box), aarch64 (Pi 5)
+uname -v                                        # build string: #139-Ubuntu SMP PREEMPT_DYNAMIC <date>
+ls -l /boot                                     # installed kernels, initramfs images and symlinks
+cat /proc/cmdline                               # command line the running kernel was booted with
+[ -d /sys/firmware/efi ] && echo UEFI || echo BIOS   # how this machine booted (test box: BIOS)
+sudo file /boot/vmlinuz-$(uname -r)             # identify image format and version (needs root on Ubuntu)
+grep -E '^CONFIG_KERNEL_(GZIP|XZ|LZ4|ZSTD)' /boot/config-$(uname -r)   # which image compression was used
+grep CONFIG_PREEMPT /boot/config-$(uname -r)    # check any config option
+lsinitramfs /boot/initrd.img-$(uname -r) | head # list initramfs contents (Ubuntu/Debian)
+journalctl -k -b | grep 'Memory:'               # kernel image size in RAM from the boot log
+cat /proc/sys/kernel/kptr_restrict              # pointer-hiding level (test box: 1)
+sudo grep -w start_kernel /proc/kallsyms        # live (KASLR-shifted) address; non-root sees zeros
+ls /lib/modules/$(uname -r)/                    # modules for the running kernel
 ```
 
-Observed on the test box (28 Sep 2026):
-
-- Running `6.8.0-139-generic`, but `/boot/vmlinuz` points to `6.8.0-142-generic`: a newer kernel is installed and will boot next time. Modules built now target `-139`.
-- `/proc/cmdline` shows `BOOT_IMAGE=/vmlinuz-...` (no `/boot` prefix) because `/boot` is a **separate partition** (note `lost+found`); GRUB sees it as its root.
-- `vmlinuz-*` and `System.map-*` are mode `0600` (root only): Ubuntu hardening against leaking kernel addresses.
+Observed on the test box: running `-139`, but `/boot/vmlinuz` points to `-142`. A newer kernel is installed and will boot next time, so build modules for `-139` until you reboot.
 
 ### Pitfalls
 
-- Building an out-of-tree module against headers for a different kernel than `uname -r` → `insmod` fails with `Invalid module format` (vermagic mismatch).
-- After a kernel upgrade without reboot, `/lib/modules/$(uname -r)/build` still points to the *old* headers, which is correct for the running kernel; do not "fix" it.
-- `System.map` is only valid for the exact build it came from. With **KASLR** the runtime addresses are shifted by a random offset, so use `/proc/kallsyms` for live addresses.
-- Deleting old kernels from `/boot` by hand breaks GRUB entries; use the package manager (`apt autoremove`).
+- Building a module against a different kernel than `uname -r` → `insmod` fails with `Invalid module format` (vermagic mismatch, §7).
+- After an upgrade without a reboot, `/lib/modules/$(uname -r)/build` still points to the old headers. That is **correct** for the running kernel: do not "fix" it.
+- `System.map` addresses ≠ runtime addresses because of **KASLR**. Use `/proc/kallsyms` (as root).
+- Do not delete old kernels from `/boot` by hand. Use the package manager (`apt autoremove`).
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| The boot executable boots from sector 0 of the disk | That was the pre-2.6.24 floppy boot sector. It no longer works; a bootloader is always needed. |
+| "uefa: pe32" | **UEFI**, **PE32+** (64-bit) |
+| xz is the most popular/efficient | xz gives the best **ratio** but decompresses slowly. Most distros now use **zstd**. |
+| "vmlinux 16 megabytes" | That is the compressed **`vmlinuz`**. `vmlinux` with debug info is hundreds of MB. |
+| `System.map` exists only on desktop/server Linux, not Android | Every build produces it. Android just does not ship it on the device, and SELinux blocks `/proc/kallsyms`. |
+| `kptr_restrict=0` = visible to everyone | On Ubuntu `perf_event_paranoid=4`, so unprivileged users still see zeros. Only root gains visibility. |
 
 ### Revision questions
 
 1. What is the difference between `vmlinux` and `vmlinuz`, and which one would you give to `crash` or `gdb`?
 2. Why does a system need an initramfs, and when could you boot without one?
 3. `/boot/vmlinuz` points to a different version than `uname -r`. What does that tell you, and which version must your module be built for?
-4. Why might `System.map` addresses not match `/proc/kallsyms` on a running system?
+4. Why might `System.map` addresses not match `/proc/kallsyms`?
 
 <details>
 <summary>Answers</summary>
 
-1. `vmlinux` is the uncompressed ELF kernel with symbols (and debug info); `vmlinuz` is the compressed, stripped, bootable image. Debuggers need `vmlinux`.
-2. The initramfs supplies the drivers and logic (modules, LVM, LUKS, RAID) needed to mount the real root filesystem. Without one, everything needed to mount root must be built into the kernel (`=y`) and the root device given directly with `root=`.
-3. A newer kernel is installed but the machine has not rebooted. Modules must be built for the **running** kernel (`uname -r`).
-4. KASLR randomises the kernel's base address at boot; `System.map` holds link-time addresses. (Also, `kptr_restrict` shows zeros to unprivileged users.)
+1. `vmlinux` is the uncompressed ELF with symbols and debug info; `vmlinuz` is compressed, stripped and bootable. Debuggers need `vmlinux`.
+2. It supplies the drivers and logic (modules, LVM, LUKS, RAID) needed to mount the real root. You can boot without one only if everything needed to mount root is built in (`=y`) and the root device is given with `root=`.
+3. A newer kernel is installed but the machine has not rebooted. Build for the **running** kernel (`uname -r`).
+4. KASLR shifts the kernel base at every boot, and `System.map` holds link-time addresses. Also, `kptr_restrict` shows zeros to unprivileged users.
 
 </details>
 
 ### Source pointers
 
-- `arch/x86/boot/` (setup code, `bzImage` build), `arch/x86/boot/compressed/` (self-decompressor)
-- `init/main.c` (`start_kernel()`, `kernel_init()`, running `/init` or `/sbin/init`)
-- `init/initramfs.c` (unpacking the initramfs)
-- `Documentation/admin-guide/initrd.rst`, `Documentation/filesystems/ramfs-rootfs-initramfs.rst`
-- `Documentation/admin-guide/kernel-parameters.txt` (command-line options)
-- `Documentation/arch/x86/boot.rst` (x86 boot protocol)
-- `arch/x86/boot/header.S` (boot sector stub, PE header, setup header), `drivers/firmware/efi/libstub/` (EFI stub)
-- `Documentation/arch/arm64/booting.rst` (ARM64 boot requirements)
-- `init/Kconfig` (`KERNEL_*` compression choice), `lib/decompress_*.c` (decompressors)
+- `arch/x86/boot/` (setup code, `header.S`: boot sector, PE header, setup header), `arch/x86/boot/compressed/` (decompressor)
+- `drivers/firmware/efi/libstub/` (EFI stub), `init/main.c` (`start_kernel()`), `init/initramfs.c`
+- `Documentation/arch/x86/boot.rst` (x86 boot protocol), `Documentation/arch/arm64/booting.rst`
+- `Documentation/filesystems/ramfs-rootfs-initramfs.rst`, `Documentation/admin-guide/kernel-parameters.txt`
+- `init/Kconfig` (`KERNEL_*` compression), `kernel/ksyms_common.c` (`kallsyms_show_value()`)
 
 ---
 
 ## 2. Where Kernels Come From: Distribution vs Vendor (BSP) Kernels
 
+> **Remember**
+>
+> - **Every** Linux kernel comes from kernel.org (**mainline** → **stable/LTS**). Others add patches on top.
+> - PCs and servers run **distribution kernels**. Phones and boards run **vendor BSP kernels**.
+> - Android **GKI**: one Google-built core kernel, with hardware support in **vendor modules** loaded against a stable **KMI**.
+> - Patching the kernel directly creates a **fork** (endless rebasing), and **GPLv2** requires you to publish the source if you distribute it. Prefer modules, eBPF, or upstreaming.
+> - Build modules against the **exact** kernel you run: "6.8" from Ubuntu ≠ "6.8" from kernel.org.
+
 ### Overview
 
-Few systems run a pure **mainline** kernel from kernel.org. PCs and servers run a **distribution kernel** (Ubuntu, Fedora, …); phones and embedded boards run a **vendor/BSP kernel** supplied by the SoC maker (Qualcomm, MediaTek, …). Knowing which one you are on tells you which source tree, config and patches you must build modules against.
+Few systems run a pure mainline kernel. Knowing whether you are on a distro kernel or a vendor kernel tells you which source tree, config and patches your modules must be built against.
 
-### Key concepts
+### How kernels are derived
 
 ```text
 mainline (Linus, torvalds/linux.git)
    └─> stable / LTS (Greg KH, linux-6.12.y, ...)
-          ├─> distribution kernels (PC/server)
-          │      Ubuntu 6.8.0-NN-generic, Fedora, RHEL, SUSE, Debian
+          ├─> distribution kernels (PC/server): Ubuntu 6.8.0-NN-generic, Fedora, RHEL, SUSE, Debian
           │      + backports, security fixes, distro config
           └─> Android Common Kernel (ACK, Google) → GKI
                  └─> SoC vendor BSP kernels (Qualcomm, MediaTek, Samsung, ...)
                         └─> device (OEM) kernels
 ```
 
-| | Distribution kernel (PC/server) | Vendor BSP kernel (Android/embedded) |
-| - | ------------------------------- | ------------------------------------ |
-| Supplied by | Distro: Ubuntu (Canonical), Fedora/RHEL (Red Hat), SUSE, Debian | SoC vendor: Qualcomm (`qcom`), MediaTek (`mtk`), NXP, TI, Rockchip, … |
-| Based on | A stable/LTS release plus distro patches | An LTS release, often via Google's Android Common Kernel |
-| Hardware | Generic: one image for many PCs, most drivers as modules | One SoC family; board described by **Device Tree** |
-| Out-of-tree code | Minimal (mostly upstream drivers) | Often large amounts of non-upstream drivers (GPU, modem, camera) |
-| Update model | Frequent security updates via package manager | Frozen at one LTS for the device's life; updates depend on the OEM |
+| | Distribution kernel | Vendor BSP kernel |
+| - | ------------------- | ----------------- |
+| Supplied by | Ubuntu, Fedora/RHEL, SUSE, Debian | SoC vendor: Qualcomm, MediaTek, NXP, TI, Rockchip, … |
+| Hardware | Generic: one image for many PCs, most drivers as modules | One SoC family; board described by a **Device Tree** |
+| Out-of-tree code | Minimal | Often large (GPU, modem, camera drivers) |
+| Updates | Frequent, via the package manager | Frozen at one LTS; updates depend on the OEM |
 
 - **BSP** (Board Support Package): the vendor's kernel tree, bootloader, Device Trees, drivers and firmware for its SoC.
-- **GKI** (Generic Kernel Image, Android 12+ / kernel 5.10+): Google ships one common kernel binary per Android LTS branch; SoC/board-specific code moves into **vendor modules** loaded against a stable **KMI** (Kernel Module Interface). This reduces the fragmentation of per-vendor kernel forks.
+- The Pi's kernel (`6.12.x+rpt-rpi-2712`) is itself a vendor kernel (`raspberrypi/linux`).
 
-#### GKI and its advantages
+### GKI (Generic Kernel Image, Android 12+, kernel 5.10+)
 
 ```text
-Before GKI (per-device kernel)          With GKI (Android 12+, kernel 5.10+)
+Before GKI (per-device kernel)          With GKI
 ┌──────────────────────────────┐        ┌──────────────────────────────┐
 │ one monolithic kernel         │        │ GKI kernel (Google-built,     │  same binary for every
 │ = LTS + Android + SoC vendor  │        │ signed, per LTS branch)       │  device on that branch
 │   + OEM patches, all mixed    │        ├──────── KMI (stable) ────────┤  frozen list of exported
 └──────────────────────────────┘        │ vendor modules (.ko): SoC,    │  symbols + types
-                                         │ board, GPU, modem drivers     │  in vendor_boot / vendor_dlkm
+                                         │ board, GPU, modem drivers     │
                                          └──────────────────────────────┘
 ```
 
 | Advantage | Why |
 | --------- | --- |
-| **Faster security updates** | Google can ship a new GKI (e.g. monthly LTS fixes) without each SoC vendor/OEM rebasing a private fork |
-| **Less fragmentation** | One core kernel per Android release/LTS branch instead of thousands of device forks |
-| **Stable interface for vendors** | The **KMI** stays frozen within a branch, so vendor modules keep loading after core-kernel updates |
-| **Upstream alignment** | Vendor changes to the core must go upstream or into ACK instead of vendor-only patches; the core stays close to kernel.org |
-| **Testing and certification** | One binary can be tested and certified centrally (e.g. via VTS) |
-| **Updatability** | The kernel can be updated separately from vendor code (the Treble idea applied to the kernel) |
+| Faster security updates | Google ships a new GKI without every vendor rebasing a private fork |
+| Less fragmentation | One core kernel per branch instead of thousands of device forks |
+| Stable vendor interface | The **KMI** is frozen within a branch, so vendor modules keep loading |
+| Upstream alignment | Core changes must go upstream or into ACK |
+| Central testing | One binary is tested and certified centrally |
 
-- This is a real-world case of Section 7: hardware support lives in **loadable modules** against a controlled symbol list, not in patches to the core.
-- Trade-offs: vendors are limited to the KMI symbol list (adding symbols needs Google's approval), and module loading at boot adds complexity (`vendor_boot`, `vendor_dlkm` partitions).
-- **Every** Linux kernel ultimately comes from **kernel.org** (mainline/stable). This includes the Android Common Kernels: Google hosts them at `android.googlesource.com/kernel/common`, but they are branches of kernel.org LTS releases with Android patches on top.
-- The Raspberry Pi kernel (`6.12.x+rpt-rpi-2712`) is itself a vendor kernel (`raspberrypi/linux`), based on a stable release.
+- **Trade-offs:** vendors are limited to the KMI symbol list, and module loading at boot adds complexity (`vendor_boot` and `vendor_dlkm` partitions).
+- GKI is a real-world example of §7: hardware support lives in **modules** against a controlled symbol list.
 
-#### Licensing: GPLv2 and why not to patch the kernel directly
+### Licensing: GPLv2 and why not to patch the kernel directly
 
-- The kernel is licensed under **GPL-2.0-only** (`COPYING`, `LICENSES/`, SPDX tags in every file). Changes to the kernel proper are **derivative works**: anyone who **distributes** a modified kernel (e.g. in a phone or appliance) must provide the corresponding source code to recipients under the GPL. *Raw notes: "all changes must be kept open source". The obligation is triggered by distribution; private changes that are never shipped do not have to be published.*
-- **Directly modifying kernel sources is discouraged** because:
-  - **Legal:** the changes fall under GPLv2 and must be released with any shipped binary.
-  - **Engineering:** it effectively creates a **fork (branch)**. Every new upstream/stable release means rebasing your patches, resolving conflicts and retesting. This is the root of the Android/BSP update problem above.
-- Preferred alternatives: write a **loadable module** against exported interfaces; use existing extension points (**eBPF**, tracepoints, Device Tree, sysfs/configfs); or **upstream** the change so the community maintains it.
-- Modules and licensing:
-  - `MODULE_LICENSE("GPL")` gives access to `EXPORT_SYMBOL_GPL()` symbols.
-  - A non-GPL-compatible licence **taints** the kernel (`P` flag, `/proc/sys/kernel/tainted`) and cannot use GPL-only symbols.
-  - Whether a proprietary out-of-tree module is a derivative work is legally disputed. **⚠️ Verify** the course's position.
+- The kernel is **GPL-2.0-only**. Anyone who **distributes** a modified kernel must provide the source to recipients.
+- **Avoid patching the kernel directly:**
+  - **Legal:** the changes fall under GPLv2 and must be released with any binary you ship.
+  - **Engineering:** you create a **fork** that must be rebased on every upstream release. This is the root of the Android update problem.
+- **Preferred alternatives:** a **loadable module**, existing extension points (**eBPF**, tracepoints, Device Tree, sysfs), or **upstream** the change.
+- **Modules:** `MODULE_LICENSE("GPL")` unlocks `EXPORT_SYMBOL_GPL()` symbols. A non-GPL licence **taints** the kernel (`P`). Whether a proprietary module is a derivative work is legally disputed (**⚠️ Verify** the course's position).
 
 ### Pitfalls
 
-- Modules must be built against the **exact** kernel tree and config in use; a distro or BSP kernel's headers are not interchangeable with mainline sources of the same version number.
-- Vendor trees often carry older APIs or out-of-tree changes, so code written for mainline 6.x may not build on them unchanged.
+- Distro/BSP headers are **not** interchangeable with mainline sources of the same version number.
+- Vendor trees often carry older or modified APIs, so mainline 6.x code may not build on them unchanged.
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| "All changes must be kept open source" | The obligation is triggered by **distribution**. Private changes that are never shipped need not be published. |
 
 ### Revision questions
 
 1. Why is it hard to update the kernel on an old Android phone, and how does GKI help?
-2. The test box runs `6.8.0-139-generic`. Is that a mainline kernel? Where does it come from?
+2. The test box runs `6.8.0-139-generic`. Is that a mainline kernel?
+3. Give two reasons to write a module instead of patching the kernel.
 
 <details>
 <summary>Answers</summary>
 
-1. Each device runs a vendor BSP kernel carrying out-of-tree SoC/board drivers on an old LTS; updates need the SoC vendor and OEM to rebase their patches. GKI splits it into one Google-maintained common kernel plus vendor modules against a stable KMI, so the core kernel can be updated on its own.
-2. No. It is Ubuntu's distribution kernel: based on upstream 6.8 plus Ubuntu patches, backports and config; `-139` is Ubuntu's ABI/upload number.
+1. Each device runs a vendor BSP kernel with out-of-tree drivers on an old LTS, so updates need the vendor and the OEM to rebase their patches. GKI separates one Google-maintained core kernel from vendor modules that load against a stable KMI, so the core can be updated on its own.
+2. No. It is Ubuntu's distribution kernel: upstream 6.8 plus Ubuntu patches, backports and config. `-139` is Ubuntu's ABI/upload number.
+3. No private fork to rebase on every release. The code stays separate from GPL obligations on the kernel proper (subject to licence). It can be loaded and unloaded without rebuilding the kernel.
 
 </details>
 
 ### Source pointers
 
-- `Documentation/process/2.Process.rst` (mainline/stable development process)
-- `Documentation/process/stable-kernel-rules.rst`
-- `COPYING`, `LICENSES/preferred/GPL-2.0`, `Documentation/process/license-rules.rst` (SPDX, module licences)
-- `Documentation/admin-guide/tainted-kernels.rst`
-- `arch/arm64/boot/dts/qcom/`, `arch/arm64/boot/dts/mediatek/` (upstream Device Trees for these SoCs)
+- `Documentation/process/2.Process.rst`, `Documentation/process/stable-kernel-rules.rst`
+- `COPYING`, `LICENSES/`, `Documentation/process/license-rules.rst`, `Documentation/admin-guide/tainted-kernels.rst`
+- `arch/arm64/boot/dts/qcom/`, `arch/arm64/boot/dts/mediatek/`
 - Android: `source.android.com/docs/core/architecture/kernel` (GKI, KMI)
 
 ---
 
 ## 3. Virtual Address Space: User/Kernel Split
 
+> **Remember**
+>
+> - Every process has its own **virtual address space**: **user space** in the low half (private), **kernel space** in the high half (shared by all processes, kernel mode only).
+> - x86_64 with 4-level paging: user `0x0000_0000_0000_0000`–`0x0000_7fff_ffff_ffff` (**47 bits, 128 TiB**); kernel from `0xffff_8000_0000_0000`. The gap in between is **non-canonical** and faults.
+> - An address works only if it is **mapped** (a page-table entry points to a physical page). Otherwise the CPU raises a **page fault**.
+> - `mmap()` creates only a **VMA** (a reserved range). Physical pages are allocated **on first touch** (**demand paging**).
+> - Kernel code must **never** dereference a user pointer. Use `copy_from_user()` / `copy_to_user()`.
+
 ### Overview
 
-Each process has its own **virtual address space**, split into a **user space** part (the lower addresses, different for each process) and a **kernel space** part (the upper addresses, shared by all processes and only accessible in kernel mode). The number of usable address bits depends on the architecture and the number of page-table levels, not on how much RAM is installed.
+The number of usable address bits depends on the **architecture and the number of page-table levels**, not on installed RAM. 128 TiB of user space does not need 128 TiB of RAM.
 
-### Key concepts
-
-- User space occupies the **low** half, kernel space the **high** half. On 64-bit CPUs the addresses in between are **non-canonical**: using one causes a fault.
-- *Raw notes said user space is "commonly on the order of 37–40 bits", but the range written alongside it, `0x0`–`0x7fff_ffff_ffff`, is **47 bits** (12 hex digits, top bit clear).*
-- Typical user-space widths: **47 bits** on x86_64 with 4-level paging (128 TiB); 47/48 bits on most ARM64 configs; 39 bits (512 GiB) on some ARM64/Android configs. The width varies by architecture and config.
-- Kernel space begins at `0xffff_8000_0000_0000` on x86_64 (4-level); the kernel image itself is at `0xffffffff8…`. *Raw notes: `0xfffffff?????`. The exact start depends on architecture, config and paging levels, and KASLR randomises the offsets within it.*
-- Addresses are virtual: 128 TiB of user space does not need 128 TiB of RAM. Pages are only backed by memory when touched.
-- `TASK_SIZE` is the top of user space for the current task. Kernel code must never dereference a user pointer directly: use `copy_from_user()` / `copy_to_user()`.
-
-### How it works
-
-x86_64 with 4-level paging (48-bit virtual addresses):
+### Layout (x86_64, 4-level paging)
 
 ```text
 0xffff_ffff_ffff_ffff ┌────────────────────────────┐
@@ -402,38 +402,35 @@ x86_64 with 4-level paging (48-bit virtual addresses):
                       │ shared by all processes    │  kernel text (0xffffffff8…)
 0xffff_8000_0000_0000 ├────────────────────────────┤
                       │ non-canonical hole         │  access → #GP fault
-                      │ (bits 63..47 not all equal)│
-0x0000_7fff_ffff_ffff ├────────────────────────────┤  ← TASK_SIZE (minus a guard page)
+0x0000_7fff_ffff_ffff ├────────────────────────────┤  ← TASK_SIZE
                       │ user space (128 TiB)       │  stack (top), mmap/libs,
                       │ per process                │  heap, text (bottom)
 0x0000_0000_0000_0000 └────────────────────────────┘
 ```
 
-| Architecture / config | VA bits | User space | Notes |
-| --------------------- | ------- | ---------- | ----- |
-| x86 32-bit | 32 | 3 GiB (`0x00000000`–`0xbfffffff`) | Classic **3G/1G split**, kernel at `0xc0000000` (`PAGE_OFFSET`) |
-| x86_64, 4-level paging | 48 | 128 TiB (47 bits) | Default |
-| x86_64, 5-level paging (`CONFIG_X86_5LEVEL`, CPU has `la57`) | 57 | up to 64 PiB (56 bits) | User mappings above 47 bits only if `mmap()` is given a high hint address |
-| ARM64 | 39 / 47 / 48 / 52 (`CONFIG_ARM64_VA_BITS`) | 2^(VA_BITS) | User addresses go through `TTBR0_EL1`, kernel addresses through `TTBR1_EL1` (separate page-table roots) |
+| Architecture / config | User space |
+| --------------------- | ---------- |
+| x86 32-bit | 3 GiB (classic **3G/1G split**, kernel at `0xc0000000`) |
+| **x86_64, 4-level (default)** | **128 TiB (47 bits)** |
+| x86_64, 5-level (`CONFIG_X86_5LEVEL` + CPU flag `la57`) | Up to 64 PiB (56 bits); addresses above 47 bits only if requested via an `mmap()` hint |
+| ARM64 (`CONFIG_ARM64_VA_BITS` = 39/47/48/52) | 2^VA_BITS; separate page-table roots for user (`TTBR0_EL1`) and kernel (`TTBR1_EL1`) |
 
-Observed:
+- **Test box:** `CONFIG_X86_5LEVEL=y`, but the vCPU lacks `la57`, so it runs **4-level**: 47-bit user space.
+- **Pi 5:** `ARM64_VA_BITS=47`, 16 KiB pages, 128 TiB user space.
 
-- **Test box:** `CONFIG_X86_5LEVEL=y`, but the vCPU has no `la57` flag (`/proc/cpuinfo`: "48 bits virtual"), so the kernel falls back to **4-level paging**: 47-bit user space. The top user mappings are around `0x7ffd…` (`[stack]`, `[vdso]`). `[vsyscall]` at `0xffffffffff600000` is a legacy page in kernel space.
-- **Pi 5:** `CONFIG_ARM64_VA_BITS=47`, 16 KiB pages, 3 page-table levels: 128 TiB user space; `[stack]` near `0x7fff…`.
+### Mapped vs unmapped (key term)
 
-#### Mapped vs unmapped (key term)
+A virtual page is usable only if it is **mapped**. When a process touches an unmapped address, the MMU raises a **page fault** and the kernel checks whether the address lies in a valid **VMA**:
 
-**Mapped** is a key term the instructor will use throughout. A virtual page is only accessible if it is **mapped**: a page-table entry (PTE) links it to a physical page frame. An **unmapped** address has nothing behind it.
+```text
+page fault
+  ├─ inside a VMA, page not present yet → demand paging: allocate/read page, fill PTE, retry (invisible)
+  └─ no VMA, or wrong permissions      → SIGSEGV (user) / oops (kernel)
+```
 
-- Access to an unmapped address → the MMU raises a **page fault** → the kernel checks whether the address lies in a valid region (**VMA**) of the process:
-  - Valid region, page not yet present → **demand paging**: the kernel allocates or reads in the page, fills in the PTE and retries the instruction transparently (minor/major fault).
-  - No VMA, or wrong permissions → `SIGSEGV` in user space; an **oops** if the kernel itself faults on a bad address.
-- **NULL dereference** faults because the lowest pages are never mapped: `vm.mmap_min_addr` (65536 on the test box) stops processes mapping page 0. This turns kernel NULL-pointer bugs into oopses rather than exploitable accesses.
-- **`mmap()`** (double *p*: "memory map") is the system call that creates a mapping in the process's address space. *Raw notes said mmap is "claiming a physical page to map a virtual address onto it". More precisely, `mmap()` only creates the **VMA** (the reservation of a virtual range). Physical pages are normally allocated **lazily on first access** via page faults, unless `MAP_POPULATE`/`mlock()` is used.*
+- **NULL dereference always faults:** the lowest pages are never mapped (`vm.mmap_min_addr` = 65536). This turns kernel NULL bugs into oopses rather than exploits.
 
-#### Reading `/proc/<pid>/maps`: libc example
-
-From class (test box, `x86_64`): the C runtime library **libc** (glibc: `/usr/lib/x86_64-linux-gnu/libc.so.6`) mapped into the shell:
+### Reading `/proc/<pid>/maps`: libc example
 
 ```text
 $ grep libc /proc/$$/maps
@@ -446,201 +443,188 @@ $ grep libc /proc/$$/maps
 
 | Column | Meaning |
 | ------ | ------- |
-| `start-end` | Virtual address range of this **VMA** (all below `0x7fff_ffff_ffff`: user space) |
-| `r-xp` | Permissions (read/write/execute) + `p` private (copy-on-write) or `s` shared |
-| `00028000` | Offset in the file where the mapping starts |
-| `fc:00` | Device (major:minor) holding the file |
-| `1061951` | Inode number |
-| path | Backing file; `[heap]`, `[stack]`, `[vdso]`, or blank for anonymous memory |
+| `start-end` | Virtual range of one **VMA** (all below `0x7fff_ffff_ffff`, so user space) |
+| `r-xp` | Permissions + `p` private (copy-on-write) / `s` shared |
+| `00028000` | Offset in the file |
+| `fc:00`, `1061951` | Device (major:minor), inode |
+| path | Backing file, or `[heap]`, `[stack]`, `[vdso]`, blank = anonymous |
 
-One ELF shared object → several mappings, one per segment with different permissions:
+One shared library → **one mapping per segment**: headers (`r--`), code `.text` (`r-x`), read-only data (`r--`), **RELRO** (`r--`, made read-only after linking), writable data `.data`/`.bss` (`rw-`). The code pages are **shared** physically by every process that uses libc. Only written pages get private copies.
 
-| Perms | Content |
+### Where the kernel's own memory shows up
+
+`maps` shows only user mappings. Kernel memory usage is in **`/proc/meminfo`**:
+
+| Field | Meaning |
 | ----- | ------- |
-| `r--p` (1st) | ELF headers, read-only data before the code |
-| `r-xp` | `.text`: executable code (e.g. `read()`, `printf()`) |
-| `r--p` (3rd) | `.rodata`, exception tables |
-| `r--p` (4th) | **RELRO**: relocated data, made read-only after the dynamic linker finishes (hardening) |
-| `rw-p` | `.data`/`.bss`: writable globals (private copy per process) |
-
-- libc's code pages are **shared** in physical memory by every process that uses it (same file pages in the page cache). Only written (`rw-p`) pages get private copies (copy-on-write).
-- libc is the layer between programs and the kernel: its wrappers (`read()`, `write()`, `open()`, …) execute the `syscall` instruction, or use the vDSO (Section 4).
-
-#### Where the kernel's own memory usage shows up
-
-`/proc/<pid>/maps` shows only a process's **user-space** mappings (plus special entries like `[vdso]`/`[vsyscall]`). The kernel's memory footprint is in **`/proc/meminfo`**. Test box sample:
-
-| Field | Meaning | Test box |
-| ----- | ------- | -------- |
-| `MemTotal` / `MemFree` / `MemAvailable` | RAM usable by the kernel / completely unused / estimate available without swapping | 2014148 / 110880 / 707196 kB |
-| `Slab` | Kernel object caches (`kmalloc`, dentries, inodes, …) | 393264 kB |
-| `KernelStack` | Kernel stacks of all threads | 5680 kB |
-| `PageTables` | Memory used for page tables | 27048 kB |
-| `VmallocUsed` | `vmalloc()` area in use | 28512 kB |
-| `Percpu` | Per-CPU allocations | 2880 kB |
+| `Slab` | Kernel object caches (`kmalloc`, dentries, inodes) |
+| `KernelStack` | Kernel stacks of all threads |
+| `PageTables` | Memory used by page tables |
+| `VmallocUsed` | `vmalloc()` area in use |
+| `Percpu` | Per-CPU allocations |
 
 ### Key APIs / structures
 
 | Symbol | Header | Purpose | Context |
 | ------ | ------ | ------- | ------- |
-| `TASK_SIZE` | `<asm/processor.h>` | Top of user address space for `current` | Any |
-| `PAGE_OFFSET` | `<asm/page.h>` | Start of the kernel's direct map of physical memory | Any |
-| `copy_from_user()` / `copy_to_user()` | `<linux/uaccess.h>` | Safe copy between user and kernel memory; returns bytes **not** copied | Process context, **may sleep** (page fault) |
-| `access_ok()` | `<linux/uaccess.h>` | Check that a user range lies below the user limit (does not check that it is mapped) | Process context |
-| `__user` | `<linux/compiler_types.h>` | `sparse` annotation marking a user-space pointer | n/a |
+| `copy_from_user()` / `copy_to_user()` | `<linux/uaccess.h>` | Safe user ↔ kernel copy; returns bytes **not** copied | Process context, **may sleep** |
+| `access_ok()` | `<linux/uaccess.h>` | Range lies below the user limit (does not check that it is mapped) | Process context |
+| `__user` | `<linux/compiler_types.h>` | `sparse` annotation for user pointers | n/a |
+| `TASK_SIZE` | `<asm/processor.h>` | Top of user space for `current` | Any |
+| `PAGE_OFFSET` | `<asm/page.h>` | Start of the kernel's direct map of RAM | Any |
 
 ### Commands / debugging
 
 ```sh
-cat /proc/self/maps                     # user-space layout of the current process
-cat /proc/$$/maps                       # layout of the current shell ($$ = shell's PID); as used in class
-grep -m1 'address sizes' /proc/cpuinfo  # physical/virtual bits the CPU supports
-grep -o la57 /proc/cpuinfo | head -1    # 5-level paging support (x86)
-grep -E 'X86_5LEVEL|ARM64_VA_BITS|PGTABLE_LEVELS' /boot/config-$(uname -r)
-cat /proc/meminfo                       # system-wide memory incl. kernel usage
-sudo slabtop -o | head -15              # biggest slab caches
-sysctl vm.mmap_min_addr                 # lowest address user space may map
+cat /proc/$$/maps                       # layout of the current shell ($$ = shell's PID)
+grep -m1 'address sizes' /proc/cpuinfo  # physical/virtual address bits the CPU supports
+grep -o la57 /proc/cpuinfo | head -1    # prints la57 if the CPU supports 5-level paging (x86)
+grep -E 'X86_5LEVEL|ARM64_VA_BITS|PGTABLE_LEVELS' /boot/config-$(uname -r)   # paging config
+cat /proc/meminfo                       # system-wide memory, including kernel usage
+sudo slabtop -o | head -15              # biggest kernel slab caches
+sysctl vm.mmap_min_addr                 # lowest address user space may map (65536)
 ```
 
 ### Pitfalls
 
-- Dereferencing a `__user` pointer in the kernel: a bug even when it "works". **SMAP** (x86) / **PAN** (ARM64) make it fault, and it is an exploitable hole. Run `sparse` (`make C=1`) to catch it.
-- Calling `copy_*_user()` while holding a spinlock or in interrupt context: it can sleep on a page fault.
-- Assuming 47-bit user addresses. With 5-level paging the limit can be higher, and some programs that use the top pointer bits as tags break (hence the opt-in hint to `mmap()`).
+- Dereferencing a `__user` pointer directly: a bug even when it "works". **SMAP** (x86) / **PAN** (ARM64) make it fault. Catch it with `sparse` (`make C=1`).
+- Calling `copy_*_user()` with a spinlock held or in interrupt context: it may sleep on a page fault.
+- Assuming user addresses always fit in 47 bits (breaks under 5-level paging).
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| User space is "commonly 37–40 bits" | The range written next to it (`0x0`–`0x7fff_ffff_ffff`) is **47 bits** (x86_64). 39 bits is used on some ARM64/Android configs. |
+| Kernel space at `0xfffffff?????` | Starts at `0xffff_8000_0000_0000` (x86_64, 4-level). The kernel **image** is at `0xffffffff8…`. |
+| `mmap` claims a physical page and maps it | `mmap()` only creates the **VMA**. Pages are allocated lazily on first access, unless `MAP_POPULATE`/`mlock()` is used. |
 
 ### Revision questions
 
-1. On x86_64 with 4-level paging, what are the user and kernel address ranges, and what happens if you access `0x0000_8000_0000_0000`?
+1. On x86_64 with 4-level paging, what are the user and kernel ranges, and what happens if you access `0x0000_8000_0000_0000`?
 2. Why can't a driver `memcpy()` from a pointer passed in an `ioctl()` argument?
-3. The test box kernel has `CONFIG_X86_5LEVEL=y`. Why is its user space still 47 bits?
-4. A program calls `mmap()` for 1 GiB and `MemFree` barely changes. Why?
+3. The test box has `CONFIG_X86_5LEVEL=y`. Why is its user space still 47 bits?
+4. A program `mmap()`s 1 GiB and `MemFree` barely changes. Why?
 
 <details>
 <summary>Answers</summary>
 
-1. User: `0x0000_0000_0000_0000`–`0x0000_7fff_ffff_ffff`; kernel: `0xffff_8000_0000_0000`–`0xffff_ffff_ffff_ffff`. `0x0000_8000_0000_0000` is non-canonical, so a general-protection fault is raised (SIGSEGV in user space, an oops in the kernel).
-2. It is a user virtual address. It may be unmapped, paged out or malicious (pointing into kernel space), and SMAP/PAN block direct access. `copy_from_user()` validates the range and handles faults safely.
-3. 5-level paging also needs CPU support (`la57`). Without it the kernel boots in 4-level mode at runtime. Even with it, user addresses above 47 bits are only handed out when `mmap()` is given a high hint.
-4. `mmap()` only creates a VMA; physical pages are allocated on first touch (demand paging via page faults).
+1. User `0x0`–`0x0000_7fff_ffff_ffff`, kernel `0xffff_8000_0000_0000`–`0xffff_ffff_ffff_ffff`. `0x0000_8000_0000_0000` is non-canonical, so the CPU raises a general-protection fault (SIGSEGV in user space, an oops in the kernel).
+2. It is a user virtual address. It may be unmapped, paged out or malicious (pointing into the kernel), and SMAP/PAN block direct access. `copy_from_user()` validates the range and handles faults.
+3. The CPU also needs `la57`. Without it the kernel falls back to 4-level paging at boot. Even with it, addresses above 47 bits are only handed out when requested via an `mmap()` hint.
+4. `mmap()` only creates a VMA. Pages are allocated on first touch (demand paging).
 
 </details>
 
 ### Source pointers
 
-- `Documentation/arch/x86/x86_64/mm.rst` (x86_64 virtual memory map), `Documentation/arch/x86/x86_64/5level-paging.rst`
-- `Documentation/arch/arm64/memory.rst` (ARM64 layout, `TTBR0`/`TTBR1`)
-- `arch/x86/include/asm/page_64_types.h` (`TASK_SIZE_MAX`, `__PAGE_OFFSET`)
-- `include/linux/uaccess.h`, `arch/x86/lib/usercopy_64.c`
+- `Documentation/arch/x86/x86_64/mm.rst`, `Documentation/arch/x86/x86_64/5level-paging.rst`, `Documentation/arch/arm64/memory.rst`
+- `arch/x86/include/asm/page_64_types.h` (`TASK_SIZE_MAX`), `include/linux/uaccess.h`
 - `mm/memory.c` (`handle_mm_fault()`), `arch/x86/mm/fault.c` (`exc_page_fault()`), `mm/mmap.c`
-- `fs/proc/meminfo.c`, `Documentation/filesystems/proc.rst` (`meminfo`, `maps` fields)
+- `Documentation/filesystems/proc.rst` (`maps`, `meminfo`)
 
 ---
 
 ## 4. vDSO and vsyscall: Kernel Code Mapped into User Space
 
-### Overview
+> **Remember**
+>
+> - The **vDSO** is a small ELF shared library **supplied by the kernel** and mapped into every process as `[vdso]`, with a data page `[vvar]`.
+> - It lets hot, read-only calls (`clock_gettime`, `gettimeofday`, `time`, `getcpu`) run **without entering the kernel**, which avoids a mode switch.
+> - How it works: the kernel keeps the time data in `[vvar]` up to date, and the vDSO code reads that data plus the CPU counter, entirely in user mode.
+> - **vsyscall** is the legacy x86_64 version at a **fixed** address (`0xffffffffff600000`). It is now emulated, because a fixed address helps exploits.
+> - Real x86_64 syscalls use the **`syscall`** instruction with the number in `rax` (`read` = 0).
+> - `strace` cannot see vDSO calls, because no syscall happens.
 
-The kernel reserves the right to map some of its own pages into every process's user address space. The main example is the **vDSO** (virtual Dynamic Shared Object): a small shared library supplied by the kernel that lets user space run some "system calls" **without entering the kernel**. This avoids the cost of a mode switch for hot, read-only calls such as getting the time.
-
-### Key concepts
-
-- The vDSO is a real (but "fake", file-less) **ELF shared object**, mapped into each process at exec time as `[vdso]`, with its data page `[vvar]` (kernel-updated, read-only for user space).
-- The kernel passes its address to the process in the auxiliary vector (`AT_SYSINFO_EHDR`). glibc's dynamic linker finds it there and binds functions such as `clock_gettime()` to the vDSO versions automatically.
-- Mechanism for time: the kernel updates the clock data in `[vvar]` on each timer tick. The vDSO function reads it plus the CPU's counter (`rdtsc` on x86, `CNTVCT_EL0` on ARM64) entirely in user mode, so no syscall is needed.
-- Placement is randomised with ASLR (it is in the upper user range, near the stack).
-- Call path: the program calls the **library function** `gettimeofday()` (it never issues the syscall itself). glibc knows the platform provides a vDSO, so it jumps to the vDSO entry instead of executing `syscall`. The process gets the answer without entering the kernel.
+### How a call reaches the vDSO
 
 ```text
-app: gettimeofday(&tv)          app: getpid()
-   └─> glibc wrapper               └─> glibc wrapper
-         └─> [vdso] __vdso_gettimeofday     └─> syscall instruction ─> kernel entry ─> sys_getpid
-               reads [vvar] + rdtsc                  (mode switch, ~100 ns+)
+app: gettimeofday(&tv)                    app: getpid()
+   └─> glibc wrapper                         └─> glibc wrapper
+         └─> [vdso] __vdso_gettimeofday           └─> syscall instruction ─> kernel entry ─> sys_getpid
+               reads [vvar] + rdtsc                     (mode switch, ~100 ns+)
                (user mode only)
 ```
-- The vDSO exports only a handful of functions (checked on both machines, 28 Sep 2026):
+
+- The kernel passes the vDSO address in the auxiliary vector (`AT_SYSINFO_EHDR`). glibc finds it there and binds these functions to it automatically.
+- The vDSO's position is randomised by ASLR. It appears in `ldd` output as `linux-vdso.so.1`, but there is **no file on disk**.
 
 | Machine | vDSO exports |
 | ------- | ------------ |
-| Test box (x86_64, 6.8) | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `getcpu`, `sgx_enter_enclave` (as `__vdso_*`) |
-| Pi 5 (arm64, 6.12) | `__kernel_clock_gettime`, `__kernel_clock_getres`, `__kernel_gettimeofday`, `__kernel_getrandom` (plus the signal-return trampoline) |
+| Test box (x86_64, 6.8) | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `getcpu`, `sgx_enter_enclave` |
+| Pi 5 (arm64, 6.12) | `clock_gettime`, `clock_getres`, `gettimeofday`, `getrandom` (6.11+), signal-return trampoline |
 
-*Raw notes listed `memset` as a vDSO function. It is **not** exported by the x86_64 or arm64 vDSO. CPU-optimised versions of `memset`/`memcpy` come from elsewhere: in user space glibc picks the best implementation for the CPU at load time (IFUNC); inside the kernel, **alternatives** patch in the best version at boot (e.g. `rep stosb` on CPUs with ERMS/FSRM). **⚠️ Verify** what the instructor meant.* `getrandom()` joined the vDSO in 6.11 (present on the Pi's 6.12, not on the test box's 6.8).
+### vsyscall (legacy, x86_64 only)
 
-#### vsyscall (legacy, x86_64 only)
+- A page at the fixed address `0xffffffffff600000` providing `gettimeofday`, `time` and `getcpu`. Its fixed, executable address defeats ASLR, so it was replaced by the vDSO.
+- It is kept only for very old static binaries. It is **emulated**: the page is execute-only (`--xp`), and a call traps into the kernel, which does a real syscall. Boot option: `vsyscall=xonly|emulate|none`.
 
-- **vsyscall** is the older x86_64 mechanism: a page at the **fixed** address `0xffffffffff600000` containing the code for `gettimeofday`, `time` and `getcpu`. A fixed, executable address is a gift to exploits (it defeats ASLR), so it was replaced by the vDSO.
-- It still appears in `/proc/<pid>/maps` for compatibility with very old static binaries. Modern kernels **emulate** it: the page is execute-only (`--xp`, `CONFIG_LEGACY_VSYSCALL_XONLY=y` on the test box). A call traps into the kernel, which performs a real syscall. Boot option: `vsyscall=xonly|emulate|none`.
-- *Raw notes said "vsyscall syscall gate used in intel only". vsyscall is **x86_64-specific** (Intel and AMD alike), not Intel-only. "**Syscall gate**" is a different thing: the 32-bit x86 vDSO was named `linux-gate.so.1` because it supplied `__kernel_vsyscall`, which chooses the fastest syscall instruction (`sysenter`/`syscall`/`int 0x80`) for the CPU.*
-
-**x86 system-call entry instructions** (the "syscall gate" choices discussed in class):
+### x86 system-call entry instructions
 
 | Instruction | Where | Notes |
 | ----------- | ----- | ----- |
-| `int 0x80` | 32-bit x86 (any CPU); still accepted from 64-bit code for 32-bit ABI | Original software-interrupt gate; slowest |
-| `sysenter` / `sysexit` | 32-bit mode, Intel (and AMD in 32-bit legacy mode) | Fast entry added with the Pentium II |
-| `syscall` / `sysret` | **All x86_64** (AMD designed it, Intel adopted it for 64-bit) | **The modern 64-bit instruction** |
+| `int 0x80` | 32-bit x86 | Original software-interrupt gate; slowest |
+| `sysenter` / `sysexit` | 32-bit mode | Fast entry, Pentium II onwards |
+| **`syscall` / `sysret`** | **All x86_64** | **The modern 64-bit instruction** |
 
-*Class transcript: vsyscall was described as a wrapper for **all** system calls that picks between `int`/`syscall`/`sysenter`, with `sysenter` as "the modern one", and `read` as syscall 3. As I understand current kernels (**⚠️ Verify** with the instructor):*
-- *Picking the entry instruction per CPU is the job of `__kernel_vsyscall` in the **32-bit vDSO** (`linux-gate.so.1`), not the x86_64 vsyscall page. The x86_64 vsyscall page only ever provided `gettimeofday`, `time` and `getcpu`.*
-- *On x86_64 the modern instruction is **`syscall`**. `sysenter` matters for 32-bit code.*
-- *Generic system calls (`read`, `write`, … i.e. `man 2` pages) are wrapped by **glibc** (`read()` or the generic `syscall(2)` function), which puts the number in `rax` and executes `syscall` directly.*
-- *`__NR_read` is **0** on x86_64 and **3** on 32-bit i386 (the instructor's "3" is the i386 number). See `arch/x86/entry/syscalls/syscall_64.tbl` / `syscall_32.tbl`.*
+On 32-bit x86, the vDSO (`linux-gate.so.1`) supplies `__kernel_vsyscall`, which picks the fastest instruction the CPU supports: the "syscall gate".
 
 ### Commands / debugging
 
 ```sh
-grep -E 'vdso|vvar|vsyscall' /proc/self/maps
-LD_SHOW_AUXV=1 /bin/true | grep SYSINFO     # AT_SYSINFO_EHDR = vDSO address
-ldd /bin/ls | grep vdso                       # linux-vdso.so.1 (no file on disk)
-strace -e trace=clock_gettime date           # shows no clock_gettime syscall: served by vDSO
-# Dump the vDSO and list its symbols: read the [vdso] range from /proc/self/mem, then readelf -Ws
+grep -E 'vdso|vvar|vsyscall' /proc/self/maps   # where the kernel-supplied pages are mapped
+LD_SHOW_AUXV=1 /bin/true | grep SYSINFO        # AT_SYSINFO_EHDR = vDSO address passed by the kernel
+ldd /bin/ls | grep vdso                        # linux-vdso.so.1: listed, but no file on disk
+strace -e trace=clock_gettime date             # no clock_gettime syscall shown: served by the vDSO
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource   # tsc = vDSO fast path works
 ```
 
 ### Pitfalls
 
-- `strace` does not show vDSO calls (no syscall happens). Use `ltrace` or `perf`/`uprobes` to see them.
-- If the clocksource cannot be read from user space (e.g. an unstable TSC in some VMs), the vDSO falls back to a real syscall and loses its speed advantage. Check `/sys/devices/system/clocksource/clocksource0/current_clocksource`.
-- Statically linked or very old binaries may use `vsyscall`; `vsyscall=none` breaks them.
+- `strace` does not show vDSO calls. Use `ltrace` or `perf` / uprobes instead.
+- If the clocksource cannot be read from user space (e.g. an unstable TSC in a VM), the vDSO falls back to a real syscall and loses its speed advantage.
+- `vsyscall=none` breaks very old static binaries.
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| `memset` is a vDSO function | It is **not** in either vDSO. CPU-optimised `memset` comes from glibc (IFUNC, chosen at load time) or, in the kernel, from **alternatives** patched at boot. **⚠️ Verify.** |
+| vsyscall "syscall gate used in Intel only" | vsyscall is **x86_64-specific** (Intel and AMD). The "syscall gate" is the 32-bit vDSO's `__kernel_vsyscall`. |
+| vsyscall wraps **all** syscalls, picking `int`/`syscall`/`sysenter`; `sysenter` is the modern one | Picking the instruction is `__kernel_vsyscall` in the 32-bit vDSO. The x86_64 vsyscall page only ever had 3 functions. Normal syscalls go through glibc, which executes `syscall` directly. On x86_64 **`syscall`** is the modern instruction. **⚠️ Verify.** |
+| `read` is syscall 3 | 3 on **i386**; **0** on x86_64 (`arch/x86/entry/syscalls/syscall_64.tbl`) |
 
 ### Revision questions
 
-1. Why is `clock_gettime()` cheaper than `getpid()` on a modern Linux system?
+1. Why is `clock_gettime()` cheaper than `getpid()`?
 2. Why was vsyscall replaced by the vDSO?
 3. Does the vDSO appear in `ldd` output? Is there a file for it on disk?
 
 <details>
 <summary>Answers</summary>
 
-1. `clock_gettime()` is served by the vDSO: it reads kernel-maintained time data from `[vvar]` and the CPU counter in user mode, with no syscall. `getpid()` is a real syscall (glibc no longer caches the PID).
-2. vsyscall sits at a fixed, executable address in every process, which defeats ASLR and provides gadgets for exploits. The vDSO is an ELF object at a randomised address, and it can be extended with new functions.
-3. Yes, as `linux-vdso.so.1` (`linux-gate.so.1` on 32-bit x86), but there is no file on disk: the image is built into the kernel and mapped at `exec()`.
+1. The vDSO serves `clock_gettime()` by reading `[vvar]` and the CPU counter in user mode, with no syscall. `getpid()` is a real syscall.
+2. vsyscall sits at a fixed, executable address in every process, which defeats ASLR and gives exploits useful gadgets. The vDSO is at a randomised address and can be extended with new functions.
+3. Yes, as `linux-vdso.so.1`. There is no file: the image is built into the kernel and mapped at `exec()`.
 
 </details>
 
 ### Source pointers
 
-- `arch/x86/entry/vdso/` (`vma.c`: mapping; `vclock_gettime.c`), `arch/x86/entry/vsyscall/vsyscall_64.c`
-- `arch/arm64/kernel/vdso/`, `lib/vdso/gettimeofday.c` (generic vDSO time code)
-- `Documentation/ABI/stable/vdso`, `man 7 vdso`
+- `arch/x86/entry/vdso/`, `arch/x86/entry/vsyscall/vsyscall_64.c`, `arch/arm64/kernel/vdso/`
+- `lib/vdso/gettimeofday.c` (generic vDSO time code), `man 7 vdso`
 
 ---
 
 ## 5. The First Processes: PID 0, PID 1 (`init`) and PID 2 (`kthreadd`)
 
-### Overview
-
-Once the kernel has initialised, it creates the first two tasks itself: **PID 1** becomes the user-space `init` (systemd), the ancestor of every user process, and **PID 2**, **`kthreadd`**, creates every other kernel thread. **Kernel threads** are tasks that run only in kernel mode and have no user address space. That is why `ps` shows them in `[brackets]` with zero memory.
-
-### Key concepts
-
-- **PID 0** is the **idle task** (`swapper`, `init_task`). It is statically defined in the kernel image, not forked, and is the boot CPU's original thread; every CPU gets its own idle task. It never appears in `ps`, which is why PID 1 and PID 2 show **PPID 0**.
-- *Raw notes said "pid 1 is created out of nothing".* More precisely, PID 1 and PID 2 are the first tasks **forked from PID 0** in `rest_init()`. They are the only ones not created by `fork()`/`clone()` from user space.
-- **PID 1** starts life as a kernel thread running `kernel_init()`. It finishes booting (frees `__init` memory, runs the initramfs `/init`), then `exec`s the user-space init (`/sbin/init` → systemd), becoming a normal user process. If PID 1 exits, the kernel panics. It also **adopts orphaned user processes** (unless a subreaper, `PR_SET_CHILD_SUBREAPER`, is closer).
-- Every schedulable entity, whether a user thread, a process or a kernel thread, is a **`struct task_struct`** (`include/linux/sched.h`). The kernel does not distinguish "process" from "thread" at this level; threads are tasks that share an `mm`, files, etc. (`clone()` flags). A process's **PID** is really the **TGID** (thread-group ID), and each thread has its own TID.
-- Every task is visible under `/proc`: `/proc/<pid>` for thread-group leaders, `/proc/<pid>/task/<tid>` for each thread. *Raw notes said creation "automatically produces /proc/pid". procfs does not create files when a task is created. It is a pseudo-filesystem that **generates `/proc/<pid>` entries on demand** when you look them up, by finding the task. Non-leader threads are also reachable as `/proc/<tid>`, but they are not listed by `ls /proc`.*
-- **PID 2, `kthreadd`**, is a real kernel thread (*raw notes said "fake pid 2"*). Its job is to create kernel threads: `kthread_create()` queues a request, and `kthreadd` forks the new thread.
-- *Raw notes said kernel threads are "adopted" by PID 2 "for ease of reference".* They are not adopted: their parent is PID 2 because **`kthreadd` creates them**. Adoption (reparenting on parent death) is a user-process mechanism handled by PID 1/subreapers. The effect is the same: `ps --ppid 2` lists all kernel threads (110 on the test box).
-- **Why kernel threads show `VSZ 0` / `RSS 0`** (the raw notes asked why): they have **no user address space** (`task->mm == NULL`). `ps` reports user-space memory only. Their kernel stack and data are kernel memory, counted in `/proc/meminfo` (`KernelStack`, `Slab`), not per process. The speed angle: when the scheduler switches to a kernel thread, it simply **borrows the previous task's page tables** (`active_mm`, "lazy TLB"). Since all processes share the same kernel half of the address space, no page-table switch or TLB flush is needed.
+> **Remember**
+>
+> - **PID 0** = the **idle task** (`swapper`, `init_task`). It is built into the kernel image, not forked. It creates PID 1 and PID 2 in `rest_init()`, which is why both show **PPID 0**.
+> - **PID 1** starts as a kernel thread, then `exec`s **systemd**. It is the ancestor of every user process, adopts orphans, and if it exits the kernel **panics**.
+> - **PID 2 `kthreadd`** creates **every other kernel thread**, so `ps --ppid 2` lists them all.
+> - **Kernel threads** have no user address space (`mm == NULL`). That is why `ps` shows them as `[name]` with `VSZ 0` / `RSS 0`.
+> - Every thread, process and kernel thread is one **`struct task_struct`**. A "PID" is really the thread group ID (**TGID**).
 
 ### How it works
 
@@ -648,55 +632,63 @@ Once the kernel has initialised, it creates the first two tasks itself: **PID 1*
 start_kernel()                       PID 0 (idle / swapper), static init_task
   └─> rest_init()
         ├─ user_mode_thread(kernel_init)  → PID 1
-        │     kernel_init(): finish init, free __init memory,
+        │     finish init, free __init memory,
         │     run /init (initramfs) or /sbin/init  ──exec──> systemd (user space)
         │           └─> all user processes (login, sshd, bash, ...)
         ├─ kernel_thread(kthreadd)        → PID 2
-        │     loops: kthread_create_list → fork kernel threads
+        │     loop: take requests from kthread_create_list → fork kernel threads
         │           └─> kworker/*, ksoftirqd/*, migration/*, rcu_*, kswapd0, ...
-        └─ cpu_startup_entry()            PID 0 becomes the idle loop
+        └─ cpu_startup_entry()            PID 0 becomes the idle loop (one per CPU)
 ```
 
-Reading the class `ps` output (test box):
+### Key concepts
 
-| Column / item | Meaning |
-| ------------- | ------- |
-| `[kthreadd]` in brackets | Kernel thread: no command line (`/proc/<pid>/cmdline` is empty), so `ps` shows the thread name in brackets |
-| `VSZ 0`, `RSS 0` | No user address space (`mm == NULL`); `/proc/2/maps` is empty |
-| `STAT` `S` / `I` / `<` / `s` | Sleeping / **Idle** kernel thread (does not count towards load average) / high priority (negative nice) / session leader |
-| `systemd --system --deserialize=67` | systemd has re-executed itself (e.g. after a package upgrade, `systemctl daemon-reexec`) and read its saved state back from fd 67. Still PID 1 |
-| `/proc/<pid>/status` `Kthread: 1` | Flags a kernel thread (recent kernels; present on 6.8) |
+- **Tasks, not processes:** threads are just tasks that share an `mm`, open files, etc. (`clone()` flags). Each thread has its own TID. The process's PID is the TGID.
+- **`/proc/<pid>`** entries are **generated on demand** when looked up (procfs is a pseudo-filesystem). Threads are in `/proc/<pid>/task/<tid>`.
+- **Why kernel threads show 0 memory:** `ps` reports **user** memory only. Their stacks and data are kernel memory (`KernelStack` and `Slab` in `/proc/meminfo`).
+- **Lazy TLB (why kernel threads are cheap):** a kernel thread borrows the previous task's page tables (`active_mm`). The kernel half is identical in every address space, so there is no page-table switch or TLB flush.
+- **Parent vs adoption:** a kernel thread's parent is PID 2 because **kthreadd created it**. Adoption (reparenting when a parent dies) is a user-process mechanism, handled by PID 1 or a subreaper (`PR_SET_CHILD_SUBREAPER`).
 
-Common kernel thread names:
+### Reading `ps` output
+
+| Item | Meaning |
+| ---- | ------- |
+| `[kthreadd]` | Kernel thread: empty `/proc/<pid>/cmdline`, so `ps` shows the name in brackets |
+| `VSZ 0`, `RSS 0` | No user address space (`mm == NULL`) |
+| `STAT` `S` / `I` / `<` / `s` | Sleeping / **Idle** kernel thread (not counted in the load average) / high priority / session leader |
+| `systemd --deserialize=67` | systemd re-executed itself (e.g. after an upgrade) and restored its state from fd 67. Still PID 1. |
+| `Kthread: 1` in `/proc/<pid>/status` | Flags a kernel thread |
+
+<details>
+<summary>▶ Common kernel thread names</summary>
 
 | Name | Purpose |
 | ---- | ------- |
-| `kworker/<cpu>:<id>[H]` | **Workqueue** worker bound to a CPU (`H` = high-priority pool) |
+| `kworker/<cpu>:<id>[H]` | **Workqueue** worker bound to a CPU (`H` = high priority) |
 | `kworker/u<n>:<id>` | Unbound workqueue worker |
-| `kworker/R-<wq>` | **Rescuer** thread for a `WQ_MEM_RECLAIM` workqueue: guarantees progress under memory pressure (name truncated, e.g. `R-rcu_g` = `rcu_gp`) |
-| `pool_workqueue_release` | Frees workqueue pool structures (kthread worker, 6.x) |
-| `ksoftirqd/<cpu>` | Runs deferred softirqs when load is high |
-| `migration/<cpu>` | Stopper thread: moves tasks between CPUs |
-| `rcu_tasks_*_kthread`, `rcu_preempt` | RCU grace-period machinery |
-| `kswapd0` | Page reclaim per NUMA node |
-| `idle_inject/<cpu>`, `cpuhp/<cpu>` | Idle injection, CPU hotplug |
+| `kworker/R-<wq>` | **Rescuer** thread for a `WQ_MEM_RECLAIM` workqueue: guarantees progress under memory pressure |
+| `ksoftirqd/<cpu>` | Runs deferred softirqs under load |
+| `migration/<cpu>` | Moves tasks between CPUs |
+| `rcu_preempt`, `rcu_tasks_*` | RCU grace-period machinery |
+| `kswapd0` | Page reclaim (one per NUMA node) |
+| `cpuhp/<cpu>`, `idle_inject/<cpu>` | CPU hotplug, idle injection |
+
+</details>
 
 ### Key APIs / structures
 
 | API | Header | Purpose | Context |
 | --- | ------ | ------- | ------- |
-| `kthread_run(fn, data, namefmt, ...)` | `<linux/kthread.h>` | Create **and** wake a kernel thread (child of `kthreadd`) | Process context, may sleep |
+| `kthread_run(fn, data, namefmt, ...)` | `<linux/kthread.h>` | Create **and** start a kernel thread (a child of `kthreadd`) | Process context, may sleep |
 | `kthread_create()` + `wake_up_process()` | `<linux/kthread.h>` | Create stopped, then start | Process context, may sleep |
+| `kthread_should_stop()` | `<linux/kthread.h>` | Checked in the thread's loop | In the kthread |
 | `kthread_stop(task)` | `<linux/kthread.h>` | Ask the thread to stop and wait for it to exit | Process context, sleeps |
-| `kthread_should_stop()` | `<linux/kthread.h>` | Poll in the thread's loop | In the kthread |
-| `struct task_struct` | `<linux/sched.h>` | One per task (thread/process/kernel thread) | n/a |
-| `current` | `<asm/current.h>` | Pointer to the running task's `task_struct` | Process context (meaningless in IRQ) |
-| `current->mm` / `current->active_mm` | `<linux/sched.h>` | `mm` is `NULL` for kernel threads; `active_mm` is the borrowed one | Any |
-| `init_task` | `<linux/sched/task.h>` | PID 0's static `task_struct` | n/a |
+| `current` | `<asm/current.h>` | The running task's `task_struct` | Process context |
+| `current->mm` / `->active_mm` | `<linux/sched.h>` | `mm` is `NULL` in kernel threads; `active_mm` is the borrowed one | Any |
 
 ### Code example
 
-Minimal kernel-thread module. Full file and `Makefile`: [`examples/kthread_demo/`](examples/kthread_demo/). **Built on 6.8 x86_64** (not loaded).
+Full file and `Makefile`: [`examples/kthread_demo/`](examples/kthread_demo/). **Built on 6.8 x86_64** (not loaded).
 
 ```c
 // SPDX-License-Identifier: GPL-2.0
@@ -734,228 +726,188 @@ MODULE_LICENSE("GPL");				/* GPL-compatible licence: needed for GPL-only kthread
 MODULE_DESCRIPTION("Minimal kernel thread demo");	/* shown by modinfo */
 ```
 
-After `insmod`, `ps -o pid,ppid,vsz,rss,comm -C kthread_demo` shows PPID 2 and VSZ/RSS 0, and `dmesg` shows `mm=0000000000000000` (`%p` hashing prints NULL as zeros).
+**What to expect after `insmod`:** `ps` shows PPID 2 with VSZ/RSS 0, and `dmesg` shows `mm=0000000000000000`.
 
 ### Commands / debugging
 
 ```sh
-ps -ef | head                        # PID 1 and 2 have PPID 0
-ps --ppid 2 -o pid,stat,comm         # all kernel threads
-ps -eo pid,ppid,vsz,rss,stat,comm    # VSZ/RSS 0 for kernel threads
-grep Kthread /proc/2/status          # Kthread: 1
-ls /proc/1/task/                     # threads (TIDs) of a process
-ps -eLf | head                       # one line per thread (LWP = TID)
-cat /proc/2/cmdline | wc -c          # 0: why ps shows [kthreadd]
-pstree -p 1 | head                   # user-space tree under systemd
-cat /sys/devices/virtual/workqueue/*/per_cpu 2>/dev/null   # workqueue attributes
+ps -ef | head                        # PID 1 and PID 2 both have PPID 0
+ps --ppid 2 -o pid,stat,comm         # every kernel thread (children of kthreadd)
+ps -eo pid,ppid,vsz,rss,stat,comm    # VSZ/RSS are 0 for kernel threads
+grep Kthread /proc/2/status          # Kthread: 1 marks a kernel thread
+cat /proc/2/cmdline | wc -c          # 0 bytes: why ps shows [kthreadd]
+ls /proc/1/task/                     # thread IDs (TIDs) of a process
+ps -eLf | head                       # one line per thread (LWP column = TID)
+pstree -p 1 | head                   # user-space process tree under systemd
 ```
 
 ### Pitfalls
 
-- Kernel threads must not touch user memory (`copy_from_user()` has no `mm` to use).
-- A kthread loop that never checks `kthread_should_stop()` makes `rmmod` hang in `kthread_stop()`.
-- Kernel threads cannot be killed with signals by default; they must opt in (`allow_signal()`).
-- Killing PID 1 (or PID 1 exiting) → kernel panic: "Attempted to kill init!".
+- A kthread loop that never checks `kthread_should_stop()` makes `rmmod` hang forever in `kthread_stop()`.
+- Forgetting `kthread_stop()` in module exit → the thread runs code that has been unloaded → oops.
+- Kernel threads have no `mm`, so they must not touch user memory. They ignore signals unless they opt in (`allow_signal()`).
+- If PID 1 exits → kernel panic ("Attempted to kill init!").
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| PID 1 is "created out of nothing" | PID 1 and PID 2 are **forked from PID 0** in `rest_init()`, the only tasks not created by `fork()`/`clone()` from user space |
+| Creating a task "automatically produces `/proc/pid`" | procfs **generates** `/proc/<pid>` on demand when it is looked up; no files are created |
+| "fake PID 2" | `kthreadd` is a **real** kernel thread |
+| Kernel threads are "adopted" by PID 2 | Not adopted: PID 2 **created** them. Adoption is for orphaned user processes (PID 1). |
 
 ### Revision questions
 
-1. Why do PID 1 and PID 2 both show a PPID of 0, and what is PID 0?
-2. Why does `ps` show `VSZ` and `RSS` of 0 for `[kworker/0:1]`, and what page tables does it run on?
+1. Why do PID 1 and PID 2 both show PPID 0, and what is PID 0?
+2. Why does `ps` show `VSZ`/`RSS` of 0 for `[kworker/0:1]`, and what page tables does it run on?
 3. What is the difference between a kernel thread's parent being `kthreadd` and a user process being reparented to `init`?
 
 <details>
 <summary>Answers</summary>
 
-1. Both are created directly by PID 0, the static idle/swapper task (`init_task`), in `rest_init()`. PID 0 is not shown by `ps`.
-2. Kernel threads have no user address space (`mm == NULL`), and `ps` reports user memory only. They run on whatever page tables were loaded (`active_mm` borrowed from the previous task), since the kernel half is identical in all of them; this avoids a TLB flush.
-3. `kthreadd` is the real creator (parent) of every kernel thread. Reparenting to `init` (or a subreaper) happens only when a user process's parent dies, so that orphans can be reaped.
+1. Both are created directly by PID 0, the static idle/swapper task, in `rest_init()`. `ps` does not show PID 0.
+2. Kernel threads have no user address space (`mm == NULL`), and `ps` reports user memory only. They borrow the previous task's page tables (`active_mm`, lazy TLB), since the kernel half is the same in all of them.
+3. `kthreadd` really created every kernel thread. Reparenting happens only when a user process's parent dies, so that the orphan can be reaped.
 
 </details>
 
 ### Source pointers
 
-- `init/main.c` (`rest_init()`, `kernel_init()`), `init/init_task.c` (`init_task`)
-- `kernel/kthread.c` (`kthreadd()`, `kthread_create_on_node()`), `include/linux/kthread.h`
-- `kernel/workqueue.c`, `Documentation/core-api/workqueue.rst` (kworker naming, rescuers)
-- `kernel/exit.c` (`find_new_reaper()`, orphan reparenting), `kernel/sched/core.c` (`context_switch()`, lazy TLB)
+- `init/main.c` (`rest_init()`, `kernel_init()`), `init/init_task.c`
+- `kernel/kthread.c` (`kthreadd()`), `kernel/workqueue.c`, `Documentation/core-api/workqueue.rst`
+- `kernel/exit.c` (orphan reparenting), `kernel/sched/core.c` (`context_switch()`, lazy TLB)
 
 ---
 
 ## 6. Kernel Headers: In-Tree, Module-Build and UAPI
 
-### Overview
+> **Remember**
+>
+> - "Kernel headers" means **three different things**:
+>   1. **Internal** headers in the source tree (`include/linux/`): for kernel code, **no stable API**.
+>   2. The **headers package** (`/lib/modules/$(uname -r)/build`): for building modules against **one exact** installed kernel.
+>   3. **UAPI** headers (`/usr/include/linux/`): for user-space programs, a **stable ABI**.
+> - The headers package includes `.config` and `Module.symvers`, not just `.h` files.
+> - Always build modules through Kbuild: `make -C /lib/modules/$(uname -r)/build M=$PWD modules`.
 
-"Kernel headers" can mean three different things: the **internal headers** in the kernel source tree (`include/linux/`), the **headers package** used to build out-of-tree modules for a specific installed kernel (`/usr/src/linux-headers-<ver>`), and the **UAPI headers** exported to user space (`/usr/include/linux`). Using the wrong set is a classic source of build failures and of `Invalid module format` at `insmod`.
+### The three header sets
 
-### Key concepts
+| | Internal headers | Headers package | UAPI headers |
+| - | ---------------- | --------------- | ------------ |
+| Location | `include/linux/`, `arch/<arch>/include/asm/` | `/usr/src/linux-headers-<ver>` via `/lib/modules/$(uname -r)/build` | `/usr/include/linux/`, `/usr/include/asm/` |
+| Used by | The kernel and modules | Out-of-tree modules for **that** kernel | User-space programs, glibc |
+| Stability | **None**: changes every release | Matches one build (version + `.config`) | **Stable**: never broken on purpose |
+| Comes from | kernel.org source | `linux-headers-$(uname -r)` package | `include/uapi/` → `make headers_install`; Ubuntu `linux-libc-dev` |
 
-| | Internal kernel headers | Headers package (module build tree) | UAPI (user-space API) headers |
-| - | ----------------------- | ----------------------------------- | ----------------------------- |
-| Location | Source tree: `include/linux/`, `include/asm-generic/`, `arch/<arch>/include/asm/` | `/usr/src/linux-headers-<ver>-generic`, reached via `/lib/modules/$(uname -r)/build` | `/usr/include/linux/`, `/usr/include/asm/` |
-| Used by | The kernel and modules | Out-of-tree modules for **that exact** installed kernel | User-space programs, glibc |
-| Stability | **No stable API**: changes every release | Matches one build (version + `.config`) | **Stable ABI**: never broken on purpose |
-| Source | `git`/tarball from kernel.org | Distro package `linux-headers-$(uname -r)` | `include/uapi/` via `make headers_install`; Ubuntu package `linux-libc-dev` |
+- `#include <linux/module.h>` → `include/linux/module.h`. `#include <asm/page.h>` → `arch/x86/include/asm/page.h` for the architecture being built.
+- **No stable in-kernel API** (`Documentation/process/stable-api-nonsense.rst`): internal functions and structs change freely, and all in-tree users are updated with them. Only the user-space boundary (syscalls, UAPI, `/proc`, `/sys`) is stable.
+- **What the headers package adds beyond `.h` files:** `.config`, `Module.symvers` (exported symbols + CRCs), `include/generated/` (`autoconf.h`, `utsrelease.h`), Makefiles, Kconfig, `scripts/`.
 
-- Kernel code includes headers as `#include <linux/module.h>` (→ `include/linux/module.h`) and `#include <asm/page.h>` (→ `arch/x86/include/asm/page.h` for the architecture being built).
-- The kernel has **no stable in-kernel API**: functions and structures in `include/linux/` change between releases, and out-of-tree modules must follow (see `Documentation/process/stable-api-nonsense.rst`). Only the user-space ABI (syscalls, UAPI headers, `/proc`, `/sys`) is stable.
-- A headers package is **not the full source**. It holds headers, Makefiles/Kbuild, Kconfig, `scripts/`, plus build-specific files: `.config`, `Module.symvers` (exported symbols and CRCs for modversions), `include/generated/` (`autoconf.h`, `utsrelease.h`), `include/config/`.
-
-### How it works
-
-Test box layout (Ubuntu 24.04, checked 28 Sep 2026):
+### Test box layout
 
 ```text
-/lib/modules/6.8.0-139-generic/build ──> /usr/src/linux-headers-6.8.0-139-generic   (29 MB)
-                                            ├─ .config, Module.symvers, Makefile
-                                            ├─ include/generated/, include/config/, arch/x86/include/generated/
-                                            └─ block, fs, mm, ... ──symlinks──> ../linux-headers-6.8.0-139/  (128 MB)
-                                                                              common, flavour-independent part:
-                                                                              headers, Kbuild, Kconfig, scripts
-/usr/include/linux/  (587 UAPI headers, package linux-libc-dev)
-~/Advanced_Linux_Kernel_Course/linux/     full source, 6.12.111   (shallow git clone)
-~/Advanced_Linux_Kernel_Course/linux7.2/  full source, 7.2.8      (from linux-7.2.8.tar.xz, 1.8 GB; include/linux/ has ~1600 headers)
+/lib/modules/6.8.0-139-generic/build ──> /usr/src/linux-headers-6.8.0-139-generic   (flavour: .config,
+                                            │                                          Module.symvers, generated/)
+                                            └─ symlinks ──> /usr/src/linux-headers-6.8.0-139/   (common part:
+                                                                                     headers, Kbuild, scripts)
+/usr/include/linux/                     UAPI headers (linux-libc-dev)
+~/Advanced_Linux_Kernel_Course/linux/     full source 6.12.111 (shallow git clone)
+~/Advanced_Linux_Kernel_Course/linux7.2/  full source 7.2.8
 ```
 
-#### Kernel source tree: top-level directories
+Both the `-139` (running) and `-142` (installed) header sets are present. Use `-139` until you reboot (§1).
 
-`ls ~/Advanced_Linux_Kernel_Course/linux7.2` (full source). The headers package (`/usr/src/linux-headers-6.8.0-139`) shows the **same directory names**, but they mostly hold only `Makefile`/`Kconfig`/`Kbuild` files and headers, not `.c` sources. The extra **`ubuntu/`** directory there is Ubuntu's own additions.
+### Kernel source tree: top-level directories
+
+The ones to know first are in **bold**. The headers package has the same directory names but mostly only Makefiles, Kconfig and headers. Ubuntu adds `ubuntu/`.
 
 | Directory | Contents |
 | --------- | -------- |
-| `arch/` | Architecture-specific code: `arch/x86/`, `arch/arm64/`, … (boot, entry/syscalls, MMU, interrupts, `include/asm/`, defconfigs, Device Trees in `arch/*/boot/dts/`) |
-| `block/` | Block layer: request queues, I/O schedulers (`mq-deadline`, BFQ), partitions |
-| `certs/` | Certificates/keyrings for module signing and trusted keys |
-| `crypto/` | Crypto API and algorithm implementations (AES, SHA, …) |
-| `Documentation/` | Kernel docs in reStructuredText (`make htmldocs`); also at docs.kernel.org |
-| `drivers/` | Device drivers, by far the largest directory (`net/`, `gpu/`, `usb/`, `char/`, `block/`, …) |
-| `fs/` | VFS core plus each filesystem (`ext4/`, `btrfs/`, `proc/`, `sysfs/`, …) |
-| `include/` | Architecture-independent headers: `include/linux/` (internal), `include/uapi/` (user-space API), `include/asm-generic/` |
-| `init/` | Boot-time initialisation: `main.c` (`start_kernel()`, `kernel_init()`), `Kconfig` "General setup" |
-| `io_uring/` | io_uring asynchronous I/O interface |
-| `ipc/` | System V IPC and POSIX message queues (semaphores, shared memory, `mqueue`) |
-| `kernel/` | Core kernel: scheduler (`sched/`), `fork.c`, `exit.c`, signals, timers (`time/`), locking, RCU, `kthread.c`, tracing (`trace/`), BPF (`bpf/`), printk, modules |
-| `lib/` | Generic helpers: string functions, lists, rbtrees, bitmaps, decompressors, CRCs |
-| `mm/` | Memory management: page allocator, slab (SLUB), `vmalloc`, page faults, reclaim, `mmap` |
-| `net/` | Networking stack: sockets, TCP/IP (`ipv4/`, `ipv6/`), netfilter, Bluetooth, … |
-| `rust/` | Rust support: bindings and abstractions for writing kernel code in Rust |
-| `samples/` | Small example modules/programs for kernel APIs (kprobes, BPF, ftrace, …): good learning material |
-| `scripts/` | Build helpers and tools: Kconfig front ends, `checkpatch.pl`, `get_maintainer.pl`, modpost, `decode_stacktrace.sh` |
-| `security/` | LSM framework and modules: SELinux, AppArmor, Landlock, Yama, IMA/EVM |
-| `sound/` | ALSA sound subsystem and sound drivers |
-| `tools/` | User-space tools built from the tree: `perf`, `bpftool`, selftests (`tools/testing/selftests/`) |
-| `usr/` | Builds the initramfs embedded in the kernel (`gen_init_cpio`) |
-| `virt/` | Architecture-independent virtualisation: KVM core (`virt/kvm/`) |
-| `COPYING`, `LICENSES/` | GPL-2.0 licence and the SPDX licence texts |
-| `CREDITS`, `MAINTAINERS` | Contributors; who maintains each subsystem/file (use `scripts/get_maintainer.pl`) |
-| `Kbuild`, `Kconfig`, `Makefile` | Top of the build system: build rules, config menu root, main Makefile (version number at the top) |
-| `README` | Pointer to `Documentation/` |
-
-- Ubuntu splits headers into a **common** package (`linux-headers-6.8.0-139`) and a **flavour** package (`linux-headers-6.8.0-139-generic`) that adds the flavour's `.config`, `Module.symvers` and generated files and symlinks the rest.
-- Both the `-139` (running) and `-142` (installed, not yet booted) header sets are present. Modules must use `-139` until reboot (Section 1).
+| **`arch/`** | Architecture-specific code (`x86/`, `arm64/`): boot, syscall entry, MMU, `include/asm/`, Device Trees |
+| **`drivers/`** | Device drivers: by far the largest directory |
+| **`fs/`** | VFS plus each filesystem (`ext4/`, `proc/`, `sysfs/`) |
+| **`include/`** | `linux/` (internal), `uapi/` (user-space API), `asm-generic/` |
+| **`init/`** | Boot initialisation: `main.c` (`start_kernel()`) |
+| **`kernel/`** | Core: scheduler (`sched/`), `fork.c`, signals, timers, locking, RCU, `kthread.c`, tracing, BPF, modules |
+| **`mm/`** | Memory management: page allocator, SLUB, `vmalloc`, page faults, reclaim |
+| **`net/`** | Networking stack |
+| `block/` | Block layer, I/O schedulers |
+| `crypto/`, `certs/` | Crypto API; keys for module signing |
+| `ipc/`, `io_uring/` | System V IPC and message queues; io_uring |
+| `lib/` | Helpers: strings, lists, rbtrees, CRCs, decompressors |
+| `security/` | LSMs: SELinux, AppArmor, Landlock, Yama |
+| `sound/`, `virt/`, `rust/` | ALSA; KVM core; Rust support |
+| `samples/` | Small example modules: good learning material |
+| `scripts/`, `tools/` | Build helpers (`checkpatch.pl`, `get_maintainer.pl`, modpost); `perf`, `bpftool`, selftests |
+| `usr/` | Builds the initramfs embedded in the kernel |
+| `Documentation/` | reStructuredText docs (also at docs.kernel.org) |
+| `MAINTAINERS`, `COPYING`, `LICENSES/`, `Makefile`, `Kconfig`, `Kbuild` | Maintainers list; licence; top of the build system (the version number is at the top of `Makefile`) |
 
 ### Commands / debugging
 
 ```sh
-sudo apt install linux-headers-$(uname -r)          # headers for the running kernel
-readlink -f /lib/modules/$(uname -r)/build           # where module builds look
-make -C /lib/modules/$(uname -r)/build M=$PWD modules   # build an out-of-tree module
-dpkg -S /usr/include/linux/types.h                    # → linux-libc-dev (UAPI)
-make headers_install INSTALL_HDR_PATH=/tmp/uapi       # export UAPI headers from a source tree
-grep -rn 'EXPORT_SYMBOL' kernel/kthread.c | head      # what a module may call
+sudo apt install linux-headers-$(uname -r)              # install headers for the running kernel
+readlink -f /lib/modules/$(uname -r)/build              # where module builds look for headers
+make -C /lib/modules/$(uname -r)/build M=$PWD modules   # build an out-of-tree module in this directory
+dpkg -S /usr/include/linux/types.h                      # shows linux-libc-dev: these are UAPI headers
+make headers_install INSTALL_HDR_PATH=/tmp/uapi         # export UAPI headers from a source tree
+grep -rn 'EXPORT_SYMBOL' kernel/kthread.c | head        # which functions modules are allowed to call
 ```
 
 ### Pitfalls
 
-- Building a module with `-I/usr/include` or including `<linux/...>` from `/usr/include`: those are **UAPI** headers, not the kernel's internal ones. Always build through Kbuild (`make -C …/build M=$PWD`).
-- User-space code must never include kernel-internal headers; use UAPI headers only.
-- Headers from a different version/config than the running kernel → build errors, or `insmod` fails with `Invalid module format` / `disagrees about version of symbol` (vermagic/modversions mismatch).
-- Code written against one source tree (e.g. `linux7.2`) may not build against the test box's 6.8 headers: internal APIs change. Check the target version.
+- Including `<linux/...>` from `/usr/include` (`-I/usr/include`) when building a module: those are **UAPI** headers. Always build through Kbuild.
+- User-space code must never include kernel-internal headers.
+- Headers from a different version/config than the running kernel → build errors, or `Invalid module format` / `disagrees about version of symbol` at load time.
+- Code written against the 7.2 tree may not build against the test box's 6.8 headers.
 
 ### Revision questions
 
-1. What is the difference between `/usr/include/linux/sched.h` and `include/linux/sched.h` in the kernel source?
+1. What is the difference between `/usr/include/linux/sched.h` and `include/linux/sched.h` in the source tree?
 2. Why does the headers package need `Module.symvers` and `.config`, not just `.h` files?
 3. Why can Linux promise user space a stable ABI but not promise module authors a stable API?
 
 <details>
 <summary>Answers</summary>
 
-1. `/usr/include/linux/sched.h` is the exported **UAPI** header (from `include/uapi/linux/sched.h`) for user space: clone flags, scheduling policies. `include/linux/sched.h` is the internal kernel header defining `struct task_struct` etc., for kernel code only.
-2. `.config` (via `include/generated/autoconf.h`) decides struct layouts and which code exists (`CONFIG_*`). `Module.symvers` lists exported symbols and their CRCs so modpost can resolve and version-check the module's imports against that exact kernel.
-3. The syscall/UAPI boundary is small and deliberately frozen ("don't break user space"). Internal interfaces are kept free to change so they can be improved and fixed. All in-tree users are updated in the same change, and out-of-tree code is expected to follow or be upstreamed.
+1. The first is the **UAPI** header for user space (clone flags, scheduling policies). The second is internal and defines `struct task_struct` etc. for kernel code only.
+2. `.config` (via `autoconf.h`) decides struct layouts and which code exists. `Module.symvers` lists the exported symbols and their CRCs, so modpost can resolve and version-check the module's imports against that exact kernel.
+3. The syscall/UAPI boundary is small and deliberately frozen ("don't break user space"). Internal interfaces must stay free to change so they can be improved. In-tree users are updated together, and out-of-tree code must follow or be upstreamed.
 
 </details>
 
 ### Source pointers
 
-- `include/linux/`, `include/uapi/`, `arch/x86/include/asm/`, `arch/x86/include/uapi/asm/`
-- `Documentation/kbuild/modules.rst` (building external modules), `Documentation/kbuild/headers_install.rst`
-- `Documentation/process/stable-api-nonsense.rst`
-- `scripts/mod/modpost.c` (`Module.symvers` handling)
+- `include/linux/`, `include/uapi/`, `arch/x86/include/asm/`
+- `Documentation/kbuild/modules.rst`, `Documentation/kbuild/headers_install.rst`, `Documentation/process/stable-api-nonsense.rst`
+- `scripts/mod/modpost.c`
 
 ---
 
 ## 7. Loadable Kernel Modules (LKMs)
 
+> **Remember**
+>
+> - A **module** (`.ko`) is kernel code loaded into the **running** kernel. It runs in kernel mode with full privileges: **no sandbox**, and a bug can crash the whole system.
+> - It can only use **exported** symbols and hook into **registration APIs** (drivers, filesystems, netfilter, …). It cannot replace the scheduler, page allocator or syscall table. Custom scheduling uses **sched_ext** (BPF), not modules.
+> - **`MODULE_LICENSE()`** is mandatory. A non-GPL licence **taints** the kernel and blocks `EXPORT_SYMBOL_GPL` symbols (≈ 60 % of exports).
+> - **vermagic** in `.modinfo` ties a `.ko` to one kernel build: if it does not match, the load fails.
+> - `insmod`/`rmmod` do **no** dependency handling. `modprobe` / `modprobe -r` do, using `modules.dep`.
+> - Every module needs `module_init()` + `module_exit()`. If init fails, undo everything (`goto` unwinding); in exit, clean up everything.
+
 ### Overview
 
-A **loadable kernel module** (LKM, `.ko` file) is a piece of kernel code that can be loaded into and unloaded from the running kernel. It plugs into **predefined extension points**: driver models, filesystems, network protocols, notifier chains, and so on. It runs in kernel mode with full privileges, in the same address space as the rest of the kernel. In Linux almost everything can be built as a module (drivers, filesystems, netfilter, crypto), which is how distributions ship one generic kernel for all hardware. The test box has 95 modules loaded.
+Modules are how distributions ship **one generic kernel** for all hardware: drivers, filesystems, netfilter and crypto are loaded on demand. The test box has about 95 modules loaded.
 
-### Key concepts
-
-- A module is **not** a separate process or sandbox. It is linked into the kernel at load time, and a bug in it can crash or compromise the whole system.
-- A module can only use kernel symbols that are **exported** (`EXPORT_SYMBOL`, `EXPORT_SYMBOL_GPL`) and only hook into places the kernel exposes via a registration API (`register_chrdev`, `platform_driver_register`, `register_filesystem`, `nf_register_net_hook`, …).
-- **What modules cannot do** (things wired into the core kernel):
-  - Replace the core scheduler, page allocator, or syscall table (not exported, and deliberately not pluggable).
-  - Add a new **scheduling class**: `struct sched_class` instances are built into the kernel and not registrable from modules.
-  - *Raw notes said "you cannot affect low-level scheduling algorithms (at least until 7.1/7.2)". Custom scheduling policies became possible in **6.12** with **sched_ext** (`CONFIG_SCHED_CLASS_EXT`, a `bool`, so built-in only): the policy is written as a **BPF program** loaded at runtime, **not** as a kernel module. It is present in both course trees (6.12.111 and 7.2.8). **⚠️ Verify** what the instructor meant by 7.1/7.2.*
-- **Licence restricts the API**: `EXPORT_SYMBOL_GPL()` symbols are only linkable by modules declaring a GPL-compatible `MODULE_LICENSE()`. On the test box kernel, 18053 of 30363 exported symbols (≈ 60 %) are GPL-only (`Module.symvers`). A proprietary module also **taints** the kernel (Section 2).
-
-#### `MODULE_LICENSE()` values
-
-Every module must declare a licence (a missing `MODULE_LICENSE()` is a **modpost build error** in current kernels). The kernel only compares the **string**: GPL-compatible strings (`license_is_gpl_compatible()` in `include/linux/license.h`) are:
-
-| String | Meaning |
-| ------ | ------- |
-| `"GPL"` | GPL v2 or later (the usual choice) |
-| `"GPL v2"` | GPL v2 only |
-| `"GPL and additional rights"` | GPL v2 plus extra rights |
-| `"Dual BSD/GPL"`, `"Dual MIT/GPL"`, `"Dual MPL/GPL"` | Dual-licensed; choose either |
-| `"Proprietary"` (or any other string) | **Not** GPL-compatible → kernel **tainted** (`P`, "module license 'Proprietary' taints kernel"), and **GPL-only symbols forbidden** |
-
-- *Raw notes listed "gpl gplv2 lgpl mt". There is **no `"LGPL"`** string in the list (it would count as non-GPL and taint). "mt" is presumably `"Dual MIT/GPL"`.*
-- *Raw notes said `MODULE_LICENSE` is "legally binding as open source". The macro is a **declaration** that the kernel acts on technically (tainting, symbol access). The legal obligations come from the licence of the code itself and the GPL of the kernel (Section 2).*
-
-#### `.modinfo`: metadata embedded in the `.ko`
-
-The `MODULE_*()` macros and `module_param()` store `key=value` strings in the ELF section **`.modinfo`**. `modinfo` pretty-prints it. The raw section of the course example (`objcopy -O binary -j .modinfo hello.ko /dev/stdout | tr '\0' '\n'`):
-
-```text
-author=Advanced Linux Kernel Programming course
-description=Minimal hello-world loadable kernel module
-license=GPL                                    ← MODULE_LICENSE()
-parm=count:Number of greetings to print ...    ← MODULE_PARM_DESC()
-parmtype=count:int                             ← module_param()
-srcversion=AF7AB8636E61230A11A31ED             ← added by modpost (hash of sources)
-depends=                                       ← added by modpost (modules this one needs)
-retpoline=Y                                    ← built with Spectre v2 mitigation
-name=hello
-vermagic=6.8.0-139-generic SMP preempt mod_unload modversions   ← added by the build
-```
-
-- The instructor stressed three fields: **`license`**, **`parm`** (module parameters: *raw notes said `MODULE_PARAM`; the macros are `module_param()` + `MODULE_PARM_DESC()`*), and **`vermagic`**.
-- **vermagic** is added automatically from the kernel build tree (`include/linux/vermagic.h`): kernel release + key options (`SMP`, preemption model, `mod_unload`, `modversions`). It **ties the module to one kernel build**: if it does not match the running kernel, the load fails (`disagrees about version of …` / `Invalid module format`). `modprobe --force-vermagic` can override this, but that is dangerous and taints the kernel (`F`).
-- With **`modversions`** the loader also checks a **CRC per imported symbol** (`__versions` section) against `Module.symvers`, which catches ABI changes even when vermagic matches.
-- Other fields also matter in practice: **`alias`** (from `MODULE_DEVICE_TABLE`) lets udev/`modprobe` **auto-load** drivers for detected hardware, and **`depends`** tells `modprobe` what to load first.
-
-### How it works
+### Life cycle
 
 ```text
 hello.c ──Kbuild (make -C /lib/modules/$(uname -r)/build M=$PWD)──> hello.ko
-   (modpost checks imports against Module.symvers, adds vermagic + modinfo)
+   (modpost checks imports against Module.symvers, adds vermagic + .modinfo)
 
 insmod hello.ko / modprobe hello
-   └─> finit_module() syscall
+   └─> finit_module() syscall   (needs CAP_SYS_MODULE, §8)
          ├─ check signature (CONFIG_MODULE_SIG), vermagic, symbol CRCs (modversions)
          ├─ allocate memory, relocate, resolve symbols against exports
          ├─ apply module_param values
@@ -964,23 +916,51 @@ rmmod hello
    └─> delete_module() syscall: refcount must be 0 → module_exit() → free
 ```
 
+### Licences: `MODULE_LICENSE()`
+
+The kernel only compares the **string**. These count as GPL-compatible:
+
+| String | Meaning |
+| ------ | ------- |
+| `"GPL"` | GPL v2 or later (the usual choice) |
+| `"GPL v2"` | GPL v2 only |
+| `"GPL and additional rights"` | GPL v2 plus extra rights |
+| `"Dual BSD/GPL"`, `"Dual MIT/GPL"`, `"Dual MPL/GPL"` | Dual-licensed |
+| anything else (e.g. `"Proprietary"`) | **Taints** the kernel (`P`); GPL-only symbols forbidden |
+
+A missing `MODULE_LICENSE()` is a **build error** in current kernels.
+
+### `.modinfo`: metadata inside the `.ko`
+
+The `MODULE_*()` macros store `key=value` strings in the ELF section `.modinfo`. `modinfo` prints them. The instructor stressed **`license`**, **`parm`** and **`vermagic`**:
+
+```text
+license=GPL                                    ← MODULE_LICENSE()
+parm=count:Number of greetings to print ...    ← MODULE_PARM_DESC()
+parmtype=count:int                             ← module_param()
+depends=                                       ← added by modpost: modules this one needs
+vermagic=6.8.0-139-generic SMP preempt mod_unload modversions   ← added by the build
+```
+
+- **vermagic** = kernel release + key options. A mismatch → `Invalid module format`. (`modprobe --force-vermagic` overrides it, which is dangerous and taints the kernel with `F`.)
+- **modversions** also checks a **CRC per imported symbol** against `Module.symvers`, which catches ABI changes even when vermagic matches.
+- **`alias`** (from `MODULE_DEVICE_TABLE`) lets udev auto-load drivers for detected hardware. **`depends`** tells `modprobe` what to load first.
+
 ### Key APIs / structures
 
 | Macro / function | Header | Purpose |
 | ---------------- | ------ | ------- |
 | `module_init(fn)` / `module_exit(fn)` | `<linux/module.h>` | Entry/exit points (process context, may sleep) |
-| `__init` / `__exit` | `<linux/init.h>` | Place code in sections freed after init / dropped if built-in |
-| `MODULE_LICENSE("GPL")` | `<linux/module.h>` | Required; decides GPL-only symbol access and tainting |
-| `MODULE_DESCRIPTION()`, `MODULE_AUTHOR()` | `<linux/module.h>` | Metadata shown by `modinfo` |
-| `MODULE_PARM_DESC(name, "text")` | `<linux/moduleparam.h>` | Parameter description (`parm=` in `.modinfo`) |
-| `MODULE_DEVICE_TABLE(type, table)` | `<linux/module.h>` | Emit `alias=` entries for hardware auto-loading |
-| `module_param(name, type, perm)` | `<linux/moduleparam.h>` | Load-time parameter; appears in `/sys/module/<mod>/parameters/` |
-| `EXPORT_SYMBOL()` / `EXPORT_SYMBOL_GPL()` | `<linux/export.h>` | Make a symbol usable by other modules (GPL-only for the latter) |
+| `__init` / `__exit` | `<linux/init.h>` | Code freed after init / dropped if built in |
+| `MODULE_LICENSE()`, `MODULE_DESCRIPTION()`, `MODULE_AUTHOR()` | `<linux/module.h>` | Metadata; the licence also controls symbol access and taint |
+| `module_param(name, type, perm)` + `MODULE_PARM_DESC()` | `<linux/moduleparam.h>` | Load-time parameter, visible in `/sys/module/<mod>/parameters/` |
+| `EXPORT_SYMBOL()` / `EXPORT_SYMBOL_GPL()` | `<linux/export.h>` | Make a symbol usable by other modules |
+| `MODULE_DEVICE_TABLE(type, table)` | `<linux/module.h>` | `alias=` entries for hardware auto-loading |
 | `try_module_get()` / `module_put()` | `<linux/module.h>` | Pin a module while its code may still run |
 
 ### Code example
 
-Full file and `Makefile`: [`examples/hello_module/`](examples/hello_module/). **Built on 6.8 x86_64** (`6.8.0-139-generic`, not loaded).
+Full file and `Makefile`: [`examples/hello_module/`](examples/hello_module/). **Built on 6.8 x86_64** (not loaded).
 
 ```c
 // SPDX-License-Identifier: GPL-2.0
@@ -1025,151 +1005,151 @@ clean:	# target run by "make clean"
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean	# let Kbuild delete all generated files (.ko, .o, .mod.c, ...)
 ```
 
-`modinfo hello.ko` on the test box: `license: GPL`, `vermagic: 6.8.0-139-generic SMP preempt mod_unload modversions`, `parm: count:… (int)`. The build prints "Skipping BTF generation … unavailability of vmlinux", which is harmless.
+The build prints "Skipping BTF generation … unavailability of vmlinux". This is harmless.
 
-#### Module dependencies: `rmmod` vs `modprobe` (class demo: `vfat` / `fat`)
+### Dependencies: `rmmod` vs `modprobe` (class demo: `vfat` → `fat`)
 
-`vfat` (long-filename FAT) uses symbols exported by `fat` (the common FAT code), so `vfat` **depends on** `fat`, and `fat`'s refcount counts `vfat` as a user.
+`vfat` uses symbols exported by `fat`, so `fat`'s refcount counts `vfat` as a user:
 
 ```text
 $ lsmod | grep fat
 vfat     20480  0
-fat      86016  1 vfat          ← "Used by: 1 (vfat)"
-
+fat      86016  1 vfat                              ← used by 1 module: vfat
 $ sudo rmmod fat
 rmmod: ERROR: Module fat is in use by: vfat        ← refcount > 0, refused
-$ sudo rmmod vfat && sudo rmmod fat                ← remove in reverse order: works
+$ sudo rmmod vfat && sudo rmmod fat                ← reverse order: works
 $ sudo modprobe vfat                               ← loads fat first, then vfat
-$ sudo modprobe -r vfat                            ← removes vfat, then unused fat
+$ sudo modprobe -r vfat                            ← removes vfat, then the now-unused fat
 ```
 
-*(Raw notes wrote `rmod`; the command is **`rmmod`**. Output reconstructed.)*
-
-| Tool | Resolves dependencies? | Input |
-| ---- | ---------------------- | ----- |
-| `insmod` | No: fails with `Unknown symbol …` if `fat` is not loaded | Path to a `.ko` file |
+| Tool | Handles dependencies? | Takes |
+| ---- | --------------------- | ----- |
+| `insmod` | No: `Unknown symbol` if a dependency is missing | Path to a `.ko` |
 | `rmmod` | No: refuses if the module is in use | Module name |
-| `modprobe` | **Yes**: uses `/lib/modules/$(uname -r)/modules.dep` (generated by `depmod`) | Module name (or alias) |
-| `modprobe -r` | **Yes**: also removes dependencies that are no longer used | Module name |
+| `modprobe` / `modprobe -r` | **Yes**, via `modules.dep` (generated by `depmod`) | Module name or alias |
 
-- **On the course machines this demo will not work as shown**: `fat` and `vfat` are **built in** (`CONFIG_FAT_FS=y`, `CONFIG_VFAT_FS=y` on the test box; also built in on the Pi). `modinfo vfat` shows `filename: (builtin)`, and `rmmod vfat` gives `Module vfat is builtin`. Built-in code can never be unloaded.
-- Test-box alternative with a real dependency: `udf` depends on `crc-itu-t` (`modinfo -F depends udf`). Loaded examples with users: `bridge` → `stp` → `llc`, and `nf_conntrack` ← `nf_nat` (see `lsmod`). *Loading/unloading needs root: ask first.*
+- **On the course machines this demo will not work as shown:** `fat`/`vfat` are **built in** (`modinfo vfat` → `filename: (builtin)`), and built-in code can never be unloaded. Test-box alternative: `udf` depends on `crc-itu-t`. *Loading or unloading modules needs root: ask first.*
 
-#### `/proc/modules` and `/sys/module/`
+### `/proc/modules` vs `/sys/module/`
 
 | Path | Contents |
 | ---- | -------- |
-| `/proc/modules` | One line per **loaded** module: name, size, refcount (users), dependents, state (`Live`/`Loading`/`Unloading`), load address (zeros unless root, via `kptr_restrict`). `lsmod` just formats this file. |
-| `/sys/module/<name>/` | One directory per module: loaded modules **and** built-in code that has parameters or a version (`parameters/`, `refcnt`, `sections/`, `holders/`, `taint`, `initstate`, `srcversion`). |
+| `/proc/modules` | One line per **loaded** module: name, size, refcount, users, state, address. `lsmod` just formats this file. |
+| `/sys/module/<name>/` | Loaded modules **and** built-in code that has parameters: `parameters/`, `refcnt`, `holders/`, `sections/`. Built-in parameters are set on the kernel command line as `<module>.<param>=value`. |
 
-- *Raw notes said `/sys/modules`; correct is **`/sys/module`** (singular).*
-- Test box: 94 lines in `/proc/modules` but 219 entries in `/sys/module/`. The extra ones are **built-in** "modules" such as `kernel`, `printk`, `ext4` (built in on Ubuntu), shown only because they have parameters. Built-in module parameters are set on the kernel command line as `<module>.<param>=value`.
+Test box: 94 loaded modules, but 219 entries in `/sys/module/`, because of built-ins such as `printk` and `kernel`.
 
 ### Commands / debugging
 
 ```sh
-lsmod                                   # loaded modules, size, users
-cat /proc/modules                       # raw source of lsmod
-ls /sys/module/hello/                   # parameters/, refcnt, sections/, holders/ ...
-cat /sys/module/printk/parameters/time  # built-in parameter (printk.time= on cmdline)
+lsmod                                   # loaded modules, size and users (formats /proc/modules)
 modinfo hello.ko                        # license, vermagic, params, depends
-modinfo -F vermagic hello.ko            # one field
-objcopy -O binary -j .modinfo hello.ko /dev/stdout | tr '\0' '\n'   # raw .modinfo
-uname -r                                # compare with vermagic
-sudo insmod hello.ko count=3            # load a file (no dependency handling)
-sudo modprobe <name>                    # load by name from /lib/modules, with dependencies
-sudo rmmod hello                        # unload
-sudo dmesg | tail                       # pr_info() output (dmesg_restrict=1 on test box)
-cat /sys/module/hello/parameters/count
-cat /proc/sys/kernel/tainted            # non-zero after proprietary/unsigned/out-of-tree modules
-awk '{print $4}' /lib/modules/$(uname -r)/build/Module.symvers | sort | uniq -c   # GPL vs non-GPL exports
+modinfo -F vermagic hello.ko            # print a single field
+uname -r                                # compare with vermagic: they must match
+sudo insmod hello.ko count=3            # load a file with a parameter (no dependency handling)
+sudo modprobe <name>                    # load by name from /lib/modules, dependencies first
+sudo rmmod hello                        # unload (refused while in use)
+sudo dmesg | tail                       # pr_info() output (dmesg_restrict=1 on the test box)
+cat /sys/module/hello/parameters/count  # read a parameter at runtime
+cat /proc/sys/kernel/tainted            # 0 = clean; non-zero after proprietary/unsigned/out-of-tree modules
+objcopy -O binary -j .modinfo hello.ko /dev/stdout | tr '\0' '\n'   # dump the raw .modinfo section
 ```
 
 ### Pitfalls
 
-- `module_init` returning an error means the module is **not** loaded: undo any partial setup first (`goto` unwinding).
-- Forgetting cleanup in `module_exit` (timers, kthreads, registered callbacks) → the kernel later calls into freed module code → oops.
-- Out-of-tree/unsigned modules taint the kernel (`O`, `E` flags). With Secure Boot + lockdown, unsigned modules are refused.
-- Using a GPL-only symbol without `MODULE_LICENSE("GPL")` → modpost error `… is a GPL-only symbol`, or load failure.
+- `module_init` returning an error means the module is **not** loaded, so undo any partial setup first (`goto` unwinding).
+- Missing cleanup in `module_exit` (timers, kthreads, callbacks) → the kernel later calls freed code → oops.
+- Out-of-tree/unsigned modules taint the kernel (`O`, `E`). With Secure Boot + lockdown, unsigned modules are refused.
+- A GPL-only symbol without `MODULE_LICENSE("GPL")` → modpost error `… is a GPL-only symbol`.
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| Modules can't affect low-level scheduling "until 7.1/7.2" | Custom scheduling became possible in **6.12** with **sched_ext** (built-in `CONFIG_SCHED_CLASS_EXT`). The policy is a **BPF program**, not a module. **⚠️ Verify** what 7.1/7.2 referred to. |
+| Licences: "gpl gplv2 lgpl mt" | There is **no `"LGPL"`** string: it would taint. "mt" is presumably `"Dual MIT/GPL"`. |
+| `MODULE_LICENSE` is "legally binding as open source" | It is a **declaration** the kernel acts on technically (taint, symbol access). The legal obligations come from the code's actual licence. |
+| `MODULE_PARAM` | `module_param()` + `MODULE_PARM_DESC()` |
+| `rmod`, `/sys/modules` | **`rmmod`**, **`/sys/module`** (singular) |
 
 ### Revision questions
 
-1. What can a module do, and what core kernel behaviour can it not change? How does sched_ext fit?
+1. What can a module do, and what can it not change? How does sched_ext fit?
 2. What is the difference between `insmod` and `modprobe`?
 3. Why does `MODULE_LICENSE()` matter at build and load time?
+4. A module built on another machine fails with `Invalid module format`. What do you check first?
 
 <details>
 <summary>Answers</summary>
 
-1. It can add drivers, filesystems, protocols, hooks and so on through exported APIs and registration points. It cannot replace non-exported core machinery: scheduler classes, syscall table, page allocator. sched_ext (6.12+) allows custom scheduling policies, but as BPF programs attached to a built-in scheduling class, not as modules.
-2. `insmod` loads one given file with no dependency resolution. `modprobe` finds the module by name in `/lib/modules/$(uname -r)`, loads its dependencies first (`modules.dep`) and applies `/etc/modprobe.d` options.
-3. GPL-compatible licences may link against `EXPORT_SYMBOL_GPL` symbols (modpost/loader enforce this), and non-GPL modules taint the kernel (`P`), which affects debugging and support.
+1. It can add drivers, filesystems, protocols and hooks through exported APIs and registration points. It cannot replace non-exported core machinery (scheduler classes, syscall table, page allocator). sched_ext (6.12+) allows custom scheduling policies as BPF programs attached to a built-in scheduling class.
+2. `insmod` loads one given file with no dependency resolution. `modprobe` finds the module by name, loads its dependencies first (`modules.dep`) and applies `/etc/modprobe.d` options.
+3. Only GPL-compatible licences may use `EXPORT_SYMBOL_GPL` symbols (modpost and the loader enforce this). Non-GPL modules taint the kernel (`P`).
+4. `modinfo -F vermagic` against `uname -r`: the module must be built against the running kernel's headers.
 
 </details>
 
 ### Source pointers
 
-- `kernel/module/main.c` (`load_module()`, `finit_module`), `include/linux/module.h`, `include/linux/export.h`
-- `kernel/sched/ext.c`, `Documentation/scheduler/sched-ext.rst` (sched_ext)
+- `kernel/module/main.c` (`load_module()`), `include/linux/module.h`, `include/linux/export.h`, `include/linux/license.h`
+- `kernel/sched/ext.c`, `Documentation/scheduler/sched-ext.rst`
 - `Documentation/kbuild/modules.rst`, `Documentation/admin-guide/module-signing.rst`
 
 ---
 
 ## 8. Linux Capabilities
 
-*Raw notes: "kernel capabilities and where to find them and what they do". Interpreted as **Linux (POSIX) capabilities** (`CAP_*`). **⚠️ Verify**: if the instructor meant kernel features/config options, see `/boot/config-$(uname -r)` (Section 1).*
+*Interpreted as **Linux (POSIX) capabilities** (`CAP_*`). **⚠️ Verify**: the raw notes said "kernel capabilities and where to find them". If that meant kernel features/config options, see `/boot/config-$(uname -r)` (§1).*
 
-### Overview
+> **Remember**
+>
+> - **Capabilities** split root's power into **41** independent privileges (`CAP_*`, bits 0–40). The kernel checks the **specific** capability an operation needs, not "is UID 0?".
+> - Each thread has **5 sets**. **Effective** is what the kernel checks. **Permitted** is what the thread may raise. **Bounding** is a ceiling that can never be exceeded.
+> - **File capabilities** give a binary one privilege without setuid root (e.g. `ping`: `cap_net_raw=ep`).
+> - In kernel code: `capable(CAP_X)` / `ns_capable()`, and return **`-EPERM`** if the check fails.
+> - Loading modules needs **`CAP_SYS_MODULE`**, which is effectively root. So is `CAP_SYS_ADMIN`.
 
-Traditional UNIX has two privilege levels: root (UID 0, bypasses all checks) and everyone else. **Capabilities** split root's power into ~41 independent privileges (`CAP_NET_ADMIN`, `CAP_SYS_MODULE`, …) that can be given to a process or file individually. The kernel checks **the specific capability** an operation needs, not "is this root?". This is the basis of least privilege for daemons, containers and `setcap` binaries.
+### The five capability sets
 
-### Key concepts
-
-- Each thread has **five capability sets** (bitmasks, visible in `/proc/<pid>/status`):
-
-| Set | Field | Meaning |
-| --- | ----- | ------- |
+| Set | `/proc/<pid>/status` | Meaning |
+| --- | -------------------- | ------- |
 | **Effective** | `CapEff` | What the kernel actually checks right now |
 | **Permitted** | `CapPrm` | Upper limit the thread may raise into Effective |
-| **Inheritable** | `CapInh` | May be passed across `execve()` (only with matching file caps) |
-| **Bounding** | `CapBnd` | Hard ceiling: can never be gained, even via setuid-root/file caps |
+| **Inheritable** | `CapInh` | May be passed across `execve()` (only with matching file capabilities) |
+| **Bounding** | `CapBnd` | Hard ceiling: never gained, even by setuid-root programs |
 | **Ambient** | `CapAmb` | Kept across `execve()` of non-privileged programs (4.3+) |
 
-- **File capabilities** (xattr `security.capability`) give a binary specific capabilities at `exec` without setuid root. Test box: `/usr/bin/ping cap_net_raw=ep` (e = effective, p = permitted).
-- Capabilities are **per user namespace**: root in a container has capabilities only over resources owned by its namespace (`ns_capable()`).
-- `CAP_SYS_ADMIN` is the overloaded "new root": avoid depending on it in new code; prefer a specific capability.
-
-Test box, 28 Sep 2026 (`cap_last_cap` = 40, i.e. 41 capabilities, bits 0–40 → mask `0x1ffffffffff`):
-
-| Process | `CapEff` | Meaning |
-| ------- | -------- | ------- |
-| Normal shell (user `alex`) | `0000000000000000` | No capabilities |
+| Test box process | `CapEff` | Meaning |
+| ---------------- | -------- | ------- |
+| Normal shell (`alex`) | `0000000000000000` | No capabilities |
 | PID 1 (systemd, root) | `000001ffffffffff` | All 41 |
-| Everyone | `CapBnd` `000001ffffffffff` | Nothing removed from the bounding set |
 
-### Capabilities met so far in the course
+- Capabilities are **per user namespace**: root in a container has power only over its own namespace's resources (`ns_capable()`).
+- `CAP_SYS_ADMIN` is the overloaded "new root". Prefer a specific capability.
+
+### Capabilities met so far
 
 | Capability | # | Grants | Section |
 | ---------- | - | ------ | ------- |
-| `CAP_SYS_MODULE` | 16 | Load/unload kernel modules (`init_module`, `finit_module`, `delete_module`) | 7 |
-| `CAP_SYSLOG` | 34 | See real kernel addresses when `kptr_restrict=1`; read `dmesg` when `dmesg_restrict=1` | 1 |
-| `CAP_NET_RAW` | 13 | Raw/packet sockets (`ping`) | — |
-| `CAP_NET_ADMIN` | 12 | Network configuration (interfaces, routes, firewall) | — |
-| `CAP_NET_BIND_SERVICE` | 10 | Bind ports < 1024 | — |
-| `CAP_SYS_ADMIN` | 21 | Catch-all: mount, many ioctls, … | — |
-| `CAP_SYS_PTRACE` | 19 | `ptrace` any process, read others' `/proc/<pid>/mem` | — |
-| `CAP_PERFMON` / `CAP_BPF` | 38 / 39 | Performance monitoring / BPF, split from `CAP_SYS_ADMIN` in 5.8 | — |
-| `CAP_CHECKPOINT_RESTORE` | 40 | CRIU checkpoint/restore (last one, `CAP_LAST_CAP`) | — |
+| `CAP_SYS_MODULE` | 16 | Load/unload modules | §7 |
+| `CAP_SYSLOG` | 34 | Real kernel addresses when `kptr_restrict=1`; `dmesg` when `dmesg_restrict=1` | §1 |
+| `CAP_NET_RAW` | 13 | Raw/packet sockets (`ping`) | |
+| `CAP_NET_ADMIN` | 12 | Network configuration | |
+| `CAP_NET_BIND_SERVICE` | 10 | Bind ports < 1024 | |
+| `CAP_SYS_ADMIN` | 21 | Catch-all: mount, many ioctls, … | |
+| `CAP_SYS_PTRACE` | 19 | `ptrace` any process | |
+| `CAP_PERFMON` / `CAP_BPF` | 38 / 39 | perf / BPF (split out of `CAP_SYS_ADMIN` in 5.8) | |
+| `CAP_CHECKPOINT_RESTORE` | 40 | CRIU; the last one (`CAP_LAST_CAP`) | |
 
 ### Key APIs / structures (kernel side)
 
 | API | Header | Purpose | Context |
 | --- | ------ | ------- | ------- |
-| `capable(CAP_X)` | `<linux/capability.h>` | Does `current` have `CAP_X` in the **initial** user namespace? Sets `PF_SUPERPRIV`, runs LSM hooks | Process context |
+| `capable(CAP_X)` | `<linux/capability.h>` | Does `current` have `CAP_X` in the **initial** user namespace? (runs LSM hooks) | Process context |
 | `ns_capable(ns, CAP_X)` | `<linux/capability.h>` | Same, relative to user namespace `ns` | Process context |
-| `file_ns_capable(file, ns, CAP_X)` | `<linux/capability.h>` | Check against the credentials of whoever **opened** `file` | Process context |
-| `has_capability(task, CAP_X)` | `<linux/capability.h>` | Check another task without auditing | Process context |
-| `struct cred` (`cap_effective`, …) | `<linux/cred.h>` | Where the sets live (`current_cred()`) | Any (RCU) |
+| `file_ns_capable(file, ns, CAP_X)` | `<linux/capability.h>` | Check the credentials of whoever **opened** `file` | Process context |
+| `has_capability(task, CAP_X)` | `<linux/capability.h>` | Check another task, without auditing | Process context |
+| `struct cred` | `<linux/cred.h>` | Where the sets live (`current_cred()`) | Any (RCU) |
 
 ### Code example
 
@@ -1178,7 +1158,6 @@ Typical permission check in a driver's `ioctl` handler (fragment):
 ```c
 #include <linux/capability.h>	/* capable(), CAP_* constants */
 #include <linux/fs.h>		/* struct file */
-
 static long demo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) /* ioctl entry point */
 {							/* start of demo_ioctl() */
 	if (!capable(CAP_SYS_ADMIN))			/* privileged operation: require CAP_SYS_ADMIN (initial userns) */
@@ -1188,47 +1167,45 @@ static long demo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) /
 }							/* end of demo_ioctl() */
 ```
 
-Check the **narrowest** capability that fits (e.g. `CAP_NET_ADMIN` for network settings). Return `-EPERM` for a missing capability (`-EACCES` is for file permission bits).
+Check the **narrowest** capability that fits (e.g. `CAP_NET_ADMIN` for network settings). Return `-EPERM` for a missing capability; `-EACCES` is for file permission bits.
 
 ### Commands / debugging
 
 ```sh
 grep ^Cap /proc/$$/status                 # the five sets of the current shell (hex bitmasks)
-capsh --decode=000001ffffffffff           # hex mask → capability names
-capsh --print                             # current process's capabilities, readable
+capsh --decode=000001ffffffffff           # turn a hex mask into capability names
+capsh --print                             # current process's capabilities, human-readable
 cat /proc/sys/kernel/cap_last_cap         # highest capability number this kernel knows (40)
 getcap /usr/bin/ping                      # file capabilities of a binary
-sudo setcap cap_net_bind_service=ep ./srv # give a binary one capability (ask first on the test box)
 getpcaps <pid>                            # capabilities of another process
-man 7 capabilities                        # full list and rules
+sudo setcap cap_net_bind_service=ep ./srv # give a binary one capability (ask first on the test box)
 ```
 
 ### Pitfalls
 
-- Checking `uid == 0` in kernel code instead of `capable()`: breaks with namespaces and bypasses LSMs.
-- Using `capable()` when the resource belongs to a user namespace (should be `ns_capable()`), or vice versa. A container root could get host-wide power.
-- Checking capabilities at `read`/`write` time rather than at `open` (use `file_ns_capable()` with the opener's creds). Otherwise a privileged process can be tricked into writing to an fd for an unprivileged one.
-- Many capabilities are **root-equivalent** in practice (`CAP_SYS_MODULE`: load any code into the kernel; `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_DAC_OVERRIDE`…). Granting them is not "least privilege".
+- Checking `uid == 0` in kernel code instead of `capable()`: this breaks with namespaces and bypasses LSMs.
+- `capable()` vs `ns_capable()` mix-ups: a container's root could get host-wide power.
+- Checking at `read`/`write` time instead of at `open`: a privileged process can be tricked into using an unprivileged fd. Use `file_ns_capable()`.
+- `CAP_SYS_MODULE`, `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE` and `CAP_DAC_OVERRIDE` are **root-equivalent**. Granting them is not least privilege.
 
 ### Revision questions
 
 1. What is the difference between the Permitted, Effective and Bounding sets?
 2. Why can `ping` send raw ICMP packets without being setuid root on Ubuntu?
-3. Which capability does `insmod` need, and why is it effectively root-equivalent?
+3. Which capability does `insmod` need, and why is it effectively root?
 
 <details>
 <summary>Answers</summary>
 
-1. Effective = what is checked now; Permitted = what may be raised into Effective; Bounding = absolute ceiling that no `exec` can exceed.
-2. The binary has the file capability `cap_net_raw=ep`, so it gains only `CAP_NET_RAW` at exec. (Many systems also allow unprivileged ICMP sockets via `net.ipv4.ping_group_range`.)
+1. Effective is what is checked now. Permitted is what may be raised into Effective. Bounding is the ceiling no `exec` can exceed.
+2. The binary has the file capability `cap_net_raw=ep`, so it gains only `CAP_NET_RAW` at exec.
 3. `CAP_SYS_MODULE`. A module runs arbitrary code in kernel mode, so it can grant itself anything.
 
 </details>
 
 ### Source pointers
 
-- `include/uapi/linux/capability.h` (the `CAP_*` numbers), `include/linux/capability.h`
-- `kernel/capability.c` (`capable()`, `ns_capable()`), `security/commoncap.c` (exec-time rules, `cap_capable()`)
+- `include/uapi/linux/capability.h` (`CAP_*` numbers), `kernel/capability.c`, `security/commoncap.c`
 - `include/linux/cred.h`, `man 7 capabilities`, `man 7 user_namespaces`
 
 ---
@@ -1241,61 +1218,83 @@ man 7 capabilities                        # full list and rules
 
 ## Quick Reference
 
+### Boot and images (§1)
+
 | Item | Meaning |
 | ---- | ------- |
-| `uname -r` | Running kernel release |
-| `uname -m` | Architecture (`x86_64`, `aarch64`) |
-| `uname -v` | Build number, SMP/PREEMPT flags, build date |
-| `sudo file /boot/vmlinuz-<ver>` | Identify image format and version |
-| `CONFIG_EFI_STUB` | bzImage is also a PE32+ EFI application |
-| `sudo hexdump -C /boot/vmlinuz-<ver> \| head` | See `MZ` / `PE` headers |
-| `/proc/self/maps` | Process user-space layout |
-| x86_64 user / kernel (4-level) | `0x0`–`0x7fff_ffff_ffff` / `0xffff_8000_0000_0000`– |
-| `copy_{from,to}_user()` | Only safe way to touch user memory; may sleep |
-| `/proc/meminfo` | System and kernel memory usage (`Slab`, `KernelStack`, `PageTables`, …) |
-| `vm.mmap_min_addr` | Lowest mappable user address (65536): NULL deref always faults |
-| `[vdso]` / `[vvar]` | Kernel-supplied shared object + its data page; syscall-free `clock_gettime` etc. |
-| `[vsyscall]` `0xffffffffff600000` | Legacy x86_64 fixed page; emulated (`vsyscall=xonly`) |
-| `kernel.kptr_restrict` | 0 = no restriction (still needs `CAP_SYSLOG` unless `perf_event_paranoid<=1`), 1 = `CAP_SYSLOG` only (Ubuntu), 2 = nobody (Android) |
-| `journalctl -k -b \| grep Memory:` | Kernel image size in RAM (code/rwdata/rodata/init/bss) |
-| `/proc/<pid>/maps` columns | range, perms (`p`/`s`), offset, dev, inode, path |
-| `/proc/<pid>/task/<tid>` | Per-thread entries (every `task_struct`) |
-| `cat /proc/sys/kernel/tainted` | Taint48GB SODIMM flags (0 = clean; `P` bit = proprietary module) |
-| `/lib/modules/$(uname -r)/build` | → headers package used for module builds |
-| `kernel/`, `mm/`, `fs/`, `drivers/`, `arch/` | Core, memory, filesystems, drivers, arch-specific code in the source tree |
-| `/usr/include/linux/` | UAPI headers (`linux-libc-dev`), user space only |
-| `make -C /lib/modules/$(uname -r)/build M=$PWD modules` | Build out-of-tree module |
-| `lsmod` / `modinfo` / `insmod` / `modprobe` / `rmmod` | Module management |
-| `module_init()` / `module_exit()` / `MODULE_LICENSE("GPL")` | Module skeleton essentials |
-| GPL-compatible `MODULE_LICENSE` | `"GPL"`, `"GPL v2"`, `"GPL and additional rights"`, `"Dual BSD/GPL"`, `"Dual MIT/GPL"`, `"Dual MPL/GPL"` |
-| `/proc/modules` | Loaded modules (what `lsmod` reads) |
-| `modprobe <m>` / `modprobe -r <m>` | Load/unload with dependencies (`modules.dep`, `depmod -a`) |
-| `modinfo -F depends <m>` / `filename: (builtin)` | Dependencies / built-in check |
-| `/sys/module/<name>/parameters/` | Module (incl. built-in) parameters at runtime |
-| `.modinfo` / `modinfo` | Embedded module metadata: license, parm, vermagic, depends, alias |
-| `EXPORT_SYMBOL_GPL` | Only usable by GPL-compatible modules (~60 % of exports on 6.8) |
-| sched_ext (`CONFIG_SCHED_CLASS_EXT`, 6.12+) | Custom scheduler policies via BPF, not modules |
-| `grep ^Cap /proc/$$/status` / `capsh --decode=<hex>` | Show and decode capability sets |
-| `getcap` / `setcap` | Read/set file capabilities |
-| `capable(CAP_X)` / `ns_capable()` | Kernel-side capability checks; return `-EPERM` if missing |
-| `CAP_SYS_MODULE` (16) | Needed to load/unload modules |
-| `ps --ppid 2` | List kernel threads (children of `kthreadd`) |
-| `[name]` in `ps`, `VSZ 0` | Kernel thread: no cmdline, no user `mm` |
-| `kthread_run()` / `kthread_stop()` / `kthread_should_stop()` | Kernel thread lifecycle |
-| x86_64 syscall entry | `syscall` instruction, number in `rax`; `__NR_read` = 0 (i386: 3, via `int 0x80`/`sysenter`) |
-| `/boot/vmlinuz-<ver>` | Compressed bootable kernel |
-| `/boot/initrd.img-<ver>` | initramfs |
-| `/boot/System.map-<ver>` | Static symbol table |
-| `/boot/config-<ver>` | Build config |
+| `uname -r` / `-m` / `-v` | Running release / architecture / build string |
+| `/boot/vmlinuz-<ver>` | Compressed bootable kernel (`bzImage` on x86) |
+| `/boot/initrd.img-<ver>` | initramfs: mounts the real root |
+| `/boot/System.map-<ver>` | Static, link-time symbol table |
+| `/boot/config-<ver>` | Build config (`CONFIG_*`) |
+| `vmlinux` | Uncompressed ELF for debuggers |
 | `/proc/cmdline` | Boot command line |
-| `/proc/kallsyms` | Live symbol addresses (root) |
-| `/lib/modules/$(uname -r)/` | Modules for running kernel; `build/` = headers for module builds |
-| `vmlinux` | Uncompressed ELF, for debuggers |
-| `CONFIG_KERNEL_{GZIP,BZIP2,LZMA,XZ,LZO,LZ4,ZSTD}` | Kernel image compression (xz = smallest, lz4 = fastest, zstd = modern default) |
-| `CONFIG_RD_*` | Initramfs formats the kernel can decompress |
-| `CONFIG_MODULE_COMPRESS_*` | Module compression (`.ko.zst`, `.ko.xz`) |
+| `/proc/kallsyms` | Live symbol addresses (real values for root only) |
+| `kernel.kptr_restrict` | 0 = no restriction, 1 = `CAP_SYSLOG` only (Ubuntu), 2 = nobody (Android) |
+| `CONFIG_EFI_STUB` | bzImage is also a PE32+ EFI application |
+| `CONFIG_KERNEL_{XZ,LZ4,ZSTD}` | Smallest / fastest / best trade-off (Ubuntu default) |
+| `journalctl -k -b \| grep Memory:` | Kernel image size in RAM |
 
-**Gotchas:** installed ≠ running; build modules against `uname -r`; KASLR makes `System.map` addresses differ from runtime; distro/BSP kernels ≠ mainline of the same version.
+### Kernel origins (§2)
+
+| Item | Meaning |
+| ---- | ------- |
+| mainline → stable/LTS → distro / BSP | Where every kernel comes from |
+| GKI + KMI | Android: one core kernel + vendor modules against a stable interface |
+| GPL-2.0 | Distributing a modified kernel → must provide the source |
+
+### Memory layout and vDSO (§3, §4)
+
+| Item | Meaning |
+| ---- | ------- |
+| x86_64 user / kernel (4-level) | `0x0`–`0x7fff_ffff_ffff` / from `0xffff_8000_0000_0000` |
+| `copy_{from,to}_user()` | Only safe way to touch user memory; may sleep |
+| `/proc/<pid>/maps` | range, perms (`p`/`s`), offset, dev, inode, path |
+| `/proc/meminfo` | Kernel usage: `Slab`, `KernelStack`, `PageTables`, `VmallocUsed` |
+| `vm.mmap_min_addr` | Lowest mappable address (65536): NULL deref always faults |
+| `[vdso]` / `[vvar]` | Kernel-supplied library + data page: syscall-free `clock_gettime` |
+| `[vsyscall]` `0xffffffffff600000` | Legacy x86_64 fixed page; emulated |
+| x86_64 syscall entry | `syscall` instruction, number in `rax`; `__NR_read` = 0 (i386: 3) |
+
+### Processes and kernel threads (§5)
+
+| Item | Meaning |
+| ---- | ------- |
+| PID 0 / 1 / 2 | idle (`swapper`) / `init` (systemd) / `kthreadd` |
+| `ps --ppid 2` | List all kernel threads |
+| `[name]`, `VSZ 0` | Kernel thread: no cmdline, `mm == NULL` |
+| `/proc/<pid>/task/<tid>` | Per-thread entries |
+| `kthread_run()` / `kthread_should_stop()` / `kthread_stop()` | Kernel thread lifecycle |
+
+### Headers and modules (§6, §7)
+
+| Item | Meaning |
+| ---- | ------- |
+| `/lib/modules/$(uname -r)/build` | Headers package used for module builds |
+| `/usr/include/linux/` | UAPI headers: user space only |
+| `make -C /lib/modules/$(uname -r)/build M=$PWD modules` | Build an out-of-tree module |
+| `module_init()` / `module_exit()` / `MODULE_LICENSE("GPL")` | Module skeleton essentials |
+| GPL-compatible licences | `"GPL"`, `"GPL v2"`, `"GPL and additional rights"`, `"Dual BSD/GPL"`, `"Dual MIT/GPL"`, `"Dual MPL/GPL"` |
+| `EXPORT_SYMBOL_GPL` | Usable only by GPL-compatible modules (~60 % of exports) |
+| `insmod` / `rmmod` | Load file / unload: **no** dependency handling |
+| `modprobe` / `modprobe -r` | Load/unload with dependencies (`modules.dep`, `depmod -a`) |
+| `lsmod` = `/proc/modules` | Loaded modules, refcounts, users |
+| `modinfo` / `.modinfo` | Metadata: license, parm, vermagic, depends, alias |
+| `modinfo -F depends <m>`; `filename: (builtin)` | Dependencies; built-in check |
+| `/sys/module/<name>/parameters/` | Module (incl. built-in) parameters |
+| `/proc/sys/kernel/tainted` | Taint flags (0 = clean, `P` = proprietary module) |
+| sched_ext (`CONFIG_SCHED_CLASS_EXT`, 6.12+) | Custom scheduling via BPF, not modules |
+
+### Capabilities (§8)
+
+| Item | Meaning |
+| ---- | ------- |
+| `grep ^Cap /proc/$$/status` / `capsh --decode=<hex>` | Show / decode capability sets |
+| `getcap` / `setcap` | Read / set file capabilities |
+| `capable(CAP_X)` / `ns_capable()` | Kernel-side checks; return `-EPERM` if missing |
+| `CAP_SYS_MODULE` (16) | Load/unload modules |
+
+**Gotchas:** installed ≠ running; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`.
 
 ---
 
@@ -1303,68 +1302,68 @@ man 7 capabilities                        # full list and rules
 
 | Term | Definition |
 | ---- | ---------- |
-| **`/boot`** | Directory (often a separate partition) holding kernel images, initramfs, symbol maps and configs. |
-| **BSP** | Board Support Package: SoC vendor's kernel tree, Device Trees, drivers and bootloader for its hardware. |
-| **Distribution kernel** | Kernel built and patched by a distro (Ubuntu, Fedora, …) from a stable/LTS release. |
-| **Boot protocol** | Architecture-specific contract for how a bootloader loads the kernel and passes control and parameters to it. |
-| **EFI stub** | Code linked into the kernel image that makes it a PE/COFF EFI application runnable directly by UEFI firmware. |
-| **PE32+** | 64-bit Portable Executable format used by UEFI applications (and Windows). |
-| **Boot image (Android)** | `boot.img` in the raw `boot` partition: `ANDROID!` header, kernel and ramdisk. |
-| **Canonical address** | 64-bit address whose unused top bits all equal the highest implemented bit; others fault. |
-| **Kernel space** | Upper part of every virtual address space, shared, accessible only in kernel mode. |
-| **SMAP / PAN** | x86 / ARM64 feature blocking kernel access to user pages except via explicit user-copy routines. |
-| **`TASK_SIZE`** | Top of the user-space address range. |
-| **User space** | Lower, per-process part of the virtual address space. |
-| **Demand paging** | Allocating/loading a physical page only when a mapped virtual page is first accessed. |
-| **Mapped** | A virtual page backed by a page-table entry pointing to a physical frame; unmapped access faults. |
-| **`mmap()`** | System call that creates a virtual memory mapping (VMA) in a process. |
-| **Page fault** | CPU exception on access to an unmapped or protected page; handled by the kernel. |
-| **vDSO** | Virtual Dynamic Shared Object: kernel-provided ELF library mapped into every process for syscall-free calls. |
-| **VMA** | `struct vm_area_struct`: one contiguous virtual memory region of a process. |
-| **vsyscall** | Legacy x86_64 fixed-address page for fast time calls; now emulated. |
-| **`CAP_SYSLOG`** | Capability needed to see real kernel addresses when `kptr_restrict=1`. |
-| **`kptr_restrict`** | Sysctl controlling exposure of kernel pointers (`/proc/kallsyms`, `%pK`). |
-| **`/proc/kallsyms`** | Live kernel (and module) symbol table with runtime addresses. |
-| **`syscall` instruction** | x86_64 fast system-call entry instruction; `sysenter`/`int 0x80` are 32-bit equivalents. |
-| **libc** | C runtime library (glibc on Ubuntu): standard C functions and system-call wrappers. |
-| **RELRO** | Relocation Read-Only: ELF data made read-only after dynamic linking. |
-| **`task_struct`** | Kernel structure describing every task (thread, process or kernel thread). |
-| **TGID** | Thread-group ID: what user space calls the PID; TID identifies each thread. |
-| **GPL-2.0** | GNU General Public License v2: the kernel's licence; distributing modified binaries requires releasing the source. |
-| **Fork (of the kernel)** | Private branch of patched kernel source that must be rebased on every upstream release. |
-| **Taint** | Kernel flag recording conditions (e.g. proprietary module loaded) that affect debugging/support. |
-| **Upstreaming** | Getting a change merged into mainline so the community maintains it. |
-| **Headers package** | Distro package with headers, Kbuild files, `.config` and `Module.symvers` for building modules against one kernel. |
-| **`Module.symvers`** | Build output listing exported symbols and CRCs, used by modpost. |
-| **UAPI** | User-space API headers (`include/uapi/`), exported to `/usr/include`; a stable ABI. |
-| **Loadable kernel module (LKM)** | `.ko` object loaded into the running kernel at predefined extension points. |
-| **`EXPORT_SYMBOL_GPL`** | Export macro restricting a symbol to GPL-compatible modules. |
-| **sched_ext** | Extensible scheduling class (6.12+) whose policy is a BPF program. |
-| **`depmod`** | Tool generating `modules.dep` (module dependency list) for `modprobe`. |
 | **`.modinfo`** | ELF section of a `.ko` holding `key=value` module metadata. |
-| **modversions** | Per-symbol CRC checking of module imports against the kernel (`CONFIG_MODVERSIONS`). |
-| **vermagic** | Module string recording kernel version and key config; must match the running kernel. |
+| **`/boot`** | Directory (often a separate partition) holding kernel images, initramfs, symbol maps and configs. |
+| **`/proc/kallsyms`** | Live kernel (and module) symbol table with runtime addresses. |
+| **Boot image (Android)** | `boot.img` in the raw `boot` partition: `ANDROID!` header, kernel and ramdisk. |
+| **Boot protocol** | Architecture-specific contract for how a bootloader loads the kernel and passes it control and parameters. |
+| **Bootloader** | Program started by the firmware (e.g. GRUB) that loads the kernel and initramfs and passes the command line. |
+| **BSP** | Board Support Package: an SoC vendor's kernel tree, Device Trees, drivers and bootloader. |
+| **bzImage** | x86 "big zImage" format: setup code plus a self-decompressing compressed kernel. |
+| **Canonical address** | 64-bit address whose unused top bits all equal the highest implemented bit; any other address faults. |
+| **`CAP_SYSLOG`** | Capability needed to see real kernel addresses when `kptr_restrict=1`. |
 | **Capability** | One independent slice of root's privileges (`CAP_*`), checked by the kernel per operation. |
-| **Capability sets** | Effective, Permitted, Inheritable, Bounding, Ambient bitmasks per thread. |
-| **File capabilities** | Capabilities attached to an executable (`security.capability` xattr) and granted at `exec`. |
+| **Capability sets** | Per-thread bitmasks: Effective, Permitted, Inheritable, Bounding, Ambient. |
+| **Demand paging** | Allocating or loading a physical page only when a mapped virtual page is first accessed. |
+| **`depmod`** | Tool that generates `modules.dep` (the module dependency list) for `modprobe`. |
+| **Distribution kernel** | Kernel built and patched by a distro (Ubuntu, Fedora, …) from a stable/LTS release. |
+| **EFI stub** | Code linked into the kernel image that makes it a PE/COFF EFI application that UEFI can run directly. |
+| **`EXPORT_SYMBOL_GPL`** | Export macro restricting a symbol to GPL-compatible modules. |
+| **File capabilities** | Capabilities attached to an executable (`security.capability` xattr), granted at `exec`. |
+| **Fork (of the kernel)** | Private branch of patched kernel source that must be rebased on every upstream release. |
+| **GKI** | Generic Kernel Image: Android's single common kernel binary; vendor code goes in modules against a stable KMI. |
+| **GPL-2.0** | The kernel's licence: distributing modified binaries requires providing the source. |
+| **Headers package** | Distro package with the headers, Kbuild files, `.config` and `Module.symvers` for building modules against one kernel. |
 | **Idle task (PID 0)** | Static `init_task` (`swapper`); per-CPU idle loop; parent of PIDs 1 and 2. |
 | **`init` (PID 1)** | First user-space process (systemd); adopts orphans; its exit panics the kernel. |
-| **Kernel thread** | Task running only in kernel mode with no user address space (`mm == NULL`). |
+| **initramfs** | Compressed `cpio` archive unpacked into RAM as the early root filesystem; mounts the real root. |
+| **KASLR** | Kernel Address Space Layout Randomisation: a random kernel base address at each boot. |
+| **Kernel space** | Upper part of every virtual address space: shared, accessible only in kernel mode. |
+| **Kernel thread** | Task that runs only in kernel mode, with no user address space (`mm == NULL`). |
+| **KMI** | Kernel Module Interface: the stable symbol/ABI set GKI guarantees to vendor modules. |
+| **`kptr_restrict`** | Sysctl controlling whether kernel pointers are shown (`/proc/kallsyms`, `%pK`). |
 | **`kthreadd` (PID 2)** | Kernel thread that creates all other kernel threads. |
 | **kworker** | Workqueue worker kernel thread. |
 | **Lazy TLB** | Kernel threads borrowing the previous task's page tables (`active_mm`) to avoid a switch. |
-| **Rescuer thread** | Per-workqueue `kworker/R-*` thread guaranteeing progress under memory pressure. |
-| **GKI** | Generic Kernel Image: Android's single common kernel binary; vendor code goes in modules against a stable KMI. |
-| **KMI** | Kernel Module Interface: the stable symbol/ABI set GKI guarantees to vendor modules. |
+| **libc** | C runtime library (glibc on Ubuntu): standard C functions and system-call wrappers. |
+| **Loadable kernel module (LKM)** | `.ko` object loaded into the running kernel at predefined extension points. |
 | **Mainline** | Linus Torvalds' upstream kernel tree. |
-| **zstd** | Zstandard compression; good ratio and fast decompression; common default for kernel, initramfs and modules. |
-| **Bootloader** | Firmware-launched program (e.g. GRUB) that loads the kernel and initramfs and passes the command line. |
-| **bzImage** | x86 "big zImage" format: setup code plus a self-decompressing compressed kernel. |
-| **initramfs** | Compressed `cpio` archive unpacked into RAM as the early root filesystem; mounts the real root. |
-| **KASLR** | Kernel Address Space Layout Randomisation: random kernel base address at each boot. |
+| **Mapped** | A virtual page backed by a page-table entry pointing to a physical frame; access to an unmapped page faults. |
+| **`mmap()`** | System call that creates a virtual memory mapping (VMA) in a process. |
+| **`Module.symvers`** | Build output listing exported symbols and their CRCs, used by modpost. |
+| **modversions** | Per-symbol CRC checking of a module's imports against the kernel (`CONFIG_MODVERSIONS`). |
+| **Page fault** | CPU exception on access to an unmapped or protected page, handled by the kernel. |
+| **PE32+** | 64-bit Portable Executable format used by UEFI applications (and Windows). |
+| **RELRO** | Relocation Read-Only: ELF data made read-only after dynamic linking. |
+| **Rescuer thread** | Per-workqueue `kworker/R-*` thread that guarantees progress under memory pressure. |
+| **sched_ext** | Extensible scheduling class (6.12+) whose policy is a BPF program. |
+| **SMAP / PAN** | x86 / ARM64 feature that blocks kernel access to user pages except via the user-copy routines. |
+| **`syscall` instruction** | x86_64 system-call entry instruction; `sysenter`/`int 0x80` are the 32-bit equivalents. |
 | **`System.map`** | Link-time kernel symbol table (address, type, name). |
-| **`vmlinux`** | Uncompressed ELF kernel image with symbols; used for debugging. |
+| **Taint** | Kernel flag recording conditions (e.g. a proprietary module loaded) that affect debugging and support. |
+| **`task_struct`** | Kernel structure describing every task (thread, process or kernel thread). |
+| **`TASK_SIZE`** | Top of the user-space address range. |
+| **TGID** | Thread-group ID: what user space calls the PID; each thread has its own TID. |
+| **UAPI** | User-space API headers (`include/uapi/`), exported to `/usr/include`; a stable ABI. |
+| **Upstreaming** | Getting a change merged into mainline so that the community maintains it. |
+| **User space** | Lower, per-process part of the virtual address space. |
+| **vDSO** | Virtual Dynamic Shared Object: kernel-provided ELF library mapped into every process for syscall-free calls. |
+| **vermagic** | Module string recording the kernel version and key config; must match the running kernel. |
+| **VMA** | `struct vm_area_struct`: one contiguous virtual memory region of a process. |
+| **`vmlinux`** | Uncompressed ELF kernel image with symbols, used for debugging. |
 | **`vmlinuz`** | Compressed bootable kernel image installed in `/boot`. |
+| **vsyscall** | Legacy x86_64 fixed-address page for fast time calls; now emulated. |
+| **zstd** | Zstandard compression: good ratio and fast decompression; the common default for kernel, initramfs and modules. |
 
 ---
 
@@ -1372,9 +1371,9 @@ man 7 capabilities                        # full list and rules
 
 - `file` shows `swap_dev 0XE` for the bzImage: which setup-header field is that exactly, and is it meaningful today?
 - "android pe32 embedded in the /boot partition": did the instructor mean the Android boot image (`boot.img`) in the `boot` partition, or an EFI-stub `Image`?
-- "User space on the order of 40 bits": which architecture/config was the instructor thinking of (47 on x86_64, 39 on some ARM64)?
+- "User space on the order of 40 bits": which architecture/config was meant (47 on x86_64, 39 on some ARM64)?
 - "memset may be HW accelerated" under the vDSO: was this about the vDSO, or about glibc IFUNC / kernel alternatives choosing a CPU-optimal `memset`?
-- vsyscall as "wrapper for all syscalls, choosing int/syscall/sysenter": is this about the 32-bit `__kernel_vsyscall` (vDSO), rather than the x86_64 vsyscall page? And is `syscall` (not `sysenter`) the modern x86_64 instruction?
+- vsyscall as "wrapper for all syscalls, choosing int/syscall/sysenter": is this the 32-bit `__kernel_vsyscall` (vDSO) rather than the x86_64 vsyscall page? And is `syscall` (not `sysenter`) the modern x86_64 instruction?
 - Licensing of out-of-tree proprietary modules: what is the course's position (derivative work or not)?
 - Modules "cannot affect low-level scheduling (until 7.1/7.2)": what changed in 7.1/7.2? sched_ext (BPF) has existed since 6.12.
 - "Kernel capabilities and where to find them": POSIX capabilities (`CAP_*`), or kernel features/config options?
