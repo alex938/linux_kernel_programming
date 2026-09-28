@@ -701,18 +701,14 @@ Minimal kernel-thread module. Full file and `Makefile`: [`examples/kthread_demo/
 ```c
 // SPDX-License-Identifier: GPL-2.0
 /* ^ SPDX tag: machine-readable licence of this file (required in kernel sources) */
-
 /*
  * kthread_demo.c - start a kernel thread at load, stop it at unload.
  */
-
 #include <linux/module.h>	/* module_init(), module_exit(), MODULE_*() macros */
 #include <linux/kthread.h>	/* kthread_run(), kthread_stop(), kthread_should_stop() */
 #include <linux/delay.h>	/* msleep_interruptible() */
 #include <linux/sched.h>	/* current, struct task_struct */
-
 static struct task_struct *worker;	/* handle to our kernel thread (NULL until started) */
-
 static int worker_fn(void *data)	/* body of the kernel thread; 'data' is the arg from kthread_run() */
 {					/* start of worker_fn() */
 	while (!kthread_should_stop()) {	/* loop until kthread_stop() is called on us */
@@ -721,7 +717,6 @@ static int worker_fn(void *data)	/* body of the kernel thread; 'data' is the arg
 	}				/* end of loop: a stop was requested */
 	return 0;			/* exit code handed back to kthread_stop() */
 }					/* end of worker_fn() */
-
 static int __init kthread_demo_init(void)	/* runs at insmod */
 {						/* start of kthread_demo_init() */
 	worker = kthread_run(worker_fn, NULL, "kthread_demo"); /* create (via kthreadd) and wake the thread */
@@ -729,12 +724,10 @@ static int __init kthread_demo_init(void)	/* runs at insmod */
 		return PTR_ERR(worker);		/* convert the error pointer to -errno; load fails */
 	return 0;				/* success: thread is running, module is Live */
 }						/* end of kthread_demo_init() */
-
 static void __exit kthread_demo_exit(void)	/* runs at rmmod */
 {						/* start of kthread_demo_exit() */
 	kthread_stop(worker);			/* set should_stop, wake the thread, wait for it to return */
 }						/* end: thread gone, safe to unload the code it ran */
-
 module_init(kthread_demo_init);			/* register the entry point */
 module_exit(kthread_demo_exit);			/* register the exit point */
 MODULE_LICENSE("GPL");				/* GPL-compatible licence: needed for GPL-only kthread symbols */
@@ -992,56 +985,44 @@ Full file and `Makefile`: [`examples/hello_module/`](examples/hello_module/). **
 ```c
 // SPDX-License-Identifier: GPL-2.0
 /* ^ SPDX tag: machine-readable licence of this file (required in kernel sources) */
-
 /*
  * hello.c - minimal loadable kernel module with a parameter.
  */
-
 #include <linux/init.h>		/* __init / __exit section markers */
 #include <linux/module.h>	/* module_init(), module_exit(), MODULE_*() macros */
 #include <linux/moduleparam.h>	/* module_param(), MODULE_PARM_DESC() */
 #include <linux/printk.h>	/* pr_info() logging to the kernel ring buffer */
-
 static int count = 1;		/* module parameter: how many greetings; default 1 */
 module_param(count, int, 0444);	/* expose 'count' as an int param, read-only in /sys/module/hello/parameters/ */
 MODULE_PARM_DESC(count, "Number of greetings to print at load time"); /* description shown by modinfo (parm=) */
-
 static int __init hello_init(void)	/* runs once at insmod; __init code is freed after loading */
 {					/* start of hello_init() */
 	int i;				/* loop counter */
-
 	if (count < 0 || count > 10)	/* reject out-of-range parameter values */
 		return -EINVAL;		/* non-zero return = load fails, module is not inserted */
-
 	for (i = 0; i < count; i++)	/* repeat 'count' times */
 		pr_info("hello: loaded (%d/%d)\n", i + 1, count); /* log a KERN_INFO message (see dmesg) */
 	return 0;			/* 0 = success, module becomes "Live" */
 }					/* end of hello_init() */
-
 static void __exit hello_exit(void)	/* runs at rmmod; __exit code is dropped if built in */
 {					/* start of hello_exit() */
 	pr_info("hello: unloaded\n");	/* log that the module is being removed */
 }					/* end of hello_exit(): no return value, cannot fail */
-
 module_init(hello_init);		/* register hello_init() as the module's entry point */
 module_exit(hello_exit);		/* register hello_exit() as the module's exit point */
-
 MODULE_LICENSE("GPL");			/* GPL-compatible: allows GPL-only symbols, no taint */
 MODULE_DESCRIPTION("Minimal hello-world loadable kernel module"); /* shown by modinfo */
 MODULE_AUTHOR("Advanced Linux Kernel Programming course");	/* shown by modinfo */
 ```
 
 ```make
-# Build hello.c as a loadable kernel module (hello.ko)
-obj-m += hello.o
-
-# Default target: use the running kernel's build tree to compile this directory
-all:
-	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
-
-# Remove all build artefacts
-clean:
-	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+# Makefile: builds hello.c into the loadable kernel module hello.ko
+obj-m := hello.o	# tell Kbuild to compile hello.c and link it as hello.ko
+KDIR ?= /lib/modules/$(shell uname -r)/build	# kernel build tree: headers of the running kernel
+all:	# default target, run by a plain "make"
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules	# enter the kernel tree (-C) and build the module in this dir (M=)
+clean:	# target run by "make clean"
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean	# let Kbuild delete all generated files (.ko, .o, .mod.c, ...)
 ```
 
 `modinfo hello.ko` on the test box: `license: GPL`, `vermagic: 6.8.0-139-generic SMP preempt mod_unload modversions`, `parm: count:… (int)`. The build prints "Skipping BTF generation … unavailability of vmlinux", which is harmless.
