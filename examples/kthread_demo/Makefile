@@ -1,5 +1,5 @@
-# Kbuild: build hello.c into the loadable module hello.ko
-obj-m += hello.o
+# Kbuild: build kthread_demo.c into the loadable module kthread_demo.ko
+obj-m += kthread_demo.o
 
 # Kernel build tree to build against; defaults to the running kernel's headers
 KDIR ?= /lib/modules/$(shell uname -r)/build
