@@ -13,6 +13,7 @@
 - [6. Kernel Headers: In-Tree, Module-Build and UAPI](#6-kernel-headers-in-tree-module-build-and-uapi)
 - [7. Loadable Kernel Modules (LKMs)](#7-loadable-kernel-modules-lkms)
 - [8. Linux Capabilities](#8-linux-capabilities)
+- [9. Kernel Architecture: Monolithic vs Microkernel](#9-kernel-architecture-monolithic-vs-microkernel)
 - [Labs & Exercises](#labs--exercises)
 - [Quick Reference](#quick-reference)
 - [Glossary](#glossary)
@@ -41,6 +42,8 @@ extending the running kernel:
       permission to load it (and other privileged operations): capabilities ......... §8
 
 where the running kernel came from: kernel.org → distro / vendor BSP / Android GKI .. §2
+
+why a module bug is a kernel bug: Linux is monolithic, one shared kernel space ..... §9
 ```
 
 **Golden rule so far:** *installed ≠ running*. Everything you build (modules, headers) must match the **running** kernel: `uname -r`.
@@ -1210,6 +1213,80 @@ sudo setcap cap_net_bind_service=ep ./srv # give a binary one capability (ask fi
 
 ---
 
+## 9. Kernel Architecture: Monolithic vs Microkernel
+
+> **Remember**
+>
+> - Linux is a **monolithic kernel**: system calls, the scheduler, memory management, filesystems, networking and drivers all run in **one address space** (kernel space, the high half: `0xffff_8…` on x86_64), in kernel mode, and call each other as **ordinary functions**.
+> - A **microkernel** keeps only the minimum (IPC, scheduling, basic memory management) in kernel mode. Filesystems and drivers run as **user-space servers** that talk by **message passing**.
+> - Monolithic = **fast** (a function call, no IPC or context switch) but **no isolation**: one bad driver or module can corrupt or crash the whole kernel.
+> - Linux is **monolithic but modular**: modules (§7) are loaded into the same single address space, with the same full privileges.
+
+### Overview
+
+The kernel architecture decides where OS services run and how they communicate. Linux keeps everything in one privileged address space for performance. This is why a module bug is a kernel bug, and why kernel code must never trust or directly dereference user pointers (§3).
+
+### How it works
+
+```text
+        MONOLITHIC (Linux)                       MICROKERNEL (QNX, seL4, MINIX 3)
+ ┌──────────────────────────────┐         ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+ │ user space: apps, libc       │         │ app  │ │ FS   │ │ net  │ │driver│  user space
+ │ 0x0000… – 0x0000_7fff_ffff…  │         │      │ │server│ │server│ │server│  (servers)
+ ├──────── syscall ─────────────┤         └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘
+ │ kernel space: 0xffff_8000_…  │            └── IPC messages ─┴────────┘
+ │  syscalls  sched  mm  VFS/FS │         ┌──────────────────────────────────┐
+ │  net stack  drivers  modules │         │ microkernel: IPC, sched, basic mm│  kernel mode
+ │  (all direct function calls) │         └──────────────────────────────────┘
+ └──────────────────────────────┘
+```
+
+| Design | Examples | In kernel mode | Communication | Trade-off |
+| ------ | -------- | -------------- | ------------- | --------- |
+| **Monolithic** | Linux, FreeBSD | Everything | Direct function calls | Fast; one bug can take down everything |
+| **Microkernel** | QNX, seL4, MINIX 3, L4 | IPC, scheduling, basic mm | Message passing (IPC) | Isolation and restartable servers; IPC overhead |
+| **Hybrid** | Windows NT, macOS XNU | Most services, microkernel-style structure | Mostly direct calls | A compromise; in practice close to monolithic |
+
+- The raw notes' user-space range was cut off. On x86_64 with 4-level paging it is `0x0000_0000_0000_0000`–`0x0000_7fff_ffff_ffff`, and kernel space starts at `0xffff_8000_0000_0000` (§3).
+- Linux still moves *some* work to user space where it helps: FUSE filesystems, UIO/VFIO user-space drivers, and eBPF programs (verified, sandboxed code run *in* the kernel).
+- Historical note: the 1992 **Tanenbaum–Torvalds debate** (MINIX microkernel vs Linux monolithic).
+
+### Commands / debugging
+
+```bash
+sudo grep -c ' [tT] ' /proc/kallsyms          # count kernel text (function) symbols: all subsystems share one symbol table
+sudo grep -w -e vfs_read -e tcp_sendmsg -e schedule /proc/kallsyms  # FS, network and scheduler functions side by side in kernel space
+cat /proc/filesystems                          # filesystems the kernel supports, all inside the kernel itself
+lsmod | head                                   # modules loaded into the same kernel address space
+```
+
+### Pitfalls
+
+- "Modular" does not mean "isolated": a loaded module has the same privileges as the rest of the kernel. A NULL dereference in a module can oops the whole kernel.
+- Microkernel does not mean "small Linux". It is a different design with different trade-offs, not just a Linux with fewer drivers.
+
+### Revision questions
+
+1. What makes Linux a monolithic kernel, and why is that fast?
+2. Why does a bug in a loaded module crash the whole system, when a bug in a microkernel's filesystem server might not?
+3. Give one way Linux runs driver or filesystem code in user space.
+
+<details>
+<summary>Answers</summary>
+
+1. All kernel services share one privileged address space and call each other directly, so there is no IPC or context switch between subsystems.
+2. The module runs in the same kernel address space with full privileges, so it can corrupt any kernel data. A microkernel server is a separate user-space process that can be killed and restarted.
+3. FUSE (filesystems) or UIO/VFIO (drivers).
+
+</details>
+
+### Source pointers
+
+- `init/main.c` (`start_kernel()` sets up every subsystem in one image), `kernel/`, `mm/`, `fs/`, `net/`, `drivers/`
+- `Documentation/filesystems/fuse.rst`, `Documentation/driver-api/uio-howto.rst`
+
+---
+
 ## Labs & Exercises
 
 *None yet.*
@@ -1294,6 +1371,15 @@ sudo setcap cap_net_bind_service=ep ./srv # give a binary one capability (ask fi
 | `capable(CAP_X)` / `ns_capable()` | Kernel-side checks; return `-EPERM` if missing |
 | `CAP_SYS_MODULE` (16) | Load/unload modules |
 
+### Kernel architecture (§9)
+
+| Item | Meaning |
+| ---- | ------- |
+| Monolithic (Linux) | All services in one kernel address space; direct calls; fast, no isolation |
+| Microkernel (QNX, seL4, MINIX 3) | IPC + sched + basic mm in kernel; servers in user space |
+| Hybrid (NT, XNU) | Microkernel structure, mostly monolithic in practice |
+| FUSE / UIO / VFIO / eBPF | Ways Linux moves or sandboxes work outside core kernel code |
+
 **Gotchas:** installed ≠ running; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`.
 
 ---
@@ -1324,6 +1410,7 @@ sudo setcap cap_net_bind_service=ep ./srv # give a binary one capability (ask fi
 | **GKI** | Generic Kernel Image: Android's single common kernel binary; vendor code goes in modules against a stable KMI. |
 | **GPL-2.0** | The kernel's licence: distributing modified binaries requires providing the source. |
 | **Headers package** | Distro package with the headers, Kbuild files, `.config` and `Module.symvers` for building modules against one kernel. |
+| **Hybrid kernel** | Kernel with a microkernel-style structure but most services in kernel mode (Windows NT, macOS XNU). |
 | **Idle task (PID 0)** | Static `init_task` (`swapper`); per-CPU idle loop; parent of PIDs 1 and 2. |
 | **`init` (PID 1)** | First user-space process (systemd); adopts orphans; its exit panics the kernel. |
 | **initramfs** | Compressed `cpio` archive unpacked into RAM as the early root filesystem; mounts the real root. |
@@ -1339,9 +1426,11 @@ sudo setcap cap_net_bind_service=ep ./srv # give a binary one capability (ask fi
 | **Loadable kernel module (LKM)** | `.ko` object loaded into the running kernel at predefined extension points. |
 | **Mainline** | Linus Torvalds' upstream kernel tree. |
 | **Mapped** | A virtual page backed by a page-table entry pointing to a physical frame; access to an unmapped page faults. |
+| **Microkernel** | Kernel that keeps only IPC, scheduling and basic memory management in kernel mode; other services run as user-space servers. |
 | **`mmap()`** | System call that creates a virtual memory mapping (VMA) in a process. |
 | **`Module.symvers`** | Build output listing exported symbols and their CRCs, used by modpost. |
 | **modversions** | Per-symbol CRC checking of a module's imports against the kernel (`CONFIG_MODVERSIONS`). |
+| **Monolithic kernel** | Kernel whose services (syscalls, mm, filesystems, networking, drivers) all run in one privileged address space and call each other directly. |
 | **Page fault** | CPU exception on access to an unmapped or protected page, handled by the kernel. |
 | **PE32+** | 64-bit Portable Executable format used by UEFI applications (and Windows). |
 | **RELRO** | Relocation Read-Only: ELF data made read-only after dynamic linking. |
