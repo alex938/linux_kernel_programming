@@ -1247,7 +1247,9 @@ The kernel architecture decides where OS services run and how they communicate. 
 | **Microkernel** | QNX, seL4, MINIX 3, L4 | IPC, scheduling, basic mm | Message passing (IPC) | Isolation and restartable servers; IPC overhead |
 | **Hybrid** | Windows NT, macOS XNU | Most services, microkernel-style structure | Mostly direct calls | A compromise; in practice close to monolithic |
 
-- The raw notes' user-space range was cut off. On x86_64 with 4-level paging it is `0x0000_0000_0000_0000`–`0x0000_7fff_ffff_ffff`, and kernel space starts at `0xffff_8000_0000_0000` (§3).
+- On x86_64 with 4-level paging, user space is `0x0000_0000_0000_0000`–`0x0000_7fff_ffff_ffff` and kernel space starts at `0xffff_8000_0000_0000` (§3).
+- Each half is **2^47 bytes = 128 TiB**. *Raw notes said user space is O(2^27); correct is 2^47 (2^27 would be only 128 MiB).*
+- Everything between the two halves (the **non-canonical hole**, almost all of the 2^64 range) is **unaddressable**: any access raises a general-protection fault (#GP). The CPU implements only 48 virtual-address bits, and bits 63–48 must copy bit 47. With 5-level paging (`la57`), there are 57 bits and each half grows to 2^56 = 64 PiB.
 - Linux still moves *some* work to user space where it helps: FUSE filesystems, UIO/VFIO user-space drivers, and eBPF programs (verified, sandboxed code run *in* the kernel).
 - Historical note: the 1992 **Tanenbaum–Torvalds debate** (MINIX microkernel vs Linux monolithic).
 
@@ -1376,6 +1378,7 @@ lsmod | head                                   # modules loaded into the same ke
 | Item | Meaning |
 | ---- | ------- |
 | Monolithic (Linux) | All services in one kernel address space; direct calls; fast, no isolation |
+| x86_64 split (4-level) | 2^47 (128 TiB) user + 2^47 kernel; the rest of 2^64 is a non-canonical hole (#GP) |
 | Microkernel (QNX, seL4, MINIX 3) | IPC + sched + basic mm in kernel; servers in user space |
 | Hybrid (NT, XNU) | Microkernel structure, mostly monolithic in practice |
 | FUSE / UIO / VFIO / eBPF | Ways Linux moves or sandboxes work outside core kernel code |
