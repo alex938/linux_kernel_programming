@@ -14,7 +14,7 @@
 - [7. Loadable Kernel Modules (LKMs)](#7-loadable-kernel-modules-lkms)
 - [8. Linux Capabilities](#8-linux-capabilities)
 - [9. Kernel Architecture: Monolithic vs Microkernel](#9-kernel-architecture-monolithic-vs-microkernel)
-- [10. Tracing: kprobes and `trace_marker`](#10-tracing-kprobes-and-trace_marker)
+- [10. Tracing: ftrace, kprobes, `trace_marker` and ptrace](#10-tracing-ftrace-kprobes-trace_marker-and-ptrace)
 - [Labs & Exercises](#labs--exercises)
 - [Quick Reference](#quick-reference)
 - [Glossary](#glossary)
@@ -46,7 +46,7 @@ where the running kernel came from: kernel.org → distro / vendor BSP / Android
 
 why a module bug is a kernel bug: Linux is monolithic, one shared kernel space ..... §9
 
-watching it all run: ftrace, kprobes, trace_marker (user → kernel trace) .......... §10
+watching it all run: ftrace, kprobes, trace_marker, ptrace/strace ................ §10
 ```
 
 **Golden rule so far:** *installed ≠ running*. Everything you build (modules, headers) must match the **running** kernel: `uname -r`.
@@ -1292,19 +1292,61 @@ lsmod | head                                   # modules loaded into the same ke
 
 ---
 
-## 10. Tracing: kprobes and `trace_marker`
+## 10. Tracing: ftrace, kprobes, `trace_marker` and ptrace
 
 > **Remember**
 >
-> - **ftrace** is the kernel's built-in tracer. It writes events into a per-CPU **ring buffer** and is controlled through **tracefs** at `/sys/kernel/tracing`.
+> - **ftrace** is the kernel's built-in tracer. It writes events into a per-CPU **ring buffer** and is controlled through **tracefs** at `/sys/kernel/tracing`. Pick a tracer by writing to `current_tracer`: `function` (every kernel function call) or `function_graph` (entry + exit, call tree, durations).
 > - A **kprobe** dynamically instruments (almost) **any kernel instruction** at run time, with no recompile or reboot. It works by patching in a breakpoint (`int3` on x86, `BRK` on ARM64), or a jump when optimised. A **kretprobe** fires on function **return**.
 > - kprobes can be used three ways: from a **module** (`register_kprobe()`, GPL-only), from **tracefs** (`kprobe_events`, no code), or from **eBPF** (`bpftrace -e 'kprobe:…'`).
 > - kprobe handlers run in **atomic context**: they must not sleep and must be fast.
-> - **`trace_marker`** lets **user space** write text into the same ftrace ring buffer, so app events appear interleaved with kernel events on one timeline. Android's **atrace** (`ATRACE_BEGIN/END`, used by systrace/Perfetto) is built on it.
+> - **`trace_marker`** lets **user space** write text into the same ftrace ring buffer, so app events get **accurate kernel timestamps** and appear interleaved with kernel events on one timeline. Android's **atrace** (`ATRACE_BEGIN/END`, used by systrace/Perfetto) is built on it: user-mode events piggybacking on kernel tracing.
+> - **`ptrace()`** is the system call one process uses to trace/debug another (stop it, read/write its memory and registers, stop at each syscall). **gdb** and **strace** are built on it. It is a *different mechanism* from ftrace: per-process, stop-based and slow.
 
 ### Overview
 
 Tracing answers "what is the kernel actually doing, and when?" without a debugger stopping the system. Static **tracepoints** are fixed hooks compiled into the source. **kprobes** add dynamic hooks wherever you need them. `trace_marker` joins the user-space view to the kernel timeline, so you can correlate "the app started drawing a frame" with "the scheduler preempted it".
+
+### ftrace tracers
+
+ftrace has two parts: **tracers** (one active at a time, chosen via `current_tracer`) and **events** (tracepoints, kprobe events, markers: enabled independently).
+
+| Tracer | What it records | Config (all `=y` on the test box) |
+| ------ | --------------- | ------ |
+| `nop` | Nothing (default); events still work | n/a |
+| `function` | Every kernel function entry, with its caller | `CONFIG_FUNCTION_TRACER` |
+| `function_graph` | Entry **and** exit: an indented call tree with per-function duration | `CONFIG_FUNCTION_GRAPH_TRACER` |
+| `wakeup`, `wakeup_rt` | Worst-case wake-up latency | `CONFIG_SCHED_TRACER` |
+| `irqsoff`, `preemptoff` | Longest time with IRQs / preemption disabled | `CONFIG_IRQSOFF_TRACER`, `CONFIG_PREEMPT_TRACER` |
+
+- **How `function` tracing is nearly free when off:** the compiler inserts a call to `__fentry__` at the start of every function (`-pg -mfentry`). With `CONFIG_DYNAMIC_FTRACE`, the kernel patches these into **NOPs** at boot and only patches the ones you select back into calls.
+- **Always filter.** Tracing every function produces millions of lines per second. Use `set_ftrace_filter` (functions to trace), `set_graph_function` (roots for `function_graph`) and `set_ftrace_pid`.
+- `trace-cmd` is the command-line front end; KernelShark visualises its output.
+
+```bash
+cd /sys/kernel/tracing                          # tracefs control directory (root; ask first on the test box)
+cat available_tracers                           # tracers built into this kernel
+echo do_sys_openat2 > set_graph_function        # graph only calls made beneath do_sys_openat2
+echo function_graph > current_tracer            # select the function_graph tracer
+echo 1 > tracing_on                             # start recording
+cat /etc/hostname > /dev/null                   # do something that opens a file
+echo 0 > tracing_on                             # stop recording
+head -40 trace                                  # view the call tree with durations
+echo nop > current_tracer                       # switch tracing off again
+echo > set_graph_function                       # clear the filter
+sudo trace-cmd record -p function_graph -g do_sys_openat2 cat /etc/hostname   # same thing via trace-cmd
+sudo trace-cmd report | head -40                                              # print the recorded trace
+```
+
+Example `function_graph` output (shape):
+
+```text
+ 1)               |  do_sys_openat2() {
+ 1)               |    getname() {
+ 1)   0.912 us    |      kmem_cache_alloc();
+ 1)   1.803 us    |    }
+ 1) + 12.345 us   |  }
+```
 
 ### How it works: kprobes
 
@@ -1344,7 +1386,44 @@ Tracing answers "what is the kernel actually doing, and when?" without a debugge
 - Anything written to `trace_marker` appears in the trace as a `tracing_mark_write:` event with the writer's PID and a timestamp.
 - Android atrace text format: `B|<pid>|<name>` begins a slice, `E|<pid>` ends it, and `C|<pid>|<name>|<value>` records a counter. **atrace** enables *categories* (`gfx`, `view`, `sched`, `freq`, …) and collects the buffer. **Perfetto** has replaced systrace as the recording/viewing tool.
 - `trace_marker_raw` accepts binary records instead of text.
-- *Raw notes said "user mode tracers"; more precisely, atrace is user-space instrumentation that writes into the kernel's ftrace buffer via `trace_marker`.*
+- **Why go through the kernel?** Timestamps come from the same trace clock as scheduler, IRQ and kprobe events, so user and kernel events line up accurately on one timeline. atrace is user-mode instrumentation piggybacking on kernel tracing, not a separate tracer.
+
+### ptrace and strace
+
+**`ptrace()`** is the system call behind debuggers and `strace`. The **tracer** attaches to a **tracee**. The kernel then stops the tracee at chosen points and wakes the tracer (via `waitpid()`), which can inspect and modify the tracee before letting it continue.
+
+```text
+ strace (tracer)                       kernel                       traced process (tracee)
+ ptrace(PTRACE_SEIZE, pid) ──────────> attach                        running …
+ ptrace(PTRACE_SYSCALL)    ──────────> resume, stop at next syscall  openat(...) ──┐
+ waitpid()  <────────────── syscall-entry stop  <────────────────────────────────┘
+ PTRACE_GET_SYSCALL_INFO: read nr + args, print "openat(AT_FDCWD, "/etc/hostname", …"
+ ptrace(PTRACE_SYSCALL)    ──────────> run syscall, stop at exit
+ waitpid()  <────────────── syscall-exit stop: print " = 3"
+             … two stops and four context switches per system call …
+```
+
+| Request | Purpose |
+| ------- | ------- |
+| `PTRACE_TRACEME` | Child asks to be traced by its parent (how `strace cmd` / `gdb cmd` start) |
+| `PTRACE_ATTACH` / `PTRACE_SEIZE` | Attach to a running process (`SEIZE` does not stop it; preferred) |
+| `PTRACE_SYSCALL` | Continue, stopping at the next syscall entry/exit (strace) |
+| `PTRACE_PEEKDATA` / `POKEDATA`, `GETREGS` / `SETREGS` | Read/write tracee memory and registers (gdb breakpoints) |
+| `PTRACE_CONT` / `PTRACE_DETACH` | Resume / detach |
+
+- **Permissions:** you can trace your own processes (same UID, no setuid). **Yama** `kernel.yama.ptrace_scope` restricts this further: 0 = classic, **1 = only your descendants** (Ubuntu default; test box = 1), 2 = only with `CAP_SYS_PTRACE`, 3 = no ptrace at all. `CAP_SYS_PTRACE` overrides (§8).
+- **Overhead:** each syscall stops the tracee twice, so `strace` can slow syscall-heavy programs by 10–100×. For low overhead, use `perf trace` or `bpftrace` (in-kernel, no stops).
+- A process can have only **one** tracer, so you cannot `strace` a process that `gdb` is already attached to. `TracerPid:` in `/proc/<pid>/status` shows who is tracing it.
+- `ltrace` traces **library** calls (via breakpoints on PLT entries, again using ptrace).
+
+```bash
+strace -f -e trace=openat,read -o out.txt ls    # follow children, only openat/read, write to out.txt
+strace -c ls > /dev/null                        # summary: count and time per syscall
+strace -T -tt -p <pid>                          # attach to a running process (needs ptrace permission), show time per call
+cat /proc/sys/kernel/yama/ptrace_scope          # current Yama ptrace restriction level
+grep TracerPid /proc/<pid>/status               # PID of the process tracing <pid> (0 = none)
+sudo perf trace -s ls                           # strace-like syscall summary without ptrace stops
+```
 
 ### Key APIs / structures
 
@@ -1414,6 +1493,8 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 2. What restrictions apply to code in a kprobe `pre_handler`, and why?
 3. How does Android atrace get app events onto the same timeline as scheduler events?
 4. Why might a kprobe-based tool break after a kernel upgrade, and what is the more stable alternative?
+5. What is the difference between the `function` and `function_graph` tracers, and why is function tracing cheap when disabled?
+6. Why is `strace` slow, and why can `strace -p` fail on Ubuntu even for your own process?
 
 <details>
 <summary>Answers</summary>
@@ -1422,15 +1503,18 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 2. It runs in atomic context (from a trap, with preemption disabled), so it must not sleep or take sleeping locks, and it should be short.
 3. The framework writes `B|pid|name` / `E|pid` strings to `/sys/kernel/tracing/trace_marker`. These land in the ftrace ring buffer alongside kernel events, with the same clock.
 4. kprobes hook internal functions, which can be renamed, inlined or change arguments. Static tracepoints (and `raw_tp` in BPF) are the more stable interface.
+5. `function` records each function entry; `function_graph` also hooks the exit, giving a call tree with durations. With dynamic ftrace, the `__fentry__` call sites are patched to NOPs until tracing is enabled.
+6. ptrace stops the tracee at every syscall entry and exit, costing context switches. Yama `ptrace_scope = 1` only allows tracing your own descendants, so attaching to an unrelated process needs `sudo` / `CAP_SYS_PTRACE`.
 
 </details>
 
 ### Source pointers
 
 - `kernel/kprobes.c`, `arch/x86/kernel/kprobes/` (`core.c`, `opt.c`), `arch/arm64/kernel/probes/`
-- `kernel/trace/trace_kprobe.c`, `kernel/trace/trace.c` (`tracing_mark_write()`)
+- `kernel/trace/trace_kprobe.c`, `kernel/trace/trace.c` (`tracing_mark_write()`), `kernel/trace/ftrace.c`, `kernel/trace/trace_functions_graph.c`
+- `kernel/ptrace.c`, `arch/x86/kernel/ptrace.c`, `security/yama/yama_lsm.c`
 - `samples/kprobes/kprobe_example.c`, `samples/kprobes/kretprobe_example.c`
-- `Documentation/trace/kprobes.rst`, `Documentation/trace/kprobetrace.rst`, `Documentation/trace/ftrace.rst`
+- `Documentation/trace/kprobes.rst`, `Documentation/trace/kprobetrace.rst`, `Documentation/trace/ftrace.rst`, `Documentation/admin-guide/LSM/Yama.rst`, `man 2 ptrace`
 
 ---
 
@@ -1533,12 +1617,18 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | Item | Meaning |
 | ---- | ------- |
 | `/sys/kernel/tracing` | tracefs: ftrace control files (`trace`, `trace_pipe`, `events/`) |
+| `current_tracer` / `available_tracers` | Select tracer: `nop`, `function`, `function_graph`, … |
+| `set_ftrace_filter` / `set_graph_function` / `set_ftrace_pid` | Limit what is traced (always filter) |
+| `trace-cmd record -p function_graph -g <fn> <cmd>` | Record a call graph from the command line |
 | `kprobe_events`: `p:name sym` / `r:name sym $retval` | Define a kprobe / kretprobe event without code |
 | `register_kprobe()` / `unregister_kprobe()` | Module API (GPL-only); handler is atomic |
 | `bpftrace -e 'kprobe:sym { … }'` | kprobe via eBPF |
 | `/sys/kernel/debug/kprobes/{list,blacklist}` | Active probes / unprobeable functions |
 | `trace_marker` | User space writes text into the ftrace buffer |
 | atrace format | `B\|pid\|name`, `E\|pid`, `C\|pid\|name\|value` |
+| `strace -f -e trace=… / -c / -p <pid>` | Syscall tracing via ptrace (slow: 2 stops per syscall) |
+| `kernel.yama.ptrace_scope` | 0 classic, 1 descendants only (Ubuntu), 2 `CAP_SYS_PTRACE` only, 3 disabled |
+| `perf trace` | Low-overhead strace alternative |
 
 **Gotchas:** installed ≠ running; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`.
 
@@ -1561,6 +1651,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | **`CAP_SYSLOG`** | Capability needed to see real kernel addresses when `kptr_restrict=1`. |
 | **Capability** | One independent slice of root's privileges (`CAP_*`), checked by the kernel per operation. |
 | **Capability sets** | Per-thread bitmasks: Effective, Permitted, Inheritable, Bounding, Ambient. |
+| **`current_tracer`** | tracefs file selecting the active ftrace tracer (`nop`, `function`, `function_graph`, …). |
 | **Demand paging** | Allocating or loading a physical page only when a mapped virtual page is first accessed. |
 | **`depmod`** | Tool that generates `modules.dep` (the module dependency list) for `modprobe`. |
 | **Distribution kernel** | Kernel built and patched by a distro (Ubuntu, Fedora, …) from a stable/LTS release. |
@@ -1569,6 +1660,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | **File capabilities** | Capabilities attached to an executable (`security.capability` xattr), granted at `exec`. |
 | **Fork (of the kernel)** | Private branch of patched kernel source that must be rebased on every upstream release. |
 | **ftrace** | The kernel's built-in function and event tracer, writing to a per-CPU ring buffer controlled via tracefs. |
+| **`function_graph`** | ftrace tracer hooking function entry and exit, showing an indented call tree with durations. |
 | **GKI** | Generic Kernel Image: Android's single common kernel binary; vendor code goes in modules against a stable KMI. |
 | **GPL-2.0** | The kernel's licence: distributing modified binaries requires providing the source. |
 | **Headers package** | Distro package with the headers, Kbuild files, `.config` and `Module.symvers` for building modules against one kernel. |
@@ -1597,10 +1689,12 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | **Monolithic kernel** | Kernel whose services (syscalls, mm, filesystems, networking, drivers) all run in one privileged address space and call each other directly. |
 | **Page fault** | CPU exception on access to an unmapped or protected page, handled by the kernel. |
 | **PE32+** | 64-bit Portable Executable format used by UEFI applications (and Windows). |
+| **`ptrace()`** | System call letting a tracer process stop, inspect and modify a tracee; the basis of gdb and strace. |
 | **RELRO** | Relocation Read-Only: ELF data made read-only after dynamic linking. |
 | **Rescuer thread** | Per-workqueue `kworker/R-*` thread that guarantees progress under memory pressure. |
 | **sched_ext** | Extensible scheduling class (6.12+) whose policy is a BPF program. |
 | **SMAP / PAN** | x86 / ARM64 feature that blocks kernel access to user pages except via the user-copy routines. |
+| **strace** | Tool that prints every system call of a process, using `ptrace()`. |
 | **`syscall` instruction** | x86_64 system-call entry instruction; `sysenter`/`int 0x80` are the 32-bit equivalents. |
 | **`System.map`** | Link-time kernel symbol table (address, type, name). |
 | **Taint** | Kernel flag recording conditions (e.g. a proprietary module loaded) that affect debugging and support. |
@@ -1620,6 +1714,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | **`vmlinux`** | Uncompressed ELF kernel image with symbols, used for debugging. |
 | **`vmlinuz`** | Compressed bootable kernel image installed in `/boot`. |
 | **vsyscall** | Legacy x86_64 fixed-address page for fast time calls; now emulated. |
+| **Yama** | LSM that restricts `ptrace()` scope (`kernel.yama.ptrace_scope`). |
 | **zstd** | Zstandard compression: good ratio and fast decompression; the common default for kernel, initramfs and modules. |
 
 ---
@@ -1635,4 +1730,3 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 - Modules "cannot affect low-level scheduling (until 7.1/7.2)": what changed in 7.1/7.2? sched_ext (BPF) has existed since 6.12.
 - "Kernel capabilities and where to find them": POSIX capabilities (`CAP_*`), or kernel features/config options?
 - Does the course expect us to boot custom kernels via `vng` only, or also install them into `/boot` on the test box?
-- "android has atrace which is using user mode tracers": was the point simply atrace → `trace_marker`, or was something about user-space tracers (uprobes/USDT) meant too?
