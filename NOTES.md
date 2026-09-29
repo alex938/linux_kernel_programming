@@ -1013,6 +1013,61 @@ clean:	# target run by "make clean"
 
 The build prints "Skipping BTF generation … unavailability of vmlinux". This is harmless.
 
+### Module parameters
+
+A **module parameter** is a global variable whose value can be set at load time and (optionally) read or changed later through sysfs.
+
+```c
+static int int_param = 0;		/* module parameter: an integer, default 0 */
+module_param(int_param, int, 0644);	/* expose it as an int param; 0644 = root can change it at runtime in sysfs */
+MODULE_PARM_DESC(int_param, "An integer parameter (default 0)");	/* description shown by modinfo (parm:) */
+static char *filename = "none";		/* module parameter: a string (char pointer), default "none" */
+module_param(filename, charp, 0444);	/* charp = kernel copies the string at load time; 0444 = read-only in sysfs */
+MODULE_PARM_DESC(filename, "A file name string (default \"none\")");	/* description shown by modinfo (parm:) */
+```
+
+| `type` | C variable | Notes |
+| ------ | ---------- | ----- |
+| `int`, `uint`, `long`, `ulong`, `short`, `ushort`, `ullong`, `hexint` | matching integer | Bad input (`int_param=abc`) → load fails with `Invalid parameters` (`-EINVAL`) |
+| `bool` / `invbool` | `bool` | Accepts `1/0`, `y/n`, `Y/N`; `invbool` stores the inverse |
+| `byte` | `unsigned char` | A single **8-bit number**, not a character |
+| `charp` | `char *` | A **string**: the kernel allocates a copy at load time |
+| `module_param_string(name, buf, len, perm)` | `char buf[len]` | String copied into your fixed-size buffer |
+| `module_param_array(name, type, &count, perm)` | array | Comma-separated: `vals=1,2,3`; `count` receives how many were given |
+| `module_param_cb(name, &ops, &var, perm)` | any | Custom `set`/`get` callbacks, e.g. to **validate** or react to runtime writes |
+
+**The `perm` argument** sets the permissions of `/sys/module/<mod>/parameters/<name>`:
+
+| `perm` | Effect |
+| ------ | ------ |
+| `0` | Not visible in sysfs; set only at load time |
+| `0444` | World-readable, read-only |
+| `0644` | Readable; **root can change it at runtime** |
+| World-writable (e.g. `0666`) | **Build error**: the kernel refuses world-writable parameter files |
+
+**Setting a parameter:**
+
+```bash
+sudo insmod hello.ko int_param=42 filename=/etc/hostname   # at load, as name=value (no spaces around '=')
+sudo dmesg | tail -2                                       # module logged: hello: int_param=42 filename=/etc/hostname
+cat /sys/module/hello/parameters/int_param                 # read the live value
+grep -r . /sys/module/hello/parameters/                    # all parameters as path:value
+echo 7 | sudo tee /sys/module/hello/parameters/int_param   # change at runtime (only because perm is 0644)
+sudo rmmod hello                                           # unload (runtime changes are lost)
+echo 'options hello int_param=42' | sudo tee /etc/modprobe.d/hello.conf   # persistent default when loaded via modprobe
+modinfo -F parm hello.ko                                   # list parameters: name:description (type)
+```
+
+- **Built-in** code takes the same parameters on the kernel command line as `<module>.<param>=value` (e.g. `printk.time=1`).
+- *Class note: "char called filename". A file name is a string, so the type is `charp` (`char *`). A single `char` would be `byte`, which holds an 8-bit number.*
+
+**Pitfalls:**
+
+- **Runtime writes are silent.** A write to a `0644` parameter changes the variable, but the module is not told. Code that read the value at init will not see the change. Use `module_param_cb()` to validate or react to writes.
+- **No locking.** A runtime write can race with code reading the variable. Read it once (`READ_ONCE()`), or protect it with a callback and a lock.
+- Values given at load are **not validated** beyond the type. Check ranges in `module_init` and return `-EINVAL`.
+- Don't keep a `charp` pointer after the module is unloaded, and don't `kfree()` it yourself: the parameter code owns it.
+
 ### Dependencies: `rmmod` vs `modprobe` (class demo: `vfat` → `fat`)
 
 `vfat` uses symbols exported by `fat`, so `fat`'s refcount counts `vfat` as a user:
@@ -1610,6 +1665,8 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | `modinfo` / `.modinfo` | Metadata: license, parm, vermagic, depends, alias |
 | `modinfo -F depends <m>`; `filename: (builtin)` | Dependencies; built-in check |
 | `/sys/module/<name>/parameters/` | Module (incl. built-in) parameters |
+| `insmod m.ko p=42 s=text` / `options m p=42` in `/etc/modprobe.d/` | Set parameters at load / persistently |
+| `module_param(name, type, perm)`; types `int`, `bool`, `charp`, `byte`, … | `perm` 0 = hidden, 0444 = read-only, 0644 = root-writable at runtime |
 | `/proc/sys/kernel/tainted` | Taint flags (0 = clean, `P` = proprietary module) |
 | sched_ext (`CONFIG_SCHED_CLASS_EXT`, 6.12+) | Custom scheduling via BPF, not modules |
 
@@ -1672,6 +1729,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | **`CAP_SYSLOG`** | Capability needed to see real kernel addresses when `kptr_restrict=1`. |
 | **Capability** | One independent slice of root's privileges (`CAP_*`), checked by the kernel per operation. |
 | **Capability sets** | Per-thread bitmasks: Effective, Permitted, Inheritable, Bounding, Ambient. |
+| **`charp`** | `module_param` type for a string parameter (`char *`); the kernel stores a copy of the value. |
 | **`current_tracer`** | tracefs file selecting the active ftrace tracer (`nop`, `function`, `function_graph`, …). |
 | **Demand paging** | Allocating or loading a physical page only when a mapped virtual page is first accessed. |
 | **`depmod`** | Tool that generates `modules.dep` (the module dependency list) for `modprobe`. |
@@ -1705,6 +1763,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | **Mapped** | A virtual page backed by a page-table entry pointing to a physical frame; access to an unmapped page faults. |
 | **Microkernel** | Kernel that keeps only IPC, scheduling and basic memory management in kernel mode; other services run as user-space servers. |
 | **`mmap()`** | System call that creates a virtual memory mapping (VMA) in a process. |
+| **Module parameter** | Module variable settable at load time (`name=value`) and exposed in `/sys/module/<mod>/parameters/`. |
 | **`Module.symvers`** | Build output listing exported symbols and their CRCs, used by modpost. |
 | **modversions** | Per-symbol CRC checking of a module's imports against the kernel (`CONFIG_MODVERSIONS`). |
 | **Monolithic kernel** | Kernel whose services (syscalls, mm, filesystems, networking, drivers) all run in one privileged address space and call each other directly. |
