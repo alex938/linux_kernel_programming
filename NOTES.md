@@ -14,6 +14,7 @@
 - [7. Loadable Kernel Modules (LKMs)](#7-loadable-kernel-modules-lkms)
 - [8. Linux Capabilities](#8-linux-capabilities)
 - [9. Kernel Architecture: Monolithic vs Microkernel](#9-kernel-architecture-monolithic-vs-microkernel)
+- [10. Tracing: kprobes and `trace_marker`](#10-tracing-kprobes-and-trace_marker)
 - [Labs & Exercises](#labs--exercises)
 - [Quick Reference](#quick-reference)
 - [Glossary](#glossary)
@@ -44,6 +45,8 @@ extending the running kernel:
 where the running kernel came from: kernel.org → distro / vendor BSP / Android GKI .. §2
 
 why a module bug is a kernel bug: Linux is monolithic, one shared kernel space ..... §9
+
+watching it all run: ftrace, kprobes, trace_marker (user → kernel trace) .......... §10
 ```
 
 **Golden rule so far:** *installed ≠ running*. Everything you build (modules, headers) must match the **running** kernel: `uname -r`.
@@ -1289,6 +1292,148 @@ lsmod | head                                   # modules loaded into the same ke
 
 ---
 
+## 10. Tracing: kprobes and `trace_marker`
+
+> **Remember**
+>
+> - **ftrace** is the kernel's built-in tracer. It writes events into a per-CPU **ring buffer** and is controlled through **tracefs** at `/sys/kernel/tracing`.
+> - A **kprobe** dynamically instruments (almost) **any kernel instruction** at run time, with no recompile or reboot. It works by patching in a breakpoint (`int3` on x86, `BRK` on ARM64), or a jump when optimised. A **kretprobe** fires on function **return**.
+> - kprobes can be used three ways: from a **module** (`register_kprobe()`, GPL-only), from **tracefs** (`kprobe_events`, no code), or from **eBPF** (`bpftrace -e 'kprobe:…'`).
+> - kprobe handlers run in **atomic context**: they must not sleep and must be fast.
+> - **`trace_marker`** lets **user space** write text into the same ftrace ring buffer, so app events appear interleaved with kernel events on one timeline. Android's **atrace** (`ATRACE_BEGIN/END`, used by systrace/Perfetto) is built on it.
+
+### Overview
+
+Tracing answers "what is the kernel actually doing, and when?" without a debugger stopping the system. Static **tracepoints** are fixed hooks compiled into the source. **kprobes** add dynamic hooks wherever you need them. `trace_marker` joins the user-space view to the kernel timeline, so you can correlate "the app started drawing a frame" with "the scheduler preempted it".
+
+### How it works: kprobes
+
+```text
+ register_kprobe(&kp)                        CPU executes probed address
+        │                                              │
+        ▼                                              ▼
+ save original instruction            int3 trap ─> kprobe handler dispatch
+ write int3 (0xCC) over it                         │
+ (or a jmp, if optimised: OPTPROBES)               ├─ pre_handler(p, regs)
+                                                   ├─ single-step the saved original
+                                                   │   instruction (out of line)
+                                                   ├─ post_handler (optional)
+                                                   └─ resume after the probe
+ kretprobe: at entry, the return address is replaced with a trampoline
+            → the handler runs when the function returns (return value in regs)
+```
+
+- **Blacklist:** code the kprobe machinery itself uses cannot be probed (functions marked `NOKPROBE_SYMBOL()`, `__kprobes`, parts of entry code). List them with `/sys/kernel/debug/kprobes/blacklist`.
+- **Inlined or `static` functions** may have no symbol of their own, so probe by address + offset or pick a caller. Check that the symbol exists with `grep -w <sym> /proc/kallsyms`.
+- **Cost:** an `int3` probe costs a trap per hit (~µs). An **optimised** probe (`CONFIG_OPTPROBES`, `debug.kprobes-optimization = 1`) uses a jump and is much cheaper. A probe on a function entry that has an ftrace `fentry` site uses ftrace instead (`CONFIG_KPROBES_ON_FTRACE`).
+- **Test box:** `CONFIG_KPROBES`, `KRETPROBES`, `OPTPROBES`, `KPROBES_ON_FTRACE`, `KPROBE_EVENTS`, `UPROBE_EVENTS` are all `=y`; tracefs is mounted at `/sys/kernel/tracing`.
+- **uprobes** are the user-space equivalent: they probe instructions in user binaries and libraries (`uprobe_events`, `bpftrace -e 'uprobe:/bin/bash:readline …'`).
+
+### How it works: `trace_marker` and Android atrace
+
+```text
+ app / framework                          kernel
+ ATRACE_BEGIN("draw")  ─ write() ─>  /sys/kernel/tracing/trace_marker
+   "B|1234|draw"                            │
+ ATRACE_END()          ─ write() ─>         ▼
+   "E|1234"                        ftrace ring buffer  <── sched_switch, irq, kprobe events …
+                                            │
+                                    atrace / Perfetto  ──> one timeline (UI: ui.perfetto.dev)
+```
+
+- Anything written to `trace_marker` appears in the trace as a `tracing_mark_write:` event with the writer's PID and a timestamp.
+- Android atrace text format: `B|<pid>|<name>` begins a slice, `E|<pid>` ends it, and `C|<pid>|<name>|<value>` records a counter. **atrace** enables *categories* (`gfx`, `view`, `sched`, `freq`, …) and collects the buffer. **Perfetto** has replaced systrace as the recording/viewing tool.
+- `trace_marker_raw` accepts binary records instead of text.
+- *Raw notes said "user mode tracers"; more precisely, atrace is user-space instrumentation that writes into the kernel's ftrace buffer via `trace_marker`.*
+
+### Key APIs / structures
+
+| API | Header | Purpose | Context |
+| --- | ------ | ------- | ------- |
+| `struct kprobe` | `<linux/kprobes.h>` | `.symbol_name` / `.addr` / `.offset`, `.pre_handler`, `.post_handler` | n/a |
+| `register_kprobe()` / `unregister_kprobe()` | `<linux/kprobes.h>` | Plant / remove a probe (`EXPORT_SYMBOL_GPL`) | Process; may sleep |
+| `struct kretprobe`, `register_kretprobe()` | `<linux/kprobes.h>` | Handler on function return; `regs_return_value(regs)` | Process; may sleep |
+| kprobe `pre_handler` | n/a | Your code at the probe point | **Atomic**: no sleep, preemption disabled |
+| `trace_printk()` | `<linux/kernel.h>` | Fast debug print into the ftrace buffer (debug only; prints a warning banner at boot/load) | Any context |
+
+### Code example
+
+Minimal kprobe module (excerpt). Full file and `Makefile`: [`examples/kprobe_demo/`](examples/kprobe_demo/). **Built on 6.8 x86_64** (not loaded).
+
+```c
+static int handler_pre(struct kprobe *p, struct pt_regs *regs)	/* called just before the probed instruction runs */
+{									/* start of handler_pre(): atomic context, must not sleep */
+	pr_info_ratelimited("kprobe_demo: %s hit by %s (pid %d)\n",	/* rate-limited so a busy probe cannot flood the log */
+			    p->symbol_name, current->comm,		/* probed symbol name and the calling task's name */
+			    task_pid_nr(current));			/* calling task's PID */
+	return 0;							/* 0 = continue and execute the probed instruction normally */
+}									/* end of handler_pre() */
+static struct kprobe kp = {		/* the probe descriptor, registered in init */
+	.pre_handler = handler_pre,	/* run handler_pre() on every hit */
+	.symbol_name = "kernel_clone",	/* probe the fork/clone path (the demo takes this from a module parameter) */
+};					/* end of kp */
+/* in init: ret = register_kprobe(&kp);  in exit: unregister_kprobe(&kp); */
+```
+
+### Commands / debugging
+
+kprobe without writing any code, using tracefs (needs root; ask first on the test box):
+
+```bash
+cd /sys/kernel/tracing                                          # tracefs control directory
+echo 'p:myclone kernel_clone' >> kprobe_events                  # define kprobe event "myclone" at kernel_clone entry
+echo 'r:myopen do_sys_openat2 ret=$retval' >> kprobe_events     # define kretprobe event recording the return value
+echo 1 > events/kprobes/enable                                  # enable all kprobe events
+cat trace_pipe                                                  # stream events live (Ctrl-C to stop)
+echo 0 > events/kprobes/enable                                  # disable the events again
+echo > kprobe_events                                            # delete all dynamic kprobe events
+```
+
+Same idea with eBPF, plus `trace_marker`:
+
+```bash
+sudo bpftrace -e 'kprobe:kernel_clone { printf("%s %d\n", comm, pid); }'        # print every fork/clone caller
+sudo bpftrace -e 'kretprobe:do_sys_openat2 { @ret[retval < 0] = count(); }'     # count failed vs successful opens
+echo "hello from user space" | sudo tee /sys/kernel/tracing/trace_marker        # write a marker into the ftrace buffer
+sudo cat /sys/kernel/tracing/trace | grep tracing_mark_write                    # find it in the trace
+sudo trace-cmd record -e sched_switch -e ftrace:print sleep 1                   # record scheduler events plus markers
+sudo cat /sys/kernel/debug/kprobes/list                                         # probes currently registered ([OPTIMIZED], [FTRACE] flags)
+```
+
+### Pitfalls
+
+- **Sleeping in a handler** (`kmalloc(GFP_KERNEL)`, `mutex_lock()`, `copy_from_user()`): "scheduling while atomic" or a deadlock.
+- **Forgetting `unregister_kprobe()`** in `module_exit`: the breakpoint stays and jumps into freed module memory, so the next hit crashes the kernel.
+- **Probing a hot path** (`schedule`, `kmalloc`) with `pr_info()` floods the log and slows the machine. Use rate-limiting, counters, or bpftrace maps.
+- **Relying on function names/arguments:** kprobes attach to internal, unstable functions. They can be renamed, inlined or change signature between kernel versions (e.g. `_do_fork` became `kernel_clone` in 5.10). Prefer stable **tracepoints** where one exists.
+- Leaving `kprobe_events` defined after an experiment: clear them with `echo > kprobe_events`.
+
+### Revision questions
+
+1. How does a kprobe get control at the probed address on x86, and what makes an "optimised" kprobe cheaper?
+2. What restrictions apply to code in a kprobe `pre_handler`, and why?
+3. How does Android atrace get app events onto the same timeline as scheduler events?
+4. Why might a kprobe-based tool break after a kernel upgrade, and what is the more stable alternative?
+
+<details>
+<summary>Answers</summary>
+
+1. The first byte of the instruction is replaced with `int3`. The trap handler runs `pre_handler`, single-steps the saved original instruction, then resumes. An optimised probe replaces the instruction with a `jmp` to a detour buffer, which avoids the trap.
+2. It runs in atomic context (from a trap, with preemption disabled), so it must not sleep or take sleeping locks, and it should be short.
+3. The framework writes `B|pid|name` / `E|pid` strings to `/sys/kernel/tracing/trace_marker`. These land in the ftrace ring buffer alongside kernel events, with the same clock.
+4. kprobes hook internal functions, which can be renamed, inlined or change arguments. Static tracepoints (and `raw_tp` in BPF) are the more stable interface.
+
+</details>
+
+### Source pointers
+
+- `kernel/kprobes.c`, `arch/x86/kernel/kprobes/` (`core.c`, `opt.c`), `arch/arm64/kernel/probes/`
+- `kernel/trace/trace_kprobe.c`, `kernel/trace/trace.c` (`tracing_mark_write()`)
+- `samples/kprobes/kprobe_example.c`, `samples/kprobes/kretprobe_example.c`
+- `Documentation/trace/kprobes.rst`, `Documentation/trace/kprobetrace.rst`, `Documentation/trace/ftrace.rst`
+
+---
+
 ## Labs & Exercises
 
 *None yet.*
@@ -1383,7 +1528,19 @@ lsmod | head                                   # modules loaded into the same ke
 | Hybrid (NT, XNU) | Microkernel structure, mostly monolithic in practice |
 | FUSE / UIO / VFIO / eBPF | Ways Linux moves or sandboxes work outside core kernel code |
 
-**Gotchas:** installed ≠ running; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`.
+### Tracing (§10)
+
+| Item | Meaning |
+| ---- | ------- |
+| `/sys/kernel/tracing` | tracefs: ftrace control files (`trace`, `trace_pipe`, `events/`) |
+| `kprobe_events`: `p:name sym` / `r:name sym $retval` | Define a kprobe / kretprobe event without code |
+| `register_kprobe()` / `unregister_kprobe()` | Module API (GPL-only); handler is atomic |
+| `bpftrace -e 'kprobe:sym { … }'` | kprobe via eBPF |
+| `/sys/kernel/debug/kprobes/{list,blacklist}` | Active probes / unprobeable functions |
+| `trace_marker` | User space writes text into the ftrace buffer |
+| atrace format | `B\|pid\|name`, `E\|pid`, `C\|pid\|name\|value` |
+
+**Gotchas:** installed ≠ running; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`.
 
 ---
 
@@ -1394,6 +1551,7 @@ lsmod | head                                   # modules loaded into the same ke
 | **`.modinfo`** | ELF section of a `.ko` holding `key=value` module metadata. |
 | **`/boot`** | Directory (often a separate partition) holding kernel images, initramfs, symbol maps and configs. |
 | **`/proc/kallsyms`** | Live kernel (and module) symbol table with runtime addresses. |
+| **atrace** | Android tracing tool/API: framework code writes begin/end/counter markers to `trace_marker`; collected with kernel events and viewed in Perfetto. |
 | **Boot image (Android)** | `boot.img` in the raw `boot` partition: `ANDROID!` header, kernel and ramdisk. |
 | **Boot protocol** | Architecture-specific contract for how a bootloader loads the kernel and passes it control and parameters. |
 | **Bootloader** | Program started by the firmware (e.g. GRUB) that loads the kernel and initramfs and passes the command line. |
@@ -1410,6 +1568,7 @@ lsmod | head                                   # modules loaded into the same ke
 | **`EXPORT_SYMBOL_GPL`** | Export macro restricting a symbol to GPL-compatible modules. |
 | **File capabilities** | Capabilities attached to an executable (`security.capability` xattr), granted at `exec`. |
 | **Fork (of the kernel)** | Private branch of patched kernel source that must be rebased on every upstream release. |
+| **ftrace** | The kernel's built-in function and event tracer, writing to a per-CPU ring buffer controlled via tracefs. |
 | **GKI** | Generic Kernel Image: Android's single common kernel binary; vendor code goes in modules against a stable KMI. |
 | **GPL-2.0** | The kernel's licence: distributing modified binaries requires providing the source. |
 | **Headers package** | Distro package with the headers, Kbuild files, `.config` and `Module.symvers` for building modules against one kernel. |
@@ -1421,7 +1580,9 @@ lsmod | head                                   # modules loaded into the same ke
 | **Kernel space** | Upper part of every virtual address space: shared, accessible only in kernel mode. |
 | **Kernel thread** | Task that runs only in kernel mode, with no user address space (`mm == NULL`). |
 | **KMI** | Kernel Module Interface: the stable symbol/ABI set GKI guarantees to vendor modules. |
+| **kprobe** | Dynamic breakpoint-based probe on almost any kernel instruction, with a handler run in atomic context. |
 | **`kptr_restrict`** | Sysctl controlling whether kernel pointers are shown (`/proc/kallsyms`, `%pK`). |
+| **kretprobe** | kprobe variant that runs a handler when the probed function returns. |
 | **`kthreadd` (PID 2)** | Kernel thread that creates all other kernel threads. |
 | **kworker** | Workqueue worker kernel thread. |
 | **Lazy TLB** | Kernel threads borrowing the previous task's page tables (`active_mm`) to avoid a switch. |
@@ -1446,7 +1607,11 @@ lsmod | head                                   # modules loaded into the same ke
 | **`task_struct`** | Kernel structure describing every task (thread, process or kernel thread). |
 | **`TASK_SIZE`** | Top of the user-space address range. |
 | **TGID** | Thread-group ID: what user space calls the PID; each thread has its own TID. |
+| **`trace_marker`** | tracefs file through which user space writes text events into the ftrace ring buffer. |
+| **tracefs** | Pseudo-filesystem (`/sys/kernel/tracing`) exposing ftrace controls and output. |
+| **Tracepoint** | Static, named trace hook compiled into kernel source; a more stable interface than kprobes. |
 | **UAPI** | User-space API headers (`include/uapi/`), exported to `/usr/include`; a stable ABI. |
+| **uprobe** | Dynamic probe on an instruction in a user-space binary or library. |
 | **Upstreaming** | Getting a change merged into mainline so that the community maintains it. |
 | **User space** | Lower, per-process part of the virtual address space. |
 | **vDSO** | Virtual Dynamic Shared Object: kernel-provided ELF library mapped into every process for syscall-free calls. |
@@ -1470,3 +1635,4 @@ lsmod | head                                   # modules loaded into the same ke
 - Modules "cannot affect low-level scheduling (until 7.1/7.2)": what changed in 7.1/7.2? sched_ext (BPF) has existed since 6.12.
 - "Kernel capabilities and where to find them": POSIX capabilities (`CAP_*`), or kernel features/config options?
 - Does the course expect us to boot custom kernels via `vng` only, or also install them into `/boot` on the test box?
+- "android has atrace which is using user mode tracers": was the point simply atrace → `trace_marker`, or was something about user-space tracers (uprobes/USDT) meant too?
