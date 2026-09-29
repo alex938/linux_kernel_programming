@@ -1369,7 +1369,24 @@ Example `function_graph` output (shape):
 - **Inlined or `static` functions** may have no symbol of their own, so probe by address + offset or pick a caller. Check that the symbol exists with `grep -w <sym> /proc/kallsyms`.
 - **Cost:** an `int3` probe costs a trap per hit (~µs). An **optimised** probe (`CONFIG_OPTPROBES`, `debug.kprobes-optimization = 1`) uses a jump and is much cheaper. A probe on a function entry that has an ftrace `fentry` site uses ftrace instead (`CONFIG_KPROBES_ON_FTRACE`).
 - **Test box:** `CONFIG_KPROBES`, `KRETPROBES`, `OPTPROBES`, `KPROBES_ON_FTRACE`, `KPROBE_EVENTS`, `UPROBE_EVENTS` are all `=y`; tracefs is mounted at `/sys/kernel/tracing`.
-- **uprobes** are the user-space equivalent: they probe instructions in user binaries and libraries (`uprobe_events`, `bpftrace -e 'uprobe:/bin/bash:readline …'`).
+
+### uprobes: kprobes for user space (Linux 3.5+)
+
+**uprobes** bring the kprobe idea to **user-space code**. Since Linux 3.5, you can probe any instruction in a user binary or shared library by **file + offset**, usually given as a user **symbol** (e.g. `readline` in `/bin/bash`, `malloc` in libc). A **uretprobe** fires on return.
+
+- **Mechanism:** the kernel places a breakpoint (`int3`) in the **page cache page** of the file at that offset, copy-on-write per process. So **every process** that maps the file hits the probe, including processes started later, unless you filter by PID. The trap enters the kernel, which runs the handler (a trace event, BPF program or perf) and then single-steps the original instruction out of line (XOL area).
+- **No ptrace, no recompile:** the target is not stopped and there is no tracer process. Compared with `ltrace`, it is far cheaper, but each hit still costs a user→kernel trap (~1–3 µs).
+- **Symbols:** they need the binary's symbol table (or debuginfo). Stripped binaries can still be probed by raw offset.
+- **USDT** (user statically defined tracing, e.g. `DTRACE_PROBE` in glibc, Python, PostgreSQL) are static NOP markers in user code, activated through uprobes: the user-space analogue of tracepoints.
+- Config: `CONFIG_UPROBES`, `CONFIG_UPROBE_EVENTS` (`=y` on the test box).
+
+```bash
+sudo bpftrace -e 'uprobe:/bin/bash:readline { printf("readline by pid %d\n", pid); }'           # fire on every bash readline() call
+sudo bpftrace -e 'uretprobe:/bin/bash:readline { printf("%s\n", str(retval)); }'                # print each line typed into any bash
+sudo bpftrace -e 'uprobe:/lib/x86_64-linux-gnu/libc.so.6:malloc /pid == 1234/ { @[arg0] = count(); }'  # histogram of malloc sizes for one PID
+sudo perf probe -x /bin/bash readline                                                           # create a uprobe event via perf
+echo 'p:bashrl /bin/bash:0x<offset>' | sudo tee -a /sys/kernel/tracing/uprobe_events            # raw tracefs form: file + offset (offset from nm/objdump)
+```
 
 ### How it works: `trace_marker` and Android atrace
 
@@ -1495,6 +1512,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 4. Why might a kprobe-based tool break after a kernel upgrade, and what is the more stable alternative?
 5. What is the difference between the `function` and `function_graph` tracers, and why is function tracing cheap when disabled?
 6. Why is `strace` slow, and why can `strace -p` fail on Ubuntu even for your own process?
+7. How is a uprobe placed, and why does probing `malloc` in libc affect every process unless you filter?
 
 <details>
 <summary>Answers</summary>
@@ -1505,6 +1523,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 4. kprobes hook internal functions, which can be renamed, inlined or change arguments. Static tracepoints (and `raw_tp` in BPF) are the more stable interface.
 5. `function` records each function entry; `function_graph` also hooks the exit, giving a call tree with durations. With dynamic ftrace, the `__fentry__` call sites are patched to NOPs until tracing is enabled.
 6. ptrace stops the tracee at every syscall entry and exit, costing context switches. Yama `ptrace_scope = 1` only allows tracing your own descendants, so attaching to an unrelated process needs `sudo` / `CAP_SYS_PTRACE`.
+7. The kernel writes a breakpoint into the file's page-cache page at the symbol's offset. Every process mapping libc shares that (inode, offset), so all of them trap into the handler.
 
 </details>
 
@@ -1512,6 +1531,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 
 - `kernel/kprobes.c`, `arch/x86/kernel/kprobes/` (`core.c`, `opt.c`), `arch/arm64/kernel/probes/`
 - `kernel/trace/trace_kprobe.c`, `kernel/trace/trace.c` (`tracing_mark_write()`), `kernel/trace/ftrace.c`, `kernel/trace/trace_functions_graph.c`
+- `kernel/events/uprobes.c`, `arch/x86/kernel/uprobes.c`, `kernel/trace/trace_uprobe.c`, `Documentation/trace/uprobetracer.rst`
 - `kernel/ptrace.c`, `arch/x86/kernel/ptrace.c`, `security/yama/yama_lsm.c`
 - `samples/kprobes/kprobe_example.c`, `samples/kprobes/kretprobe_example.c`
 - `Documentation/trace/kprobes.rst`, `Documentation/trace/kprobetrace.rst`, `Documentation/trace/ftrace.rst`, `Documentation/admin-guide/LSM/Yama.rst`, `man 2 ptrace`
@@ -1623,6 +1643,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | `kprobe_events`: `p:name sym` / `r:name sym $retval` | Define a kprobe / kretprobe event without code |
 | `register_kprobe()` / `unregister_kprobe()` | Module API (GPL-only); handler is atomic |
 | `bpftrace -e 'kprobe:sym { … }'` | kprobe via eBPF |
+| `bpftrace -e 'uprobe:/path/bin:sym { … }'` / `uprobe_events` | uprobe (3.5+): probe user-space functions by file + symbol/offset |
 | `/sys/kernel/debug/kprobes/{list,blacklist}` | Active probes / unprobeable functions |
 | `trace_marker` | User space writes text into the ftrace buffer |
 | atrace format | `B\|pid\|name`, `E\|pid`, `C\|pid\|name\|value` |
@@ -1705,7 +1726,8 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | **tracefs** | Pseudo-filesystem (`/sys/kernel/tracing`) exposing ftrace controls and output. |
 | **Tracepoint** | Static, named trace hook compiled into kernel source; a more stable interface than kprobes. |
 | **UAPI** | User-space API headers (`include/uapi/`), exported to `/usr/include`; a stable ABI. |
-| **uprobe** | Dynamic probe on an instruction in a user-space binary or library. |
+| **uprobe** | Dynamic probe (Linux 3.5+) on an instruction in a user-space binary or library, placed by file + offset; affects every process mapping that file. |
+| **USDT** | User Statically Defined Tracing: static probe markers in user programs, activated via uprobes. |
 | **Upstreaming** | Getting a change merged into mainline so that the community maintains it. |
 | **User space** | Lower, per-process part of the virtual address space. |
 | **vDSO** | Virtual Dynamic Shared Object: kernel-provided ELF library mapped into every process for syscall-free calls. |
