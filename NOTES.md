@@ -15,6 +15,7 @@
 - [8. Linux Capabilities](#8-linux-capabilities)
 - [9. Kernel Architecture: Monolithic vs Microkernel](#9-kernel-architecture-monolithic-vs-microkernel)
 - [10. Tracing: ftrace, kprobes, `trace_marker` and ptrace](#10-tracing-ftrace-kprobes-trace_marker-and-ptrace)
+- [11. Pages and Page Size](#11-pages-and-page-size)
 - [Labs & Exercises](#labs--exercises)
 - [Quick Reference](#quick-reference)
 - [Glossary](#glossary)
@@ -1456,6 +1457,15 @@ sudo bpftrace -e 'kprobe:tcp_v4_connect {                   /* fire on entry to 
 curl -4 https://example.com                                  # in a second terminal: -4 forces IPv4 so the probe fires
 ```
 
+Find probe points before writing a script:
+
+```bash
+sudo bpftrace -l 'kprobe:tcp*'                               # list every kprobe-able kernel function starting with "tcp"
+sudo bpftrace -l 'tracepoint:sock:*'                         # list the (stable) socket tracepoints
+sudo bpftrace -lv 'tracepoint:sock:inet_sock_set_state'      # -v also shows the tracepoint's argument fields
+```
+
+
 Example output (illustrative):
 
 ```text
@@ -1620,6 +1630,172 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 
 ---
 
+## 11. Pages and Page Size
+
+### Overview
+
+A **page** is the smallest unit of memory the **MMU** maps: every virtual-to-physical translation, permission bit and page fault works on whole pages. The kernel's memory management (page tables, page cache, `struct page`, allocation) is built on it. The page size is 4 KiB on x86_64 but configurable on ARM64 (4/16/64 KiB), and that choice affects performance, memory use and even user-space ABI.
+
+### Key concepts
+
+- **Page** (virtual) vs **page frame** (the physical page it maps to). A **PFN** (page frame number) is `phys_addr >> PAGE_SHIFT`.
+- `PAGE_SIZE` = 4096 by default; `PAGE_SHIFT` = log2(`PAGE_SIZE`) = 12. `PAGE_SIZE` is defined as `1UL << PAGE_SHIFT`, so the shift is the fundamental constant.
+- An address splits into **page number** (upper bits) and **offset in page** (low `PAGE_SHIFT` bits). `PAGE_MASK` = `~(PAGE_SIZE - 1)` clears the offset.
+- Memory is still **byte-addressable**; the page is the granularity of *mapping and protection*, not of addressing. *Raw notes said "minimal unit that can be addressed"; more precisely it is the minimal unit the MMU can map.*
+- The kernel keeps one `struct page` (64 bytes) per physical page frame: about 1.6% of RAM with 4 KiB pages, less with larger pages.
+- **Huge pages** map a larger block at a higher page-table level (x86_64: 2 MiB and 1 GiB) via hugetlbfs or **THP** (Transparent Huge Pages).
+- Page size is fixed at **kernel build time** (ARM64 `CONFIG_ARM64_4K_PAGES` / `_16K_PAGES` / `_64K_PAGES`); a running kernel cannot switch it.
+
+### How it works: splitting a virtual address
+
+```text
+x86_64, 4 KiB pages, 4-level paging (48-bit VA)
+ 47      39 38      30 29      21 20      12 11           0
++----------+----------+----------+----------+--------------+
+| PGD idx  | PUD idx  | PMD idx  | PTE idx  | page offset  |
+|  9 bits  |  9 bits  |  9 bits  |  9 bits  |   12 bits    |
++----------+----------+----------+----------+--------------+
+   each table = 512 entries x 8 bytes = exactly one 4 KiB page
+   stop at PMD -> 2 MiB huge page; stop at PUD -> 1 GiB huge page
+
+ARM64, 16 KiB pages (TCR_EL1.TGx = 16K granule), 47-bit VA, 3 levels
+ 46  36 35        25 24        14 13               0
++------+------------+------------+------------------+
+| L1   |  L2 idx    |  L3 idx    |   page offset    |
+|11 bit|  11 bits   |  11 bits   |     14 bits      |
++------+------------+------------+------------------+
+   each table = 2048 entries x 8 bytes = one 16 KiB page
+```
+
+Bigger pages give a bigger offset field, more entries per table, and so **fewer levels** for the same VA size, meaning shorter page walks.
+
+### Page sizes by architecture
+
+| Architecture | Base page | Selected by | Huge/block sizes |
+| ------------ | --------- | ----------- | ---------------- |
+| x86_64 | 4 KiB only | fixed by the architecture | 2 MiB (PMD), 1 GiB (PUD) |
+| ARM64, 4K granule | 4 KiB | `TCR_EL1.TG0/TG1` + `CONFIG_ARM64_4K_PAGES` | 64 KiB (contiguous), 2 MiB, 1 GiB |
+| ARM64, 16K granule | 16 KiB | `CONFIG_ARM64_16K_PAGES` | 2 MiB (contiguous), 32 MiB |
+| ARM64, 64K granule | 64 KiB | `CONFIG_ARM64_64K_PAGES` | 2 MiB (contiguous), 512 MiB |
+
+- **ARM64 control register:** the translation granule is set in `TCR_EL1`: field `TG0` for the lower (user, `TTBR0_EL1`) half and `TG1` for the upper (kernel, `TTBR1_EL1`) half. The CPU advertises which granules it supports in `ID_AA64MMFR0_EL1`. *Raw notes said "TCR_EL1/SCR_EL1"; there is no `SCR_EL1`. `SCR_EL3` is the Secure Configuration Register and has nothing to do with page size. The register is `TCR_EL1`.*
+- **Apple silicon:** iPhone/iPad (A-series) and M1+ Macs use 16 KiB pages. Asahi Linux therefore runs a 16K-page kernel on M-series Macs. ⚠️ Verify: raw notes said "A12"; Apple moved to 16K pages well before the A12 (iOS on 64-bit devices), so the A12 may have been just an example.
+- **Android 15+:** Android 15 is the first release that *supports* 16 KiB-page devices (ARM64 16K kernels); Google Play requires apps targeting Android 15+ to be 16 KiB-compatible (from November 2025). *Raw notes said "16k by default"; the default depends on the device/vendor: 4 KiB is still common, and 16K is opt-in per device (e.g. a developer option on Pixel 8+).* ⚠️ Verify what the instructor meant by "default".
+- **Raspberry Pi 5:** the note-taking machine runs `6.12.x+rpt-rpi-2712`, a **16K-page** kernel (`getconf PAGESIZE` → `16384`). The test box (x86_64) reports `4096`.
+
+### Why page size matters (trade-offs)
+
+| Larger pages (16K/64K) | Smaller pages (4K) |
+| ---------------------- | ------------------ |
+| More memory covered per **TLB** entry ("TLB reach") → fewer TLB misses | More TLB misses on large working sets |
+| Fewer page-table levels and pages → faster walks, less page-table memory | Deeper walks, more page-table memory |
+| Fewer page faults for sequential access; typically a few % to ~10% faster on Android/Apple workloads | Less waste per allocation |
+| More **internal fragmentation** (a 1-byte file still uses a whole page in the page cache) → higher memory use | Better for many small files/mappings |
+| Breaks software that assumes 4096 (ELF segment alignment, `mmap` offsets, hard-coded constants) | The long-standing default: most software assumes it |
+
+### Key APIs / structures
+
+| API / macro | Header | Purpose | Context |
+| ----------- | ------ | ------- | ------- |
+| `PAGE_SIZE`, `PAGE_SHIFT`, `PAGE_MASK` | `<asm/page.h>` (via `<linux/mm.h>`) | Page size, log2 of it, mask that clears the offset | Any |
+| `PAGE_ALIGN(x)` | `<linux/mm.h>` | Round `x` up to the next page boundary | Any |
+| `offset_in_page(p)` | `<linux/mm.h>` | `(unsigned long)p & ~PAGE_MASK` | Any |
+| `get_order(size)` | `<asm/page.h>` | Smallest *order* (log2 of page count) that holds `size` bytes | Any |
+| `alloc_pages(gfp, order)` / `__free_pages(page, order)` | `<linux/gfp.h>` | Allocate/free 2^order contiguous physical pages (`struct page *`) | Sleeps with `GFP_KERNEL`; `GFP_ATOMIC` in atomic context |
+| `__get_free_page(gfp)` / `free_page(addr)` | `<linux/gfp.h>` | Same, returning a kernel virtual address | As above |
+| `virt_to_page()`, `page_address()`, `page_to_pfn()`, `pfn_to_page()` | `<linux/mm.h>` | Convert between address, `struct page` and PFN (linear-map addresses only) | Any |
+| `struct page` | `<linux/mm_types.h>` | Per-physical-frame metadata (flags, refcount, mapping) | n/a |
+| `getconf PAGESIZE`, `sysconf(_SC_PAGESIZE)`, `getpagesize()` | user space | Query page size at run time | n/a |
+
+### Code example
+
+Minimal module that prints the page constants and allocates one page (not built; source only):
+
+```c
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/module.h>	/* module_init/exit, MODULE_* macros */
+#include <linux/mm.h>		/* PAGE_SIZE, PAGE_SHIFT, PAGE_MASK, page_address() */
+#include <linux/gfp.h>		/* alloc_pages(), __free_pages(), GFP_KERNEL */
+
+static struct page *pg;		/* the page we allocate in init and free in exit */
+
+static int __init pagedemo_init(void)			/* runs at insmod, process context */
+{
+	pr_info("PAGE_SIZE=%lu PAGE_SHIFT=%d PAGE_MASK=%#lx\n",	/* print the constants */
+		PAGE_SIZE, PAGE_SHIFT, PAGE_MASK);		/* 4096 / 12 / 0xfffffffffffff000 on x86_64 */
+
+	pg = alloc_pages(GFP_KERNEL, 0);		/* order 0 = one page; may sleep */
+	if (!pg)					/* allocation can fail */
+		return -ENOMEM;				/* abort load with "out of memory" */
+
+	pr_info("pfn=%#lx vaddr=%px\n",			/* show frame number and kernel address */
+		page_to_pfn(pg), page_address(pg));	/* %px prints the raw pointer (demo only) */
+	return 0;					/* success: module stays loaded */
+}
+
+static void __exit pagedemo_exit(void)			/* runs at rmmod */
+{
+	__free_pages(pg, 0);				/* free the order-0 page (else it leaks) */
+}
+
+module_init(pagedemo_init);				/* register the init function */
+module_exit(pagedemo_exit);				/* register the exit function */
+MODULE_LICENSE("GPL");					/* GPL: no taint, GPL-only symbols usable */
+MODULE_DESCRIPTION("Print page-size constants and allocate one page");	/* shown by modinfo */
+```
+
+### Commands / debugging
+
+```bash
+getconf PAGESIZE                                   # base page size: 4096 on the test box, 16384 on the Pi 5
+grep -i huge /proc/meminfo                         # Hugepagesize (2048 kB on x86_64), HugePages_*, AnonHugePages (THP)
+cat /sys/kernel/mm/transparent_hugepage/enabled    # THP mode: test box shows "always [madvise] never"
+grep -E 'KernelPageSize|MMUPageSize' /proc/self/smaps | sort | uniq -c   # page size backing each mapping
+grep -E 'CONFIG_ARM64_(4K|16K|64K)_PAGES=' /boot/config-$(uname -r)     # ARM64: which granule the kernel was built with
+readelf -lW /bin/ls | grep LOAD                    # "Align" column: 0x1000 = 4K-only ELF, 0x4000+ also runs on 16K
+```
+
+### Pitfalls
+
+- **Hard-coding 4096** (in C, `mmap` sizes, buffer maths): breaks on 16K/64K ARM64. Use `PAGE_SIZE` in the kernel and `sysconf(_SC_PAGESIZE)` in user space.
+- **ELF alignment:** binaries and `.so` files linked with 4 KiB `LOAD` alignment cannot load on a 16K kernel. Link with `-Wl,-z,max-page-size=16384` (Android NDK r28+ does this by default).
+- **Confusing order with size:** `alloc_pages(gfp, 3)` allocates 2^3 = 8 pages (32 KiB on x86_64), not 3.
+- **`virt_to_page()` on `vmalloc()` memory** is wrong: vmalloc memory is not in the linear map. Use `vmalloc_to_page()`.
+- Allocating with `GFP_KERNEL` in atomic context: it may sleep. Use `GFP_ATOMIC`.
+
+### Corrections to raw notes
+
+- *"TCR_EL1/SCR_EL1"*: the granule is set in `TCR_EL1` (`TG0`/`TG1`). There is no `SCR_EL1`; `SCR_EL3` is unrelated.
+- *"minimal physical memory unit that can be addressed"*: memory is byte-addressable; the page is the minimal unit the MMU *maps*.
+- *"Android 15+ 16k page size by default"*: Android 15 *adds support* for 16K devices; 4K remains common.
+- *"can modify the page size"*: only at kernel build time (Kconfig), not at run time.
+
+### Revision questions
+
+1. If `PAGE_SHIFT` is 14, what are `PAGE_SIZE`, `PAGE_MASK` and the page offset of address `0x12345`?
+2. Why can a 16K-page ARM64 kernel cover a 47-bit address space with only 3 page-table levels, whereas x86_64 needs 4 levels for 48 bits?
+3. Give two benefits and two costs of moving from 4 KiB to 16 KiB pages.
+4. Where is the ARM64 translation granule configured in hardware, and how does Linux choose it?
+
+<details>
+<summary>Answers</summary>
+
+1. `PAGE_SIZE` = 2^14 = 16384; `PAGE_MASK` = `~0x3fff`; offset = `0x12345 & 0x3fff` = `0x2345`.
+2. A 16 KiB table holds 2048 8-byte entries (11 bits per level), and the offset is 14 bits: 14 + 3×11 = 47. With 4 KiB pages each level gives 9 bits and the offset 12: 12 + 4×9 = 48.
+3. Benefits: greater TLB reach (fewer misses), fewer/shallower page tables, fewer page faults. Costs: internal fragmentation and higher memory use; software/ELF files assuming 4 KiB break.
+4. `TCR_EL1.TG0` (user half) and `TG1` (kernel half); supported granules appear in `ID_AA64MMFR0_EL1`. Linux picks one at build time with `CONFIG_ARM64_{4K,16K,64K}_PAGES`.
+
+</details>
+
+### Source pointers
+
+- `arch/x86/include/asm/page_types.h` (`PAGE_SHIFT`, `PAGE_SIZE`, `PAGE_MASK`), `arch/x86/include/asm/pgtable_64_types.h`
+- `arch/arm64/include/asm/page-def.h`, `arch/arm64/Kconfig` (`ARM64_4K_PAGES` etc.), `arch/arm64/include/asm/pgtable-hwdef.h` (`TCR_TG0_*`, `TCR_TG1_*`)
+- `include/linux/mm.h`, `include/linux/mm_types.h` (`struct page`), `include/linux/gfp.h`, `mm/page_alloc.c`
+- `Documentation/arch/arm64/memory.rst`, `Documentation/admin-guide/mm/hugetlbpage.rst`, `Documentation/admin-guide/mm/transhuge.rst`, `Documentation/mm/page_tables.rst`
+
+---
+
 ## Labs & Exercises
 
 *None yet.*
@@ -1728,6 +1904,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | `register_kprobe()` / `unregister_kprobe()` | Module API (GPL-only); handler is atomic |
 | `bpftrace -e 'kprobe:sym { … }'` | kprobe via eBPF |
 | `bpftrace -e 'kprobe:tcp_v4_connect { … arg1 … }'` | Who connects where (IPv4); `argN` = Nth function arg; `curl -4` to test |
+| `bpftrace -l 'kprobe:tcp*'` / `-lv 'tracepoint:…'` | List available probes (wildcards); `-v` shows arguments |
 | `bpftrace -e 'uprobe:/path/bin:sym { … }'` / `uprobe_events` | uprobe (3.5+): probe user-space functions by file + symbol/offset |
 | `/sys/kernel/debug/kprobes/{list,blacklist}` | Active probes / unprobeable functions |
 | `trace_marker` | User space writes text into the ftrace buffer |
@@ -1736,7 +1913,19 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | `kernel.yama.ptrace_scope` | 0 classic, 1 descendants only (Ubuntu), 2 `CAP_SYS_PTRACE` only, 3 disabled |
 | `perf trace` | Low-overhead strace alternative |
 
-**Gotchas:** installed ≠ running; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`.
+
+### Pages (§11)
+
+| Item | Meaning |
+| ---- | ------- |
+| `PAGE_SIZE` / `PAGE_SHIFT` / `PAGE_MASK` | 4096 / 12 / `~0xfff` on x86_64; `PAGE_SIZE = 1UL << PAGE_SHIFT` |
+| `getconf PAGESIZE` / `sysconf(_SC_PAGESIZE)` | Page size at run time (never hard-code 4096) |
+| x86_64 page sizes | 4 KiB base; 2 MiB / 1 GiB huge |
+| ARM64 granule | `TCR_EL1.TG0/TG1`; 4K/16K/64K chosen by `CONFIG_ARM64_*_PAGES` at build |
+| `alloc_pages(gfp, order)` | 2^order contiguous pages; `get_order(size)` to compute the order |
+| `/proc/meminfo` `Hugepagesize`, `/sys/kernel/mm/transparent_hugepage/enabled` | Huge page size and THP mode |
+
+**Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`.
 
 ---
 
@@ -1772,7 +1961,9 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | **`function_graph`** | ftrace tracer hooking function entry and exit, showing an indented call tree with durations. |
 | **GKI** | Generic Kernel Image: Android's single common kernel binary; vendor code goes in modules against a stable KMI. |
 | **GPL-2.0** | The kernel's licence: distributing modified binaries requires providing the source. |
+| **Granule (translation)** | ARM64 term for the base page size used by the MMU (4, 16 or 64 KiB), set in `TCR_EL1`. |
 | **Headers package** | Distro package with the headers, Kbuild files, `.config` and `Module.symvers` for building modules against one kernel. |
+| **Huge page** | A page mapped at a higher page-table level (e.g. 2 MiB or 1 GiB on x86_64) to cut TLB misses; via hugetlbfs or THP. |
 | **Hybrid kernel** | Kernel with a microkernel-style structure but most services in kernel mode (Windows NT, macOS XNU). |
 | **Idle task (PID 0)** | Static `init_task` (`swapper`); per-CPU idle loop; parent of PIDs 1 and 2. |
 | **`init` (PID 1)** | First user-space process (systemd); adopts orphans; its exit panics the kernel. |
@@ -1797,6 +1988,8 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | **`Module.symvers`** | Build output listing exported symbols and their CRCs, used by modpost. |
 | **modversions** | Per-symbol CRC checking of a module's imports against the kernel (`CONFIG_MODVERSIONS`). |
 | **Monolithic kernel** | Kernel whose services (syscalls, mm, filesystems, networking, drivers) all run in one privileged address space and call each other directly. |
+| **Page** | Smallest unit of memory the MMU maps and protects (4 KiB on x86_64; 4/16/64 KiB on ARM64). |
+| **Page frame / PFN** | A physical page, and its number (`phys >> PAGE_SHIFT`). |
 | **Page fault** | CPU exception on access to an unmapped or protected page, handled by the kernel. |
 | **PE32+** | 64-bit Portable Executable format used by UEFI applications (and Windows). |
 | **`ptrace()`** | System call letting a tracer process stop, inspect and modify a tracee; the basis of gdb and strace. |
@@ -1841,3 +2034,5 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 - Modules "cannot affect low-level scheduling (until 7.1/7.2)": what changed in 7.1/7.2? sched_ext (BPF) has existed since 6.12.
 - "Kernel capabilities and where to find them": POSIX capabilities (`CAP_*`), or kernel features/config options?
 - Does the course expect us to boot custom kernels via `vng` only, or also install them into `/boot` on the test box?
+- Page size, "AAPL/A12/M1 16k by default": why A12 specifically? Apple used 16K pages on earlier A-series chips too.
+- "Android 15+ 16k page size by default": did the instructor mean 16K is *supported* from Android 15 (and required of apps on Play), or that specific devices ship 16K by default?
