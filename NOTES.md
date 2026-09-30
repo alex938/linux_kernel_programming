@@ -1443,6 +1443,33 @@ sudo perf probe -x /bin/bash readline                                           
 echo 'p:bashrl /bin/bash:0x<offset>' | sudo tee -a /sys/kernel/tracing/uprobe_events            # raw tracefs form: file + offset (offset from nm/objdump)
 ```
 
+### Worked example: tracing outbound TCP connections with bpftrace
+
+Class demo: attach a kprobe to `tcp_v4_connect()` and print who opens each IPv4 TCP connection, and to which address. Run it in one terminal, then run `curl` in another.
+
+```bash
+sudo bpftrace -e 'kprobe:tcp_v4_connect {                   /* fire on entry to tcp_v4_connect() */
+	$s = (struct sockaddr_in *)arg1;                     /* arg1 = 2nd argument (uaddr), cast to IPv4 sockaddr */
+	printf("%s %d %s %s\n", username, pid, comm,        /* user name, PID, process name ... */
+	       ntop($s->sin_addr.s_addr));                   /* ... and destination IPv4 address as text */
+}'
+curl -4 https://example.com                                  # in a second terminal: -4 forces IPv4 so the probe fires
+```
+
+Example output (illustrative):
+
+```text
+alex 4242 curl 93.184.215.14
+```
+
+- **Signature:** `int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)` in `net/ipv4/tcp_ipv4.c`. In bpftrace, `arg0`, `arg1`, … are the probed function's arguments (read from `pt_regs`: `rdi`, `rsi`, … on x86_64; `x0`, `x1`, … on ARM64), so `arg1` is `uaddr`.
+- **Why the cast works:** bpftrace reads kernel type definitions from **BTF** (`/sys/kernel/btf/vmlinux`, present on the test box), so `struct sockaddr_in` resolves with no headers. On kernels without BTF you need `#include <linux/in.h>` in the script.
+- **Builtins used:** `username` (user name from the UID), `pid` (really the TGID), `comm` (task name, 16 bytes), and `ntop()` (formats an IP address as a string).
+- **IPv6:** `tcp_v4_connect` only sees IPv4. If `example.com` resolves to IPv6, `curl` uses `tcp_v6_connect()` and nothing prints. Use `curl -4`, or also probe `kprobe:tcp_v6_connect` and cast `arg1` to `struct sockaddr_in6 *`.
+- **Scope:** this fires on the `connect()` path only (outbound, before the handshake completes). Accepted (inbound) connections go through `inet_csk_accept()`. bcc's `tcpconnect` tool does the same job with more polish (`sudo tcpconnect-bpfcc` on Ubuntu).
+- **Stable alternative:** the `sock:inet_sock_set_state` tracepoint (`tracepoint:sock:inet_sock_set_state`) sees TCP state changes for IPv4 and IPv6 without depending on internal function names.
+- ⚠️ Not run on the test box: it needs root. The ingredients are present: bpftrace v0.20.2, BTF, and the `tcp_v4_connect` symbol in `/proc/kallsyms`.
+
 ### How it works: `trace_marker` and Android atrace
 
 ```text
@@ -1700,6 +1727,7 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | `kprobe_events`: `p:name sym` / `r:name sym $retval` | Define a kprobe / kretprobe event without code |
 | `register_kprobe()` / `unregister_kprobe()` | Module API (GPL-only); handler is atomic |
 | `bpftrace -e 'kprobe:sym { … }'` | kprobe via eBPF |
+| `bpftrace -e 'kprobe:tcp_v4_connect { … arg1 … }'` | Who connects where (IPv4); `argN` = Nth function arg; `curl -4` to test |
 | `bpftrace -e 'uprobe:/path/bin:sym { … }'` / `uprobe_events` | uprobe (3.5+): probe user-space functions by file + symbol/offset |
 | `/sys/kernel/debug/kprobes/{list,blacklist}` | Active probes / unprobeable functions |
 | `trace_marker` | User space writes text into the ftrace buffer |
@@ -1722,9 +1750,11 @@ sudo cat /sys/kernel/debug/kprobes/list                                         
 | **atrace** | Android tracing tool/API: framework code writes begin/end/counter markers to `trace_marker`; collected with kernel events and viewed in Perfetto. |
 | **Boot image (Android)** | `boot.img` in the raw `boot` partition: `ANDROID!` header, kernel and ramdisk. |
 | **Boot protocol** | Architecture-specific contract for how a bootloader loads the kernel and passes it control and parameters. |
+| **BTF** | BPF Type Format: compact kernel type information (`/sys/kernel/btf/vmlinux`) that lets bpftrace/BPF use kernel structs without headers. |
 | **Bootloader** | Program started by the firmware (e.g. GRUB) that loads the kernel and initramfs and passes the command line. |
 | **BSP** | Board Support Package: an SoC vendor's kernel tree, Device Trees, drivers and bootloader. |
 | **bzImage** | x86 "big zImage" format: setup code plus a self-decompressing compressed kernel. |
+| **bpftrace** | High-level tracing language that compiles one-liners to eBPF and attaches them to kprobes, uprobes and tracepoints. |
 | **Canonical address** | 64-bit address whose unused top bits all equal the highest implemented bit; any other address faults. |
 | **`CAP_SYSLOG`** | Capability needed to see real kernel addresses when `kptr_restrict=1`. |
 | **Capability** | One independent slice of root's privileges (`CAP_*`), checked by the kernel per operation. |
