@@ -2211,7 +2211,7 @@ User space reaches hardware through one of three driver interfaces, and the choi
 | Buffering | None in the kernel core: each `read()`/`write()` goes straight to the driver | **Page cache** + block layer (merging, scheduling); `O_DIRECT` bypasses the cache | Socket buffers and qdisc queues |
 | User-space handle | `/dev/<name>` (`c` in `ls -l`) | `/dev/<name>` (`b` in `ls -l`); usually mounted as a filesystem | Interface name; `socket()`, `ioctl(SIOC*)`, netlink |
 | Kernel interface | `struct file_operations` + `struct cdev` / `miscdevice` | `struct gendisk` + `struct blk_mq_ops` | `struct net_device` + `struct net_device_ops` |
-| Test-box examples | `/dev/null` (1:3), `/dev/tty0` (4:0), `/dev/ttyS0`, `/dev/random` | `/dev/sda` (8:0, 100 GiB disk), `/dev/sr0` (11:0) | `lo`, `eth0`, `docker0`, `dummy0` |
+| Test-box examples | `/dev/null` (1:3), `/dev/tty0` (4:0), `/dev/ttyS0`, `/dev/random`, `/dev/input/event*` (13:*) | `/dev/sda` (8:0, 100 GiB disk), `/dev/sr0` (11:0) | `lo`, `eth0`, `docker0`, `dummy0` |
 
 ### How it works: where each path goes
 
@@ -2229,6 +2229,11 @@ User space reaches hardware through one of three driver interfaces, and the choi
 
 - **Why block devices are buffered:** typical workloads read and write the same blocks again and again (filesystem metadata, hot files). Caching them in RAM (the page cache) avoids slow device trips, and the block layer can merge and reorder requests. *Raw notes said "repeated access to the same blockers"; correct is "blocks".*
 - **"Character = unbuffered"** is about the kernel core: there is no page cache or block layer. A driver may still keep its own buffers (the tty layer, for example, has a line-discipline buffer).
+- **Character devices cover almost everything else:** apart from mass storage (block) and network interfaces, most hardware is exposed as a character device. Each `read()`/`write()` goes **directly** to the driver with no intermediate layer, and the data is a stream of bytes that may or may not support `lseek()` (`/dev/mem` does; a serial port does not). Examples:
+  - **tty:** a terminal combines keyboard input with output to a screen or serial line (`/dev/tty*`, `/dev/ttyS0`, pseudo-terminals `/dev/pts/*`).
+  - **Input devices:** mouse, keyboard and touchscreen under `/dev/input/` (`event*` = evdev, major 13; `mice`/`mouse*` = legacy mouse interface).
+  - Also sound (`/dev/snd/*`), GPUs (`/dev/dri/*`), `/dev/null`, `/dev/random`, watchdogs and GPIO chips.
+  - *Raw notes said "all devices short of mass storage"; network interfaces are the other exception.*
 - **Network devices** are named, not numbered: there is no major:minor and no `/dev/eth0`. Configuration tools use `ioctl()` on a socket (`ifconfig`: `SIOCGIFADDR` and friends) or, in modern tools, **netlink** (`ip` uses rtnetlink). *Raw notes said "socket API + ioctl"; netlink is the modern addition.*
 
 ### Device mapper: virtual block devices
