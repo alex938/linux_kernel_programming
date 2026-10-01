@@ -2231,6 +2231,36 @@ User space reaches hardware through one of three driver interfaces, and the choi
 - **"Character = unbuffered"** is about the kernel core: there is no page cache or block layer. A driver may still keep its own buffers (the tty layer, for example, has a line-discipline buffer).
 - **Network devices** are named, not numbered: there is no major:minor and no `/dev/eth0`. Configuration tools use `ioctl()` on a socket (`ifconfig`: `SIOCGIFADDR` and friends) or, in modern tools, **netlink** (`ip` uses rtnetlink). *Raw notes said "socket API + ioctl"; netlink is the modern addition.*
 
+### Device mapper: virtual block devices
+
+The **device mapper** (`dm`, `drivers/md/dm*.c`) is a kernel framework for creating **virtual block devices layered on top of other block devices**. Each virtual device has a **table** that maps ranges of its sectors to a **target** (a module that decides what to do with them). User space configures it through `/dev/mapper/control` with `ioctl()`s, usually via `dmsetup`, LVM or `cryptsetup`.
+
+```text
+ /dev/mapper/ubuntu--vg-ubuntu--lv  (dm-0, 252:0)   <- what ext4 is mounted on
+          │  table: sectors 0..N  ->  "linear"  8:3  offset
+          ▼
+ /dev/sda3 (8:3)  ->  /dev/sda (8:0)  ->  virtio/SCSI disk
+```
+
+| Target | Used for |
+| ------ | -------- |
+| `linear`, `striped` | **LVM** logical volumes (concatenate or stripe physical ranges) |
+| `crypt` | **dm-crypt**: transparent disk encryption (LUKS via `cryptsetup`) |
+| `thin`, `snapshot` | Thin provisioning and copy-on-write snapshots (LVM thin, Docker's old devicemapper driver) |
+| `verity` | **dm-verity**: read-only integrity checking with a hash tree (Android Verified Boot, ChromeOS) |
+| `mirror`, `raid`, `cache`, `multipath` | Redundancy, SSD caching, multiple paths to one SAN disk |
+
+- The test box itself uses it: Ubuntu's default install puts the root filesystem on an LVM volume, `/dev/mapper/ubuntu--vg-ubuntu--lv` (major **252** = `device-mapper` in `/proc/devices`), on top of `/dev/sda3`.
+- dm devices are ordinary block devices to everything above them, so filesystems, the page cache and the block layer work unchanged. They can be stacked (e.g. LVM on top of dm-crypt).
+
+```bash
+lsblk -o NAME,TYPE,MAJ:MIN                       # shows sda3 -> ubuntu--vg-ubuntu--lv (type lvm, 252:0)
+ls -l /dev/mapper                                # dm device names (symlinks to /dev/dm-N) and the control node
+sudo dmsetup ls                                  # list dm devices
+sudo dmsetup table                               # each device's mapping table (target, source device, offsets)
+sudo lvs                                         # LVM view of the same logical volumes
+```
+
 ### Major and minor numbers
 
 - A `/dev` node is just a name plus a type (`c`/`b`) and a `dev_t` = **major:minor**. Opening it makes the VFS look up the driver registered for that number.
@@ -2339,6 +2369,7 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 
 - `fs/char_dev.c` (`alloc_chrdev_region()`, `cdev_add()`), `drivers/char/misc.c`, `drivers/char/mem.c` (`/dev/null`, `/dev/zero`)
 - `block/` (`blk-mq.c`, `genhd.c`), `drivers/block/null_blk/` (example block driver)
+- `drivers/md/dm.c`, `drivers/md/dm-linear.c`, `drivers/md/dm-crypt.c`; `Documentation/admin-guide/device-mapper/`
 - `net/core/dev.c` (`register_netdev()`, `dev_queue_xmit()`), `drivers/net/dummy.c` (example network driver), `include/linux/netdevice.h`
 - `Documentation/admin-guide/devices.txt` (official major/minor list), `Documentation/block/blk-mq.rst`, `Documentation/networking/netdevices.rst`, `Documentation/driver-api/driver-model/`
 
@@ -2508,6 +2539,7 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | `alloc_chrdev_region()` → `cdev_add()` → `class_create()` → `device_create()` | Classic char device setup (undo in reverse) |
 | `misc_register(&miscdev)` | Simplest char device (major 10, dynamic minor) |
 | `blk_mq_alloc_disk()` + `add_disk()` | Block device (6.x) |
+| `dmsetup ls` / `dmsetup table`; `/dev/mapper/` | Device mapper: virtual block devices (LVM, dm-crypt, dm-verity) |
 | `alloc_etherdev()` + `register_netdev()`; `ndo_start_xmit()` is atomic | Network device |
 
 **Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`; `modules_disabled=1` cannot be undone without a reboot; never sleep under a spinlock or in an RCU read section; take an IRQ-shared lock with `spin_lock_irqsave()`.
@@ -2540,6 +2572,7 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **`current_tracer`** | tracefs file selecting the active ftrace tracer (`nop`, `function`, `function_graph`, …). |
 | **Demand paging** | Allocating or loading a physical page only when a mapped virtual page is first accessed. |
 | **`depmod`** | Tool that generates `modules.dep` (the module dependency list) for `modprobe`. |
+| **Device mapper** | Kernel framework for virtual block devices mapped onto other block devices through targets (LVM, dm-crypt, dm-verity). |
 | **Distribution kernel** | Kernel built and patched by a distro (Ubuntu, Fedora, …) from a stable/LTS release. |
 | **EFI stub** | Code linked into the kernel image that makes it a PE/COFF EFI application that UEFI can run directly. |
 | **`EXPORT_SYMBOL_GPL`** | Export macro restricting a symbol to GPL-compatible modules. |
@@ -2570,6 +2603,7 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **libc** | C runtime library (glibc on Ubuntu): standard C functions and system-call wrappers. |
 | **Loadable kernel module (LKM)** | `.ko` object loaded into the running kernel at predefined extension points. |
 | **lockdep** | Kernel lock validator (`CONFIG_PROVE_LOCKING`) that reports lock-order and IRQ-safety bugs before they deadlock. |
+| **LVM** | Logical Volume Manager: user-space tools that build resizable volumes on device-mapper `linear`/`striped`/`thin` targets. |
 | **Mainline** | Linus Torvalds' upstream kernel tree. |
 | **Major / minor number** | `dev_t` parts of a device node: major selects the driver, minor the device instance. |
 | **Mapped** | A virtual page backed by a page-table entry pointing to a physical frame; access to an unmapped page faults. |
