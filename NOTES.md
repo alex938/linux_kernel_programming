@@ -657,6 +657,59 @@ start_kernel()                       PID 0 (idle / swapper), static init_task
 - **Lazy TLB (why kernel threads are cheap):** a kernel thread borrows the previous task's page tables (`active_mm`). The kernel half is identical in every address space, so there is no page-table switch or TLB flush.
 - **Parent vs adoption:** a kernel thread's parent is PID 2 because **kthreadd created it**. Adoption (reparenting when a parent dies) is a user-process mechanism, handled by PID 1 or a subreaper (`PR_SET_CHILD_SUBREAPER`).
 
+### Tasks: `task_struct`, TCB vs PCB, and PID vs TGID
+
+Classic OS textbooks keep two kinds of descriptor:
+
+- **TCB (thread control block):** per-thread state: registers/saved context, kernel stack, thread state (running, sleeping, …), scheduling class, priority and CPU affinity.
+- **PCB (process control block):** per-process state: the address space, and handles such as open files and sockets, credentials, signal handlers, and the list of its threads.
+
+**Linux unifies both into one structure, `struct task_struct`** (`include/linux/sched.h`). There is one `task_struct` per thread. The "process" parts are not copied into each one: they live in separate, reference-counted structures that the threads of a process **share by pointer**. Which ones are shared is chosen by the `clone()` flags (`CLONE_VM`, `CLONE_FILES`, `CLONE_FS`, `CLONE_SIGHAND`, `CLONE_THREAD`).
+
+```text
+ process (thread group, TGID 1000)
+ ┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐
+ │ task_struct           │  │ task_struct           │  │ task_struct           │
+ │ pid  = 1000 (leader)  │  │ pid  = 1001           │  │ pid  = 1002           │
+ │ tgid = 1000           │  │ tgid = 1000           │  │ tgid = 1000           │
+ │ __state, prio, stack, │  │ __state, prio, stack, │  │ __state, prio, stack, │   <- "TCB" part:
+ │ thread (regs), se ... │  │ thread (regs), se ... │  │ thread (regs), se ... │      per thread
+ └──┬──────┬──────┬──────┘  └──┬──────┬──────┬──────┘  └──┬──────┬──────┬──────┘
+    │mm    │files │signal      │      │      │            │      │      │
+    ▼      ▼      ▼            ▼      ▼      ▼            ▼      ▼      ▼
+ mm_struct   files_struct   signal_struct  (+ fs_struct, sighand_struct, nsproxy, cred)
+ (address    (fd table:     (shared signal
+  space)      files,         state, rlimits)                              <- "PCB" part:
+              sockets)                                                       shared
+```
+
+| Field / call | Kernel meaning | User-space name |
+| ------------ | -------------- | --------------- |
+| `task->pid` | Unique ID of **this thread** | **TID** (`gettid()`, `ps -L` column `LWP`) |
+| `task->tgid` | ID of the thread group = PID of the first thread | **PID** (`getpid()`) |
+| `task->group_leader` | The main thread (where `pid == tgid`) | The process |
+| `/proc/<pid>/status` `Tgid:` / `Pid:` | Same two values | |
+
+- So **every PID in the kernel names a thread**; a process is the group of tasks sharing one `tgid`. The main thread is the one where **`pid == tgid`**. In a single-threaded program the two values are equal.
+- *Raw notes said "PID always a thread": true in the kernel (`task->pid`). In user space, though, `getpid()` returns the **TGID**, and the thread's own ID is called the TID. Raw notes also said `struct tast_struct`; the name is `struct task_struct`.*
+- `fork()` = `clone()` sharing nothing (new `mm` copied on write) → new TGID. `pthread_create()` = `clone(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | …)` → same TGID, new TID.
+- `task_struct` is large (several KiB on x86_64; it varies with config) and is allocated from its own slab cache (`task_struct` in `/proc/slabinfo`).
+
+```c
+pr_info("comm=%s pid(TID)=%d tgid(PID)=%d leader=%d\n",	/* print the current task's identities */
+	current->comm,	/* task name (16 bytes, as in ps) */
+	task_pid_nr(current),	/* this thread's ID: what user space calls the TID */
+	task_tgid_nr(current),	/* thread-group ID: what user space calls the PID */
+	thread_group_leader(current));	/* 1 if this is the main thread (pid == tgid) */
+```
+
+```bash
+ps -eLf | head                                   # one line per thread: PID column = TGID, LWP column = TID
+ls /proc/$$/task                                 # thread IDs (TIDs) of the current shell (just one)
+grep -E '^(Tgid|Pid|Threads):' /proc/$$/status   # TGID, this task's PID (TID) and thread count
+sudo grep -w task_struct /proc/slabinfo          # slab cache for task_structs: object size and count
+```
+
 ### Reading `ps` output
 
 | Item | Meaning |
@@ -764,6 +817,7 @@ pstree -p 1 | head                   # user-space process tree under systemd
 | Creating a task "automatically produces `/proc/pid`" | procfs **generates** `/proc/<pid>` on demand when it is looked up; no files are created |
 | "fake PID 2" | `kthreadd` is a **real** kernel thread |
 | Kernel threads are "adopted" by PID 2 | Not adopted: PID 2 **created** them. Adoption is for orphaned user processes (PID 1). |
+| "PID always a thread"; `struct tast_struct` | True in the kernel (`task->pid` = thread). User space calls that the **TID**; `getpid()` returns the **TGID**. The struct is `struct task_struct`. |
 
 ### Revision questions
 
@@ -1567,6 +1621,36 @@ grep TracerPid /proc/<pid>/status               # PID of the process tracing <pi
 sudo perf trace -s ls                           # strace-like syscall summary without ptrace stops
 ```
 
+### Cross-memory attach: `process_vm_readv()` / `process_vm_writev()`
+
+**Cross-memory attach (CMA)** (Linux 3.2+, `CONFIG_CROSS_MEMORY_ATTACH`, on by default) lets a process copy data **directly between its own memory and another process's memory** in one system call. The kernel copies straight from one address space to the other, so the data is copied only once. Nothing is mapped, and the target process does not need to stop. *Raw notes said "xma" and `process_vm_ready`; correct names are CMA and `process_vm_readv`.*
+
+```c
+ssize_t process_vm_readv(pid_t pid,	/* target process (TGID) */
+	const struct iovec *local_iov, unsigned long liovcnt,	/* where to put the data, in our memory */
+	const struct iovec *remote_iov, unsigned long riovcnt,	/* where to read from, in the target's memory */
+	unsigned long flags);	/* must be 0 */
+/* process_vm_writev() has the same arguments and copies the other way */
+```
+
+| Method | Copies | Target must stop? | Calls needed |
+| ------ | ------ | ----------------- | ------------ |
+| `PTRACE_PEEKDATA` / `POKEDATA` | One word (8 bytes) per call | Yes (ptrace-stopped) | One per word: very slow |
+| `/proc/<pid>/mem` + `pread()` / `pwrite()` | Any size, one region per call | No | `open()` plus one per region |
+| Pipe / socket / shared memory | Twice (in and out of a kernel buffer), or needs both sides to set up a mapping | No, but the target must cooperate | Several |
+| **`process_vm_readv()` / `writev()`** | **Once**, many scattered regions per call (`iovec`) | **No** | **One** |
+
+- **Why it is preferred:** single copy, scatter/gather in one call, no cooperation needed from the target. MPI libraries (Open MPI, MPICH) use it for large intra-node messages, and debuggers and profilers use it to read a target's memory quickly.
+- **Permission:** the same check as `ptrace` attach (`PTRACE_MODE_ATTACH_REALCREDS`): same user and not setuid, or `CAP_SYS_PTRACE`. **Yama** `ptrace_scope` applies too, so with the Ubuntu default of 1 you can only read your own descendants unless you have `CAP_SYS_PTRACE`.
+- **Not atomic:** the target keeps running and may change the data mid-copy. A short count is returned if a remote page is unmapped (`EFAULT` only if nothing was copied). Errors: `ESRCH` (no such process), `EPERM` (not allowed).
+- Kernel source: `mm/process_vm_access.c` (it pins the remote pages with `pin_user_pages_remote()` and copies with `copy_page_to_iter()` / `copy_page_from_iter()`).
+
+```bash
+grep CONFIG_CROSS_MEMORY_ATTACH /boot/config-$(uname -r)   # is CMA built in? (=y on Ubuntu)
+man 2 process_vm_readv                                     # full API and error codes
+strace -e trace=process_vm_readv gdb -p <pid> -batch       # see a debugger use it (needs ptrace permission)
+```
+
 ### Key APIs / structures
 
 | API | Header | Purpose | Context |
@@ -2105,6 +2189,15 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | `/proc/<pid>/task/<tid>` | Per-thread entries |
 | `kthread_run()` / `kthread_should_stop()` / `kthread_stop()` | Kernel thread lifecycle |
 
+### Tasks (§5)
+
+| Item | Meaning |
+| ---- | ------- |
+| `struct task_struct` (`<linux/sched.h>`) | One per thread; process-wide state shared via `mm`, `files`, `fs`, `signal`, `sighand` pointers |
+| `task->pid` / `task->tgid` | Thread ID (TID) / thread-group ID (user-space PID); main thread: `pid == tgid` |
+| `getpid()` / `gettid()` | Returns TGID / TID |
+| `ps -eLf`, `/proc/<pid>/task/`, `Tgid:` in `/proc/<pid>/status` | See threads and their IDs |
+
 ### Headers and modules (§6, §7)
 
 | Item | Meaning |
@@ -2167,6 +2260,7 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | `strace -f -e trace=… / -c / -p <pid>` | Syscall tracing via ptrace (slow: 2 stops per syscall) |
 | `kernel.yama.ptrace_scope` | 0 classic, 1 descendants only (Ubuntu), 2 `CAP_SYS_PTRACE` only, 3 disabled |
 | `perf trace` | Low-overhead strace alternative |
+| `process_vm_readv()` / `process_vm_writev()` | Cross-memory attach (3.2+): one-copy read/write of another process's memory; ptrace-attach permission |
 
 
 ### Pages (§11)
@@ -2216,6 +2310,7 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | **Capability sets** | Per-thread bitmasks: Effective, Permitted, Inheritable, Bounding, Ambient. |
 | **`charp`** | `module_param` type for a string parameter (`char *`); the kernel stores a copy of the value. |
 | **Critical section** | Code accessing shared data that must not run concurrently with other users of that data. |
+| **Cross-memory attach (CMA)** | `process_vm_readv()`/`process_vm_writev()`: single-copy transfer between two processes' address spaces (Linux 3.2+). |
 | **`current_tracer`** | tracefs file selecting the active ftrace tracer (`nop`, `function`, `function_graph`, …). |
 | **Demand paging** | Allocating or loading a physical page only when a mapped virtual page is first accessed. |
 | **`depmod`** | Tool that generates `modules.dep` (the module dependency list) for `modprobe`. |
@@ -2262,6 +2357,7 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | **Page** | Smallest unit of memory the MMU maps and protects (4 KiB on x86_64; 4/16/64 KiB on ARM64). |
 | **Page fault** | CPU exception on access to an unmapped or protected page, handled by the kernel. |
 | **Page frame / PFN** | A physical page, and its number (`phys >> PAGE_SHIFT`). |
+| **PCB** | Process control block: textbook per-process descriptor (address space, open files, credentials); in Linux, the shared structs a `task_struct` points to. |
 | **PE32+** | 64-bit Portable Executable format used by UEFI applications (and Windows). |
 | **`PREEMPT_RT`** | Real-time preemption model (mainline since 6.12): spinlocks become sleeping rt_mutex locks, IRQs are threaded. |
 | **`/proc/kallsyms`** | Live kernel (and module) symbol table with runtime addresses. |
@@ -2284,7 +2380,9 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | **Taint** | Kernel flag recording conditions (e.g. a proprietary module loaded) that affect debugging and support. |
 | **`TASK_SIZE`** | Top of the user-space address range. |
 | **`task_struct`** | Kernel structure describing every task (thread, process or kernel thread). |
+| **TCB** | Thread control block: textbook per-thread descriptor (state, registers, scheduling); in Linux, part of `task_struct`. |
 | **TGID** | Thread-group ID: what user space calls the PID; each thread has its own TID. |
+| **TID** | Thread ID: the kernel's `task->pid`; returned by `gettid()`. |
 | **`trace_marker`** | tracefs file through which user space writes text events into the ftrace ring buffer. |
 | **tracefs** | Pseudo-filesystem (`/sys/kernel/tracing`) exposing ftrace controls and output. |
 | **Tracepoint** | Static, named trace hook compiled into kernel source; a more stable interface than kprobes. |
