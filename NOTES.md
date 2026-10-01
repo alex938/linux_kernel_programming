@@ -710,6 +710,61 @@ grep -E '^(Tgid|Pid|Threads):' /proc/$$/status   # TGID, this task's PID (TID) a
 sudo grep -w task_struct /proc/slabinfo          # slab cache for task_structs: object size and count
 ```
 
+### The task list: `init_task` and `for_each_process()`
+
+- **`init_task`** (`init/init_task.c`) is the statically defined `task_struct` of **PID 0**, the very first task (the boot CPU's idle task, `swapper/0`). Every other task is created by copying from it, directly or indirectly. The other CPUs' idle tasks (`swapper/1`, …) are also PID 0, created by `fork_idle()`.
+- All processes are linked into one **circular doubly-linked list** through `task->tasks` (a `struct list_head`), with `init_task` as its head. Only **thread-group leaders** (processes) are on this list. A process's threads are on a second list, `signal->thread_head`.
+- `for_each_process(p)` starts at `init_task` and follows `.tasks.next` until it gets back to `init_task`. It therefore visits every process **except PID 0 itself**.
+
+```text
+           ┌──────────────────────────────────────────────────────────────┐
+           ▼                                                              │
+   init_task (PID 0) ─tasks.next─> systemd (1) ─> kthreadd (2) ─> ... ─> bash (1234)
+           ▲                                                              │
+           └──────────────────────────── tasks.prev ──────────────────────┘
+   for_each_thread(p, t): walks p->signal->thread_head (all threads of one process)
+```
+
+```c
+/* include/linux/sched/signal.h (6.x), simplified */
+#define next_task(p) \
+	list_entry_rcu((p)->tasks.next, struct task_struct, tasks)	/* the task after p in the list */
+#define for_each_process(p) \
+	for (p = &init_task; (p = next_task(p)) != &init_task; )	/* start after init_task, stop when back at it */
+```
+
+*Raw notes said "for each process(..) takes init_task does init.task.tasks.next": correct. The names are `for_each_process()` and `init_task.tasks.next`.*
+
+| Macro | Visits | Header |
+| ----- | ------ | ------ |
+| `for_each_process(p)` | Every process (thread-group leader), not PID 0 | `<linux/sched/signal.h>` |
+| `for_each_thread(p, t)` | Every thread `t` of process `p` | `<linux/sched/signal.h>` |
+| `for_each_process_thread(p, t)` | Every thread in the system (nested loop) | `<linux/sched/signal.h>` |
+
+**Locking:** the list changes as tasks fork and exit, so walk it inside `rcu_read_lock()` / `rcu_read_unlock()` (readers; may not sleep, §12). Use `read_lock(&tasklist_lock)` only if you need the list to be stable. To keep using a task after the walk, take a reference with `get_task_struct()` and drop it with `put_task_struct()`. `while_each_thread()` is deprecated: use `for_each_thread()`.
+
+```c
+#include <linux/sched/signal.h>	/* for_each_process(), for_each_thread() */
+#include <linux/rcupdate.h>	/* rcu_read_lock(), rcu_read_unlock() */
+
+static void list_tasks(void)	/* print every process and its thread count */
+{	/* start of list_tasks() */
+	struct task_struct *p, *t;	/* p = process (leader), t = one of its threads */
+	int n;	/* thread counter */
+
+	rcu_read_lock();	/* protect the task lists while we walk them; no sleeping until unlock */
+	for_each_process(p) {	/* init_task.tasks.next, ... until back at init_task */
+		n = 0;	/* reset the count for this process */
+		for_each_thread(p, t)	/* every thread in p's thread group */
+			n++;	/* count it */
+		pr_info("%-16s pid=%d threads=%d\n", p->comm, p->pid, n);	/* name, PID (= TGID for a leader), threads */
+	}	/* end of for_each_process */
+	rcu_read_unlock();	/* end of the RCU read-side section */
+}	/* end of list_tasks() */
+```
+
+⚠️ Verify: snippet not yet built on the test box; `init_task` is exported, so this works from a module.
+
 ### Reading `ps` output
 
 | Item | Meaning |
@@ -2196,6 +2251,8 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | `struct task_struct` (`<linux/sched.h>`) | One per thread; process-wide state shared via `mm`, `files`, `fs`, `signal`, `sighand` pointers |
 | `task->pid` / `task->tgid` | Thread ID (TID) / thread-group ID (user-space PID); main thread: `pid == tgid` |
 | `getpid()` / `gettid()` | Returns TGID / TID |
+| `init_task` | Static `task_struct` of PID 0; head of the circular `tasks` list |
+| `for_each_process(p)` / `for_each_thread(p, t)` | Walk all processes / one process's threads under `rcu_read_lock()` |
 | `ps -eLf`, `/proc/<pid>/task/`, `Tgid:` in `/proc/<pid>/status` | See threads and their IDs |
 
 ### Headers and modules (§6, §7)
@@ -2378,8 +2435,10 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | **sysctl** | Run-time kernel tunable exposed under `/proc/sys/`; set with `sysctl -w` or `/etc/sysctl.d/`. |
 | **`System.map`** | Link-time kernel symbol table (address, type, name). |
 | **Taint** | Kernel flag recording conditions (e.g. a proprietary module loaded) that affect debugging and support. |
+| **Task list** | Circular doubly-linked list of all processes through `task->tasks`, headed by `init_task`; walked with `for_each_process()`. |
 | **`TASK_SIZE`** | Top of the user-space address range. |
 | **`task_struct`** | Kernel structure describing every task (thread, process or kernel thread). |
+| **`tasklist_lock`** | Global rwlock protecting the task lists; readers usually use RCU instead. |
 | **TCB** | Thread control block: textbook per-thread descriptor (state, registers, scheduling); in Linux, part of `task_struct`. |
 | **TGID** | Thread-group ID: what user space calls the PID; each thread has its own TID. |
 | **TID** | Thread ID: the kernel's `task->pid`; returned by `gettid()`. |
