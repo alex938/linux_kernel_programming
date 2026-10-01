@@ -16,6 +16,7 @@
 - [9. Kernel Architecture: Monolithic vs Microkernel](#9-kernel-architecture-monolithic-vs-microkernel)
 - [10. Tracing: ftrace, kprobes, `trace_marker` and ptrace](#10-tracing-ftrace-kprobes-trace_marker-and-ptrace)
 - [11. Pages and Page Size](#11-pages-and-page-size)
+- [12. Synchronisation: Spinlocks, RW Locks and RCU](#12-synchronisation-spinlocks-rw-locks-and-rcu)
 - [Labs & Exercises](#labs--exercises)
 - [Quick Reference](#quick-reference)
 - [Glossary](#glossary)
@@ -1797,6 +1798,225 @@ readelf -lW /bin/ls | grep LOAD                    # "Align" column: 0x1000 = 4K
 
 ---
 
+## 12. Synchronisation: Spinlocks, RW Locks and RCU
+
+> **Remember**
+> - A **spinlock** busy-waits and disables preemption: hold it briefly and **never sleep** while holding it. Use `spin_lock_irqsave()` if an interrupt handler also takes the lock.
+> - A **reader-writer lock** (`rwlock_t`) lets many readers in at once, or one writer. It is rarely the right choice: readers bounce the lock's cache line, and writers can be starved.
+> - **RCU** readers take no lock and do no atomic writes: `rcu_read_lock()`, then `rcu_dereference()`. Writers publish a new copy with `rcu_assign_pointer()` and free the old one only after a **grace period** (`synchronize_rcu()` / `kfree_rcu()`).
+> - RCU suits read-mostly data. Writers still need their own lock (usually a spinlock) to keep out other writers.
+> - With `CONFIG_PREEMPT_RT`, `spinlock_t` and `rwlock_t` become sleeping locks; `raw_spinlock_t` is always a true spinning lock.
+
+*Raw notes so far: only the heading "Synchronization RCU, RWLocks and Spinlocks". The detail below is background to support the lecture; it will be extended as the notes grow.*
+
+### Overview
+
+The kernel is fully **preemptible** and runs on many CPUs at once, and interrupts can arrive at any moment. Any data that more than one of these can reach is shared, and needs protection to avoid a **race condition**. Spinlocks, reader-writer locks and RCU are the main tools for code that may not sleep, or for hot read paths. Sleeping locks (`mutex`, `rw_semaphore`) are for process context only.
+
+### Key concepts
+
+- **Critical section:** code that touches shared data and must not run at the same time as another user of that data.
+- **Concurrency sources:** true parallelism (SMP), preemption, interrupts (hardirq), softirqs/tasklets, and sleeping in the middle of an update.
+- **Atomic context:** hardirq, softirq, or holding a spinlock / preemption disabled. Code here must not sleep (`kmalloc(GFP_KERNEL)`, `mutex_lock()`, `copy_from_user()` and `msleep()` can all sleep).
+- **Spinlock:** a waiter spins (busy-waits) until the holder releases it. Taking one disables preemption on that CPU. On a uniprocessor non-preempt kernel it compiles to almost nothing.
+- **Ticket / queued spinlocks:** modern x86 uses **qspinlock** (MCS-based) so waiters spin on their own cache line and get the lock in FIFO order.
+- **RW lock:** many concurrent readers or one writer. Readers can starve writers; every reader still writes to the lock word (cache-line bouncing).
+- **RCU (Read-Copy-Update):** readers run lock-free; a writer copies, modifies, publishes the new version, then waits for all pre-existing readers to finish (a **grace period**) before freeing the old one.
+- **Quiescent state:** a point where a CPU cannot be in an RCU read-side critical section (e.g. a context switch, idle, user mode). A grace period ends once every CPU has passed through one.
+
+### How it works: choosing a lock variant
+
+```text
+Who else takes this lock?            Lock call to use (process ctx side)
+-----------------------------------  ------------------------------------
+only process context                 spin_lock()          (or a mutex if you may sleep)
++ softirq / tasklet / timer          spin_lock_bh()       (disables bottom halves)
++ hardirq handler                    spin_lock_irqsave()  (disables local IRQs, saves flags)
+inside the hardirq handler itself    spin_lock()          (IRQs already off on this CPU)
+```
+
+Why `irqsave`: if process context holds lock L and an interrupt on the **same CPU** tries to take L, the handler spins forever, because the holder cannot run until the handler returns. That is a self-deadlock.
+
+### How it works: an RCU update
+
+```text
+ readers:   [--- see old ---]       [-- see old or new --]  [--- see new ---]
+                     |                         |
+ writer:  copy+modify old -> rcu_assign_pointer(gp, new) -> synchronize_rcu() -> kfree(old)
+                                      ^ publish                ^ waits for every reader that
+                                                                 might still hold "old"
+ grace period:                        |<------------------------>|
+```
+
+Readers never block the writer, and the writer never blocks readers. The cost is that the writer waits (or defers the free), and readers may briefly see the old version.
+
+### Comparison
+
+| | Spinlock | RW lock | RCU |
+| --- | --- | --- | --- |
+| Readers in parallel | No | Yes | Yes, lock-free |
+| Reader cost | Atomic op + cache-line bounce | Atomic op + bounce | Almost zero (preemption disable, or nothing, depending on config) |
+| Writer cost | Low | Low, but can be starved | High: copy plus grace period |
+| Readers may sleep | No | No | No (use **SRCU** if they must) |
+| Best for | Short critical sections, any mix | Rarely; legacy code | Read-mostly data: routing tables, module lists, `struct file` tables |
+
+### Key APIs / structures
+
+| API | Header | Purpose | Context |
+| --- | --- | --- | --- |
+| `DEFINE_SPINLOCK(l)` / `spin_lock_init(&l)` | `<linux/spinlock.h>` | Declare / initialise a `spinlock_t` | Any |
+| `spin_lock()` / `spin_unlock()` | `<linux/spinlock.h>` | Take / release; disables preemption | Any; must not sleep while held |
+| `spin_lock_bh()` / `spin_unlock_bh()` | `<linux/spinlock.h>` | Also disables softirqs on this CPU | Process / softirq |
+| `spin_lock_irqsave(&l, flags)` / `spin_unlock_irqrestore()` | `<linux/spinlock.h>` | Also disables local IRQs and saves the previous IRQ state | Any, including hardirq |
+| `spin_trylock()` | `<linux/spinlock.h>` | Take the lock if free, never spin; returns 1 on success | Any |
+| `raw_spinlock_t`, `raw_spin_lock()` | `<linux/spinlock.h>` | Always spins, even on `PREEMPT_RT` | Any; very short sections only |
+| `DEFINE_RWLOCK(l)`, `read_lock()` / `write_lock()` (+ `_bh`, `_irqsave`) | `<linux/rwlock.h>` (via `spinlock.h`) | Reader-writer spinlock | Any; must not sleep |
+| `seqlock_t`, `read_seqbegin()` / `read_seqretry()` | `<linux/seqlock.h>` | Writer-priority alternative: readers retry if a write happened | Any |
+| `rcu_read_lock()` / `rcu_read_unlock()` | `<linux/rcupdate.h>` | Mark an RCU read-side critical section | Any; must not sleep inside |
+| `rcu_dereference(p)` | `<linux/rcupdate.h>` | Load an RCU-protected pointer safely | Inside a read-side section |
+| `rcu_assign_pointer(p, v)` | `<linux/rcupdate.h>` | Publish a new pointer (with a release barrier) | Writer, under the update lock |
+| `synchronize_rcu()` | `<linux/rcupdate.h>` | Block until a grace period has elapsed | Process context only (**sleeps**) |
+| `call_rcu(&head, fn)` / `kfree_rcu(ptr, field)` | `<linux/rcupdate.h>` | Free after a grace period without blocking | Any |
+| `list_add_rcu()`, `list_del_rcu()`, `list_for_each_entry_rcu()` | `<linux/rculist.h>` | RCU-safe linked lists | Writers under lock; readers in RCU section |
+
+### Code example: spinlock-protected writer, RCU reader
+
+```c
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/module.h>	/* module_init(), module_exit(), MODULE_*() */
+#include <linux/slab.h>	/* kmalloc(), kfree() */
+#include <linux/spinlock.h>	/* DEFINE_SPINLOCK(), spin_lock(), spin_unlock() */
+#include <linux/rcupdate.h>	/* rcu_read_lock(), rcu_dereference(), rcu_assign_pointer(), kfree_rcu() */
+
+struct cfg {	/* the shared, read-mostly data */
+	int value;	/* the payload readers want */
+	struct rcu_head rcu;	/* needed by kfree_rcu() to defer the free */
+};	/* end of struct cfg */
+
+static struct cfg __rcu *cur_cfg;	/* RCU-protected pointer to the current version */
+static DEFINE_SPINLOCK(cfg_lock);	/* serialises writers only; readers never take it */
+
+static int cfg_read(void)	/* reader: lock-free, may run on many CPUs at once */
+{	/* start of cfg_read() */
+	struct cfg *c;	/* local copy of the pointer */
+	int v;	/* value to return */
+
+	rcu_read_lock();	/* start read-side critical section (must not sleep inside) */
+	c = rcu_dereference(cur_cfg);	/* safely load the current pointer */
+	v = c ? c->value : -1;	/* use the data; -1 if nothing published yet */
+	rcu_read_unlock();	/* end read-side section; c must not be used after this */
+	return v;	/* return the value read */
+}	/* end of cfg_read() */
+
+static int cfg_update(int value)	/* writer: copy, publish, free old after grace period */
+{	/* start of cfg_update() */
+	struct cfg *new, *old;	/* the new version and the version it replaces */
+
+	new = kmalloc(sizeof(*new), GFP_KERNEL);	/* allocate before taking the spinlock (GFP_KERNEL may sleep) */
+	if (!new)	/* allocation failed? */
+		return -ENOMEM;	/* report out of memory */
+	new->value = value;	/* fill in the new version completely before publishing */
+
+	spin_lock(&cfg_lock);	/* keep other writers out */
+	old = rcu_dereference_protected(cur_cfg, lockdep_is_held(&cfg_lock));	/* read pointer as the lock holder */
+	rcu_assign_pointer(cur_cfg, new);	/* publish: readers now see new (release barrier) */
+	spin_unlock(&cfg_lock);	/* writers may proceed */
+
+	if (old)	/* was there a previous version? */
+		kfree_rcu(old, rcu);	/* free it once all current readers are done */
+	return 0;	/* success */
+}	/* end of cfg_update() */
+
+static int __init rcu_demo_init(void)	/* runs at insmod */
+{	/* start of rcu_demo_init() */
+	int ret;	/* return code from cfg_update() */
+
+	ret = cfg_update(42);	/* publish the first version */
+	if (ret)	/* did it fail? */
+		return ret;	/* abort the load with the error */
+	pr_info("rcu_demo: value=%d\n", cfg_read());	/* read it back through the RCU reader */
+	return 0;	/* load succeeded */
+}	/* end of rcu_demo_init() */
+
+static void __exit rcu_demo_exit(void)	/* runs at rmmod */
+{	/* start of rcu_demo_exit() */
+	struct cfg *old = rcu_dereference_protected(cur_cfg, 1);	/* no readers left: plain access is safe */
+
+	RCU_INIT_POINTER(cur_cfg, NULL);	/* unpublish (no barrier needed for NULL) */
+	synchronize_rcu();	/* wait out any reader that started before the unpublish */
+	kfree(old);	/* now nothing can reference it */
+	rcu_barrier();	/* wait for pending kfree_rcu() callbacks before the module text goes away */
+}	/* end of rcu_demo_exit() */
+
+module_init(rcu_demo_init);	/* register the entry point */
+module_exit(rcu_demo_exit);	/* register the exit point */
+MODULE_LICENSE("GPL");	/* GPL: RCU and lockdep helpers are GPL-only symbols */
+MODULE_DESCRIPTION("RCU reader with spinlock-serialised writer demo");	/* shown by modinfo */
+```
+
+⚠️ Verify: not yet built on the test box. `kfree(NULL)` is safe, so the exit path needs no `NULL` check.
+
+### Config and version dependencies
+
+- `CONFIG_SMP=n`: spinlocks reduce to preemption disable (or nothing on a non-preemptible kernel). Races with interrupts still exist, so `_irqsave` still matters.
+- `CONFIG_PREEMPT_RT` (merged into mainline in **6.12**): `spinlock_t` and `rwlock_t` become sleeping, priority-inheriting **rt_mutex**-based locks, and most interrupt handlers run in threads. Code that must truly spin (e.g. in the scheduler or low-level IRQ code) uses `raw_spinlock_t`.
+- RCU flavours: `CONFIG_PREEMPT_RCU` (preemptible kernels: readers can be preempted, so `rcu_read_lock()` keeps a nesting count) vs `TREE_RCU` on non-preemptible kernels (`rcu_read_lock()` just disables preemption). Since 4.20 the old rcu-bh and rcu-sched flavours have been folded into one, so `synchronize_rcu()` covers them all.
+
+### Commands / debugging
+
+```bash
+grep -E 'CONFIG_(PROVE_LOCKING|DEBUG_SPINLOCK|PREEMPT_RT|PREEMPT_RCU|DEBUG_ATOMIC_SLEEP)=' /boot/config-$(uname -r)   # which lock-debug options this kernel has
+sudo cat /proc/lockdep_stats                      # lockdep counters (only with CONFIG_PROVE_LOCKING)
+sudo cat /proc/lock_stat                          # per-lock contention stats (CONFIG_LOCK_STAT; echo 0 > to reset)
+sudo perf lock record -- sleep 5                  # record lock events system-wide for 5 s
+sudo perf lock report                             # show contended locks from the recording
+sudo bpftrace -e 'kprobe:queued_spin_lock_slowpath { @[kstack(5)] = count(); }'   # who hits the contended spinlock slow path
+dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall|possible circular locking'   # typical lock/RCU bug reports
+```
+
+- **lockdep** (`CONFIG_PROVE_LOCKING`) proves lock-ordering and IRQ-safety bugs the first time a bad pattern *could* happen, not only when it deadlocks.
+- `CONFIG_DEBUG_ATOMIC_SLEEP` reports "sleeping function called from invalid context".
+- **RCU CPU stall warnings** ("rcu: INFO: rcu_preempt detected stalls") mean a CPU has not reached a quiescent state for ~21 s, often a loop holding a lock or sitting in a read-side section.
+- The Ubuntu `-generic` test-box kernel does not enable lockdep; boot a debug kernel with `vng` to try it.
+
+### Pitfalls
+
+- **Sleeping while holding a spinlock** or inside `rcu_read_lock()`: `kmalloc(GFP_KERNEL)`, `mutex_lock()`, `copy_to_user()`, `msleep()`. Allocate first, or use `GFP_ATOMIC`.
+- **Using `spin_lock()` when an IRQ handler also takes the lock** causes self-deadlock on one CPU. Use `spin_lock_irqsave()` in process context.
+- **Lock-order inversion (ABBA):** CPU0 holds A and wants B while CPU1 holds B and wants A. Fix it with one documented global order.
+- **Recursion:** Linux spinlocks are not recursive; taking the same lock twice deadlocks.
+- **Using an RCU pointer after `rcu_read_unlock()`**, or freeing the old version before a grace period: use-after-free.
+- **Plain loads/stores of RCU pointers:** always use `rcu_dereference()` / `rcu_assign_pointer()`, otherwise the compiler or CPU can reorder the initialisation after the publish.
+- **Unloading a module with `call_rcu()`/`kfree_rcu()` callbacks pending:** call `rcu_barrier()` in `module_exit`.
+- **Holding a spinlock for a long time:** other CPUs burn cycles and latency rises. Keep sections short or use a mutex.
+
+### Revision questions
+
+1. Why must process context use `spin_lock_irqsave()` for a lock that the device's interrupt handler also takes?
+2. Why can't `synchronize_rcu()` be called while holding a spinlock, and what can you use instead?
+3. When would you choose RCU over an `rwlock_t`, and what is RCU's main cost?
+4. What happens to `spinlock_t` on a `CONFIG_PREEMPT_RT` kernel, and when must you use `raw_spinlock_t`?
+
+<details>
+<summary>Answers</summary>
+
+1. If the interrupt arrives on the same CPU while process context holds the lock, the handler spins forever: the holder cannot run until the handler returns. Disabling local IRQs while holding the lock prevents this. `irqsave` also restores the previous IRQ state, so it is safe even if IRQs were already off.
+2. `synchronize_rcu()` sleeps until a grace period ends, and sleeping in atomic context is a bug (it can also deadlock). Use `call_rcu()` or `kfree_rcu()` to defer the free without blocking.
+3. For read-mostly data on hot paths: RCU readers take no lock and write no shared cache line, so they scale perfectly and never block writers. The cost is on the update side: copying, waiting for a grace period (or deferring frees), and readers may see stale data briefly.
+4. It becomes a sleeping, priority-inheriting lock based on `rt_mutex`, so holders can be preempted. Use `raw_spinlock_t` where the code truly cannot sleep even on RT: scheduler internals, low-level interrupt and timer code, and very short sections called with IRQs disabled.
+
+</details>
+
+### Source pointers
+
+- `include/linux/spinlock.h`, `include/linux/spinlock_types.h`, `include/linux/rwlock.h`, `kernel/locking/spinlock.c`, `kernel/locking/qspinlock.c`
+- `include/linux/spinlock_rt.h`, `kernel/locking/spinlock_rt.c`, `kernel/locking/rtmutex.c` (PREEMPT_RT)
+- `include/linux/rcupdate.h`, `include/linux/rculist.h`, `kernel/rcu/tree.c`, `kernel/rcu/update.c`
+- `kernel/locking/lockdep.c`
+- `Documentation/locking/spinlocks.rst`, `Documentation/locking/locktypes.rst`, `Documentation/locking/lockdep-design.rst`, `Documentation/RCU/whatisRCU.rst`, `Documentation/RCU/checklist.rst`, `Documentation/kernel-hacking/locking.rst`
+
+---
+
 ## Labs & Exercises
 
 *None yet.*
@@ -1926,7 +2146,19 @@ readelf -lW /bin/ls | grep LOAD                    # "Align" column: 0x1000 = 4K
 | `alloc_pages(gfp, order)` | 2^order contiguous pages; `get_order(size)` to compute the order |
 | `/proc/meminfo` `Hugepagesize`, `/sys/kernel/mm/transparent_hugepage/enabled` | Huge page size and THP mode |
 
-**Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`.
+### Synchronisation (§12)
+
+| Item | Meaning |
+| ---- | ------- |
+| `spin_lock()` / `_bh()` / `_irqsave(&l, flags)` | Process-only / + softirq users / + hardirq users; never sleep while held |
+| `raw_spinlock_t` | Always spins, even on `PREEMPT_RT` (where `spinlock_t` sleeps) |
+| `read_lock()` / `write_lock()` | `rwlock_t`: many readers or one writer; prefer RCU or seqlock |
+| `rcu_read_lock()` → `rcu_dereference()` → `rcu_read_unlock()` | Lock-free reader; no sleeping inside |
+| `rcu_assign_pointer()` + `synchronize_rcu()` / `kfree_rcu()` | Publish new version; free old after a grace period |
+| `rcu_barrier()` | In `module_exit`: wait for pending `call_rcu()`/`kfree_rcu()` callbacks |
+| `CONFIG_PROVE_LOCKING`, `CONFIG_DEBUG_ATOMIC_SLEEP`, `perf lock` | Lockdep, sleep-in-atomic checks, contention analysis |
+
+**Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`; never sleep under a spinlock or in an RCU read section; take an IRQ-shared lock with `spin_lock_irqsave()`.
 
 ---
 
@@ -1934,22 +2166,22 @@ readelf -lW /bin/ls | grep LOAD                    # "Align" column: 0x1000 = 4K
 
 | Term | Definition |
 | ---- | ---------- |
-| **`.modinfo`** | ELF section of a `.ko` holding `key=value` module metadata. |
-| **`/boot`** | Directory (often a separate partition) holding kernel images, initramfs, symbol maps and configs. |
-| **`/proc/kallsyms`** | Live kernel (and module) symbol table with runtime addresses. |
+| **Atomic context** | Code that must not sleep: hardirq, softirq, or with a spinlock held / preemption disabled. |
 | **atrace** | Android tracing tool/API: framework code writes begin/end/counter markers to `trace_marker`; collected with kernel events and viewed in Perfetto. |
+| **`/boot`** | Directory (often a separate partition) holding kernel images, initramfs, symbol maps and configs. |
 | **Boot image (Android)** | `boot.img` in the raw `boot` partition: `ANDROID!` header, kernel and ramdisk. |
 | **Boot protocol** | Architecture-specific contract for how a bootloader loads the kernel and passes it control and parameters. |
-| **BTF** | BPF Type Format: compact kernel type information (`/sys/kernel/btf/vmlinux`) that lets bpftrace/BPF use kernel structs without headers. |
 | **Bootloader** | Program started by the firmware (e.g. GRUB) that loads the kernel and initramfs and passes the command line. |
-| **BSP** | Board Support Package: an SoC vendor's kernel tree, Device Trees, drivers and bootloader. |
-| **bzImage** | x86 "big zImage" format: setup code plus a self-decompressing compressed kernel. |
 | **bpftrace** | High-level tracing language that compiles one-liners to eBPF and attaches them to kprobes, uprobes and tracepoints. |
+| **BSP** | Board Support Package: an SoC vendor's kernel tree, Device Trees, drivers and bootloader. |
+| **BTF** | BPF Type Format: compact kernel type information (`/sys/kernel/btf/vmlinux`) that lets bpftrace/BPF use kernel structs without headers. |
+| **bzImage** | x86 "big zImage" format: setup code plus a self-decompressing compressed kernel. |
 | **Canonical address** | 64-bit address whose unused top bits all equal the highest implemented bit; any other address faults. |
 | **`CAP_SYSLOG`** | Capability needed to see real kernel addresses when `kptr_restrict=1`. |
 | **Capability** | One independent slice of root's privileges (`CAP_*`), checked by the kernel per operation. |
 | **Capability sets** | Per-thread bitmasks: Effective, Permitted, Inheritable, Bounding, Ambient. |
 | **`charp`** | `module_param` type for a string parameter (`char *`); the kernel stores a copy of the value. |
+| **Critical section** | Code accessing shared data that must not run concurrently with other users of that data. |
 | **`current_tracer`** | tracefs file selecting the active ftrace tracer (`nop`, `function`, `function_graph`, …). |
 | **Demand paging** | Allocating or loading a physical page only when a mapped virtual page is first accessed. |
 | **`depmod`** | Tool that generates `modules.dep` (the module dependency list) for `modprobe`. |
@@ -1962,6 +2194,7 @@ readelf -lW /bin/ls | grep LOAD                    # "Align" column: 0x1000 = 4K
 | **`function_graph`** | ftrace tracer hooking function entry and exit, showing an indented call tree with durations. |
 | **GKI** | Generic Kernel Image: Android's single common kernel binary; vendor code goes in modules against a stable KMI. |
 | **GPL-2.0** | The kernel's licence: distributing modified binaries requires providing the source. |
+| **Grace period** | RCU interval after which every reader that started before it has finished. |
 | **Granule (translation)** | ARM64 term for the base page size used by the MMU (4, 16 or 64 KiB), set in `TCR_EL1`. |
 | **Headers package** | Distro package with the headers, Kbuild files, `.config` and `Module.symvers` for building modules against one kernel. |
 | **Huge page** | A page mapped at a higher page-table level (e.g. 2 MiB or 1 GiB on x86_64) to cut TLB misses; via hugetlbfs or THP. |
@@ -1981,37 +2214,48 @@ readelf -lW /bin/ls | grep LOAD                    # "Align" column: 0x1000 = 4K
 | **Lazy TLB** | Kernel threads borrowing the previous task's page tables (`active_mm`) to avoid a switch. |
 | **libc** | C runtime library (glibc on Ubuntu): standard C functions and system-call wrappers. |
 | **Loadable kernel module (LKM)** | `.ko` object loaded into the running kernel at predefined extension points. |
+| **lockdep** | Kernel lock validator (`CONFIG_PROVE_LOCKING`) that reports lock-order and IRQ-safety bugs before they deadlock. |
 | **Mainline** | Linus Torvalds' upstream kernel tree. |
 | **Mapped** | A virtual page backed by a page-table entry pointing to a physical frame; access to an unmapped page faults. |
 | **Microkernel** | Kernel that keeps only IPC, scheduling and basic memory management in kernel mode; other services run as user-space servers. |
 | **`mmap()`** | System call that creates a virtual memory mapping (VMA) in a process. |
+| **`.modinfo`** | ELF section of a `.ko` holding `key=value` module metadata. |
 | **Module parameter** | Module variable settable at load time (`name=value`) and exposed in `/sys/module/<mod>/parameters/`. |
 | **`Module.symvers`** | Build output listing exported symbols and their CRCs, used by modpost. |
 | **modversions** | Per-symbol CRC checking of a module's imports against the kernel (`CONFIG_MODVERSIONS`). |
 | **Monolithic kernel** | Kernel whose services (syscalls, mm, filesystems, networking, drivers) all run in one privileged address space and call each other directly. |
 | **Page** | Smallest unit of memory the MMU maps and protects (4 KiB on x86_64; 4/16/64 KiB on ARM64). |
-| **Page frame / PFN** | A physical page, and its number (`phys >> PAGE_SHIFT`). |
 | **Page fault** | CPU exception on access to an unmapped or protected page, handled by the kernel. |
+| **Page frame / PFN** | A physical page, and its number (`phys >> PAGE_SHIFT`). |
 | **PE32+** | 64-bit Portable Executable format used by UEFI applications (and Windows). |
+| **`PREEMPT_RT`** | Real-time preemption model (mainline since 6.12): spinlocks become sleeping rt_mutex locks, IRQs are threaded. |
+| **`/proc/kallsyms`** | Live kernel (and module) symbol table with runtime addresses. |
 | **`ptrace()`** | System call letting a tracer process stop, inspect and modify a tracee; the basis of gdb and strace. |
+| **qspinlock** | Queued (MCS-based) spinlock implementation used on x86 and ARM64: FIFO, each waiter spins locally. |
+| **Quiescent state** | Point where a CPU cannot be inside an RCU read-side section (context switch, idle, user mode). |
+| **Race condition** | Bug where the result depends on the timing of concurrent accesses to shared data. |
+| **RCU** | Read-Copy-Update: lock-free readers; writers publish a new copy and free the old after a grace period. |
+| **Reader-writer lock** | `rwlock_t`: spinning lock allowing many readers or one writer. |
 | **RELRO** | Relocation Read-Only: ELF data made read-only after dynamic linking. |
 | **Rescuer thread** | Per-workqueue `kworker/R-*` thread that guarantees progress under memory pressure. |
 | **sched_ext** | Extensible scheduling class (6.12+) whose policy is a BPF program. |
 | **SMAP / PAN** | x86 / ARM64 feature that blocks kernel access to user pages except via the user-copy routines. |
+| **Spinlock** | Busy-waiting lock that disables preemption while held; for short critical sections that cannot sleep. |
+| **SRCU** | Sleepable RCU: an RCU variant whose readers may sleep. |
 | **strace** | Tool that prints every system call of a process, using `ptrace()`. |
 | **`syscall` instruction** | x86_64 system-call entry instruction; `sysenter`/`int 0x80` are the 32-bit equivalents. |
 | **`System.map`** | Link-time kernel symbol table (address, type, name). |
 | **Taint** | Kernel flag recording conditions (e.g. a proprietary module loaded) that affect debugging and support. |
-| **`task_struct`** | Kernel structure describing every task (thread, process or kernel thread). |
 | **`TASK_SIZE`** | Top of the user-space address range. |
+| **`task_struct`** | Kernel structure describing every task (thread, process or kernel thread). |
 | **TGID** | Thread-group ID: what user space calls the PID; each thread has its own TID. |
 | **`trace_marker`** | tracefs file through which user space writes text events into the ftrace ring buffer. |
 | **tracefs** | Pseudo-filesystem (`/sys/kernel/tracing`) exposing ftrace controls and output. |
 | **Tracepoint** | Static, named trace hook compiled into kernel source; a more stable interface than kprobes. |
 | **UAPI** | User-space API headers (`include/uapi/`), exported to `/usr/include`; a stable ABI. |
 | **uprobe** | Dynamic probe (Linux 3.5+) on an instruction in a user-space binary or library, placed by file + offset; affects every process mapping that file. |
-| **USDT** | User Statically Defined Tracing: static probe markers in user programs, activated via uprobes. |
 | **Upstreaming** | Getting a change merged into mainline so that the community maintains it. |
+| **USDT** | User Statically Defined Tracing: static probe markers in user programs, activated via uprobes. |
 | **User space** | Lower, per-process part of the virtual address space. |
 | **vDSO** | Virtual Dynamic Shared Object: kernel-provided ELF library mapped into every process for syscall-free calls. |
 | **vermagic** | Module string recording the kernel version and key config; must match the running kernel. |
@@ -2037,3 +2281,4 @@ readelf -lW /bin/ls | grep LOAD                    # "Align" column: 0x1000 = 4K
 - Does the course expect us to boot custom kernels via `vng` only, or also install them into `/boot` on the test box?
 - Page size, "AAPL/A12/M1 16k by default": why A12 specifically? Apple used 16K pages on earlier A-series chips too.
 - "Android 15+ 16k page size by default": did the instructor mean 16K is *supported* from Android 15 (and required of apps on Play), or that specific devices ship 16K by default?
+- Synchronisation (§12): raw notes so far are only the heading "Synchronization RCU, RWLocks and Spinlocks". Section 12 is background material; check it against the lecture as notes come in.
