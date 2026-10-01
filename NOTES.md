@@ -1102,6 +1102,38 @@ $ sudo modprobe -r vfat                            ← removes vfat, then the no
 
 Test box: 94 loaded modules, but 219 entries in `/sys/module/`, because of built-ins such as `printk` and `kernel`.
 
+### Kernel sysctls (`/proc/sys/kernel`) and `modules_disabled`
+
+`/proc/sys/` is the **sysctl** interface: each file is a run-time kernel tunable. `/proc/sys/kernel/` holds core-kernel settings (133 entries on the test box). Read them with `cat` or `sysctl kernel.<name>`; writing needs root (`CAP_SYS_ADMIN` for most). Changes are lost on reboot unless put in `/etc/sysctl.d/*.conf`. Reference: [Documentation for /proc/sys/kernel/](https://docs.kernel.org/admin-guide/sysctl/kernel.html) (`Documentation/admin-guide/sysctl/kernel.rst`).
+
+| sysctl (`/proc/sys/kernel/…`) | Purpose |
+| ----------------------------- | ------- |
+| `modules_disabled` | `1` = no more module loading **or** unloading, until reboot (one-way) |
+| `tainted` | Taint bitmask (see above) |
+| `kptr_restrict`, `dmesg_restrict` | Hide kernel pointers / restrict `dmesg` to privileged users |
+| `kexec_load_disabled` | `1` = forbid loading a new kernel with `kexec_load()` (also one-way) |
+| `printk` | Console log levels (current, default, minimum, boot default) |
+| `panic`, `panic_on_oops` | Reboot N s after a panic; turn an oops into a panic |
+| `pid_max`, `threads-max` | Upper limits for PIDs and threads |
+| `sysrq` | Which magic SysRq functions are allowed |
+| `yama/ptrace_scope` | ptrace restriction level (§10) |
+
+**`modules_disabled`:**
+
+- Writing `1` makes `init_module()`, `finit_module()` and `delete_module()` fail with `EPERM`. So `insmod`, `modprobe` (including automatic on-demand loading) and `rmmod` all stop working. *Raw notes said "stops install and removal of kernel mods": correct, both loading and unloading are blocked.*
+- It is **one-way**: writing `0` back is refused. Only a reboot clears it. That is the point: an attacker who later gains root cannot load a rootkit module.
+- Typical use: hardened servers set it at the end of boot, once all needed modules are loaded (e.g. a late `sysctl.d` file or systemd unit). Modules already loaded keep working.
+- Related hardening: Secure Boot **lockdown** (`/sys/kernel/security/lockdown`; test box: `[none] integrity confidentiality`) and module signing (`module.sig_enforce=1`) restrict *which* modules load, rather than stopping all of them.
+
+```bash
+ls /proc/sys/kernel                                # list the core-kernel sysctls
+sysctl kernel.modules_disabled                     # read it (0 = loading allowed; test box: 0)
+echo 1 | sudo tee /proc/sys/kernel/modules_disabled   # disable module load/unload until reboot (irreversible!)
+sudo sysctl -w kernel.modules_disabled=1           # same thing through the sysctl tool
+```
+
+*Raw notes wrote `echo 1 > /proc/sys/kernel/modules_disabled`. That only works in a root shell: `sudo echo 1 > file` fails because the redirection runs as your user, so use `sudo tee` or `sysctl -w`. Do not run it on the test box unless you want to reboot before the next lab.*
+
 ### Commands / debugging
 
 ```sh
@@ -2092,6 +2124,8 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | `insmod m.ko p=42 s=text` / `options m p=42` in `/etc/modprobe.d/` | Set parameters at load / persistently |
 | `module_param(name, type, perm)`; types `int`, `bool`, `charp`, `byte`, … | `perm` 0 = hidden, 0444 = read-only, 0644 = root-writable at runtime |
 | `/proc/sys/kernel/tainted` | Taint flags (0 = clean, `P` = proprietary module) |
+| `/proc/sys/kernel/` = `sysctl kernel.*` | Core-kernel run-time tunables; persist in `/etc/sysctl.d/` |
+| `echo 1 \| sudo tee /proc/sys/kernel/modules_disabled` | Block module load **and** unload until reboot (one-way) |
 | sched_ext (`CONFIG_SCHED_CLASS_EXT`, 6.12+) | Custom scheduling via BPF, not modules |
 
 ### Capabilities (§8)
@@ -2158,7 +2192,7 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | `rcu_barrier()` | In `module_exit`: wait for pending `call_rcu()`/`kfree_rcu()` callbacks |
 | `CONFIG_PROVE_LOCKING`, `CONFIG_DEBUG_ATOMIC_SLEEP`, `perf lock` | Lockdep, sleep-in-atomic checks, contention analysis |
 
-**Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`; never sleep under a spinlock or in an RCU read section; take an IRQ-shared lock with `spin_lock_irqsave()`.
+**Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`; `modules_disabled=1` cannot be undone without a reboot; never sleep under a spinlock or in an RCU read section; take an IRQ-shared lock with `spin_lock_irqsave()`.
 
 ---
 
@@ -2221,6 +2255,7 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | **`mmap()`** | System call that creates a virtual memory mapping (VMA) in a process. |
 | **`.modinfo`** | ELF section of a `.ko` holding `key=value` module metadata. |
 | **Module parameter** | Module variable settable at load time (`name=value`) and exposed in `/sys/module/<mod>/parameters/`. |
+| **`modules_disabled`** | One-way sysctl (`kernel.modules_disabled`) that blocks all module loading and unloading until reboot. |
 | **`Module.symvers`** | Build output listing exported symbols and their CRCs, used by modpost. |
 | **modversions** | Per-symbol CRC checking of a module's imports against the kernel (`CONFIG_MODVERSIONS`). |
 | **Monolithic kernel** | Kernel whose services (syscalls, mm, filesystems, networking, drivers) all run in one privileged address space and call each other directly. |
@@ -2244,6 +2279,7 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | **SRCU** | Sleepable RCU: an RCU variant whose readers may sleep. |
 | **strace** | Tool that prints every system call of a process, using `ptrace()`. |
 | **`syscall` instruction** | x86_64 system-call entry instruction; `sysenter`/`int 0x80` are the 32-bit equivalents. |
+| **sysctl** | Run-time kernel tunable exposed under `/proc/sys/`; set with `sysctl -w` or `/etc/sysctl.d/`. |
 | **`System.map`** | Link-time kernel symbol table (address, type, name). |
 | **Taint** | Kernel flag recording conditions (e.g. a proprietary module loaded) that affect debugging and support. |
 | **`TASK_SIZE`** | Top of the user-space address range. |
