@@ -17,6 +17,7 @@
 - [10. Tracing: ftrace, kprobes, `trace_marker` and ptrace](#10-tracing-ftrace-kprobes-trace_marker-and-ptrace)
 - [11. Pages and Page Size](#11-pages-and-page-size)
 - [12. Synchronisation: Spinlocks, RW Locks and RCU](#12-synchronisation-spinlocks-rw-locks-and-rcu)
+- [13. Device Types: Character, Block and Network](#13-device-types-character-block-and-network)
 - [Labs & Exercises](#labs--exercises)
 - [Quick Reference](#quick-reference)
 - [Glossary](#glossary)
@@ -2188,6 +2189,161 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 
 ---
 
+## 13. Device Types: Character, Block and Network
+
+> **Remember**
+> - Linux follows the Unix convention of **three device classes**: **character**, **block** and **network**.
+> - **Character device:** a stream of bytes, read and written directly through the driver's `file_operations`, with no page cache or block layer in between. Appears in `/dev` with type `c`.
+> - **Block device:** an array of fixed-size blocks with **random access**, used for mass storage. I/O goes through the **page cache** (buffered) and the **block layer** (`blk-mq`). Appears in `/dev` with type `b`.
+> - **Network device:** an interface (`eth0`, `lo`) with **no `/dev` node**. You reach it through the **socket API**, `ioctl()` and **netlink**. It sends and receives packets, not a byte stream or blocks.
+> - `/dev` nodes are identified by **major:minor** numbers: the major picks the driver, the minor picks the device instance.
+
+### Overview
+
+User space reaches hardware through one of three driver interfaces, and the choice decides which kernel subsystem sits between the application and the driver. Character and block devices are files in `/dev` ("everything is a file"). Network devices are the big exception: they live in their own namespace of interface names and are driven by the networking stack.
+
+### Comparison
+
+| | Character | Block | Network |
+| --- | --- | --- | --- |
+| Unit of I/O | Bytes (stream) | Fixed blocks (512 B sectors; 4 KiB typical logical block) | Packets (`struct sk_buff`) |
+| Access | Usually sequential; `lseek` optional | Random access by block number | Send/receive, not seek |
+| Buffering | None in the kernel core: each `read()`/`write()` goes straight to the driver | **Page cache** + block layer (merging, scheduling); `O_DIRECT` bypasses the cache | Socket buffers and qdisc queues |
+| User-space handle | `/dev/<name>` (`c` in `ls -l`) | `/dev/<name>` (`b` in `ls -l`); usually mounted as a filesystem | Interface name; `socket()`, `ioctl(SIOC*)`, netlink |
+| Kernel interface | `struct file_operations` + `struct cdev` / `miscdevice` | `struct gendisk` + `struct blk_mq_ops` | `struct net_device` + `struct net_device_ops` |
+| Test-box examples | `/dev/null` (1:3), `/dev/tty0` (4:0), `/dev/ttyS0`, `/dev/random` | `/dev/sda` (8:0, 100 GiB disk), `/dev/sr0` (11:0) | `lo`, `eth0`, `docker0`, `dummy0` |
+
+### How it works: where each path goes
+
+```text
+ user space:   read("/dev/ttyS0")    read("/mnt/file") / read("/dev/sda")    send(sock, ...)
+                    │                         │                                   │
+                  VFS                       VFS                              socket layer
+                    │                    filesystem (ext4)                 TCP/UDP → IP
+                    │                    page cache  ◄── buffering           │
+                    │                    block layer (bio, blk-mq queues)   qdisc (queueing)
+                    ▼                         ▼                                   ▼
+ driver:     file_operations          blk_mq_ops->queue_rq()          ndo_start_xmit()
+             (.read/.write/.ioctl)    (disk, NVMe, virtio-blk)        (NIC driver)
+```
+
+- **Why block devices are buffered:** typical workloads read and write the same blocks again and again (filesystem metadata, hot files). Caching them in RAM (the page cache) avoids slow device trips, and the block layer can merge and reorder requests. *Raw notes said "repeated access to the same blockers"; correct is "blocks".*
+- **"Character = unbuffered"** is about the kernel core: there is no page cache or block layer. A driver may still keep its own buffers (the tty layer, for example, has a line-discipline buffer).
+- **Network devices** are named, not numbered: there is no major:minor and no `/dev/eth0`. Configuration tools use `ioctl()` on a socket (`ifconfig`: `SIOCGIFADDR` and friends) or, in modern tools, **netlink** (`ip` uses rtnetlink). *Raw notes said "socket API + ioctl"; netlink is the modern addition.*
+
+### Major and minor numbers
+
+- A `/dev` node is just a name plus a type (`c`/`b`) and a `dev_t` = **major:minor**. Opening it makes the VFS look up the driver registered for that number.
+- Since 2.6, majors and minors are 12 and 20 bits (`MAJOR()`, `MINOR()`, `MKDEV()` in `<linux/kdev_t.h>`). New drivers should get a dynamic major (`alloc_chrdev_region()`) or use the misc device class (major 10, dynamic minor).
+- `/dev` is a `devtmpfs` filled in by the kernel; **udev** then adds permissions and symlinks (`/dev/disk/by-uuid/…`).
+- `/proc/devices` lists registered character and block majors. `/sys/class/*`, `/sys/block/*` and `/sys/class/net/*` show the devices in sysfs.
+
+### Key APIs / structures
+
+| API | Header | Purpose | Context |
+| --- | --- | --- | --- |
+| `alloc_chrdev_region()` / `unregister_chrdev_region()` | `<linux/fs.h>` | Reserve / free a range of char device numbers (dynamic major) | Process, may sleep |
+| `cdev_init()` + `cdev_add()` / `cdev_del()` | `<linux/cdev.h>` | Attach `file_operations` to those numbers | Process, may sleep |
+| `class_create(name)` + `device_create()` | `<linux/device.h>` | Create the sysfs entry so udev makes `/dev/<name>`. *Since 6.4, `class_create()` takes no `THIS_MODULE` argument.* | Process, may sleep |
+| `misc_register()` / `misc_deregister()` | `<linux/miscdevice.h>` | One-call simple char device (major 10) | Process, may sleep |
+| `struct file_operations` | `<linux/fs.h>` | `.open`, `.read`, `.write`, `.unlocked_ioctl`, `.release`, … | Called in process context |
+| `blk_mq_alloc_disk()` + `add_disk()` / `del_gendisk()` | `<linux/blk-mq.h>`, `<linux/blkdev.h>` | Create and register a block device (6.x API) | Process, may sleep |
+| `alloc_etherdev()` + `register_netdev()` / `unregister_netdev()` | `<linux/etherdevice.h>`, `<linux/netdevice.h>` | Create and register a network interface | Process, may sleep (takes RTNL) |
+| `ndo_start_xmit()` | `<linux/netdevice.h>` | Driver hook to transmit one `sk_buff` | **Atomic** (softirq / BH disabled): must not sleep |
+
+### Code example: a minimal character device (misc device)
+
+```c
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/module.h>	/* module_init(), module_exit(), MODULE_*() */
+#include <linux/miscdevice.h>	/* struct miscdevice, misc_register(), misc_deregister() */
+#include <linux/fs.h>	/* struct file_operations, simple_read_from_buffer() */
+
+static const char msg[] = "hello from a char device\n";	/* data every read returns */
+
+static ssize_t hello_read(struct file *f, char __user *buf, size_t len, loff_t *pos)	/* called for read() on /dev/hello_chr */
+{	/* start of hello_read() */
+	return simple_read_from_buffer(buf, len, pos, msg, sizeof(msg) - 1);	/* copy msg to user space from *pos; 0 = EOF */
+}	/* end of hello_read() */
+
+static const struct file_operations hello_fops = {	/* the char device's operations table */
+	.owner = THIS_MODULE,	/* pin the module while the file is open */
+	.read = hello_read,	/* our read handler */
+};	/* end of hello_fops */
+
+static struct miscdevice hello_dev = {	/* describes the misc device */
+	.minor = MISC_DYNAMIC_MINOR,	/* let the kernel choose a minor (major is 10) */
+	.name = "hello_chr",	/* udev creates /dev/hello_chr */
+	.fops = &hello_fops,	/* operations to use */
+	.mode = 0444,	/* node permissions: read-only for everyone */
+};	/* end of hello_dev */
+
+static int __init hello_chr_init(void)	/* runs at insmod */
+{	/* start of hello_chr_init() */
+	return misc_register(&hello_dev);	/* register the device; 0 on success, -errno on failure */
+}	/* end of hello_chr_init() */
+
+static void __exit hello_chr_exit(void)	/* runs at rmmod */
+{	/* start of hello_chr_exit() */
+	misc_deregister(&hello_dev);	/* remove the device and its /dev node */
+}	/* end of hello_chr_exit() */
+
+module_init(hello_chr_init);	/* register the entry point */
+module_exit(hello_chr_exit);	/* register the exit point */
+MODULE_LICENSE("GPL");	/* GPL licence */
+MODULE_DESCRIPTION("Minimal misc character device");	/* shown by modinfo */
+```
+
+⚠️ Verify: not yet built on the test box. Test with `cat /dev/hello_chr` after loading (ask before `insmod`).
+
+### Commands / debugging
+
+```bash
+ls -l /dev/null /dev/sda /dev/tty0               # first letter c = char, b = block; "1, 3" = major, minor
+cat /proc/devices                                # registered char and block majors with driver names
+lsblk -o NAME,MAJ:MIN,SIZE,TYPE,MOUNTPOINTS      # block devices and their numbers
+ls /sys/class/net                                # network interfaces (no /dev entries)
+ip -br link                                      # interfaces via netlink (modern)
+stat -c '%t:%T %F' /dev/sda                      # major:minor in hex and the file type
+udevadm info --query=all --name=/dev/sda         # udev's view: sysfs path, properties, symlinks
+cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the disk (e.g. [mq-deadline] none)
+```
+
+### Pitfalls
+
+- **Dereferencing the user pointer** in `.read`/`.write`: always use `copy_to_user()` / `copy_from_user()` (or `simple_read_from_buffer()`), which can fail and can sleep.
+- **Hard-coding a major number:** it may clash with another driver. Use a dynamic major or a misc device.
+- **Wrong unwind order:** create in the order region → cdev → class → device, and destroy in reverse in `module_exit` and on error paths (`goto`).
+- **Forgetting `.owner = THIS_MODULE`:** the module can be unloaded while a file is still open, and the next call jumps into freed code.
+- **Sleeping in `ndo_start_xmit()`:** it runs with bottom halves disabled.
+- **Expecting a write to a block device to be on disk:** it is in the page cache until written back. Use `fsync()` or `O_DIRECT`/`O_SYNC`.
+
+### Revision questions
+
+1. Name the three Unix device classes and how user space reaches each one.
+2. Why does Linux put a page cache in front of block devices but not character devices?
+3. What do the major and minor numbers of `/dev/sda` (8:0) identify?
+4. Why is there no `/dev/eth0`, and what tools and APIs configure network interfaces instead?
+
+<details>
+<summary>Answers</summary>
+
+1. Character (`/dev` node, byte stream through `file_operations`), block (`/dev` node, usually mounted, random-access blocks through the page cache and block layer), network (interface name, no `/dev` node; sockets, `ioctl()` and netlink).
+2. Block devices hold data that is accessed repeatedly and at random (filesystems), so caching blocks in RAM and merging/reordering requests gives big wins. Character devices are often streams (serial ports, terminals, sensors) where data is consumed once and caching makes no sense.
+3. The major (8) selects the driver (the SCSI disk driver `sd`); the minor (0) selects the device or partition within it (`sda` = 0, `sda1` = 1, …, the next disk `sdb` = 16).
+4. Network interfaces carry packets, not a byte stream or blocks, and are handled by the networking stack rather than the VFS, so they get names in their own namespace. They are configured with `ip` (rtnetlink), the older `ifconfig` (socket `ioctl()`s such as `SIOCSIFADDR`), and used through `socket()`.
+
+</details>
+
+### Source pointers
+
+- `fs/char_dev.c` (`alloc_chrdev_region()`, `cdev_add()`), `drivers/char/misc.c`, `drivers/char/mem.c` (`/dev/null`, `/dev/zero`)
+- `block/` (`blk-mq.c`, `genhd.c`), `drivers/block/null_blk/` (example block driver)
+- `net/core/dev.c` (`register_netdev()`, `dev_queue_xmit()`), `drivers/net/dummy.c` (example network driver), `include/linux/netdevice.h`
+- `Documentation/admin-guide/devices.txt` (official major/minor list), `Documentation/block/blk-mq.rst`, `Documentation/networking/netdevices.rst`, `Documentation/driver-api/driver-model/`
+
+---
+
 ## Labs & Exercises
 
 *None yet.*
@@ -2343,6 +2499,17 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | `rcu_barrier()` | In `module_exit`: wait for pending `call_rcu()`/`kfree_rcu()` callbacks |
 | `CONFIG_PROVE_LOCKING`, `CONFIG_DEBUG_ATOMIC_SLEEP`, `perf lock` | Lockdep, sleep-in-atomic checks, contention analysis |
 
+### Devices (§13)
+
+| Item | Meaning |
+| ---- | ------- |
+| `c` / `b` in `ls -l /dev`; `1, 3` | Char / block node; major, minor |
+| `/proc/devices`, `lsblk`, `/sys/class/net` | Registered majors; block devices; network interfaces |
+| `alloc_chrdev_region()` → `cdev_add()` → `class_create()` → `device_create()` | Classic char device setup (undo in reverse) |
+| `misc_register(&miscdev)` | Simplest char device (major 10, dynamic minor) |
+| `blk_mq_alloc_disk()` + `add_disk()` | Block device (6.x) |
+| `alloc_etherdev()` + `register_netdev()`; `ndo_start_xmit()` is atomic | Network device |
+
 **Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`; `modules_disabled=1` cannot be undone without a reboot; never sleep under a spinlock or in an RCU read section; take an IRQ-shared lock with `spin_lock_irqsave()`.
 
 ---
@@ -2353,6 +2520,7 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | ---- | ---------- |
 | **Atomic context** | Code that must not sleep: hardirq, softirq, or with a spinlock held / preemption disabled. |
 | **atrace** | Android tracing tool/API: framework code writes begin/end/counter markers to `trace_marker`; collected with kernel events and viewed in Perfetto. |
+| **Block device** | Random-access device of fixed-size blocks (disks); I/O goes through the page cache and block layer. |
 | **`/boot`** | Directory (often a separate partition) holding kernel images, initramfs, symbol maps and configs. |
 | **Boot image (Android)** | `boot.img` in the raw `boot` partition: `ANDROID!` header, kernel and ramdisk. |
 | **Boot protocol** | Architecture-specific contract for how a bootloader loads the kernel and passes it control and parameters. |
@@ -2365,6 +2533,7 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | **`CAP_SYSLOG`** | Capability needed to see real kernel addresses when `kptr_restrict=1`. |
 | **Capability** | One independent slice of root's privileges (`CAP_*`), checked by the kernel per operation. |
 | **Capability sets** | Per-thread bitmasks: Effective, Permitted, Inheritable, Bounding, Ambient. |
+| **Character device** | Byte-stream device accessed directly through the driver's `file_operations`; `c` in `ls -l /dev`. |
 | **`charp`** | `module_param` type for a string parameter (`char *`); the kernel stores a copy of the value. |
 | **Critical section** | Code accessing shared data that must not run concurrently with other users of that data. |
 | **Cross-memory attach (CMA)** | `process_vm_readv()`/`process_vm_writev()`: single-copy transfer between two processes' address spaces (Linux 3.2+). |
@@ -2402,8 +2571,10 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | **Loadable kernel module (LKM)** | `.ko` object loaded into the running kernel at predefined extension points. |
 | **lockdep** | Kernel lock validator (`CONFIG_PROVE_LOCKING`) that reports lock-order and IRQ-safety bugs before they deadlock. |
 | **Mainline** | Linus Torvalds' upstream kernel tree. |
+| **Major / minor number** | `dev_t` parts of a device node: major selects the driver, minor the device instance. |
 | **Mapped** | A virtual page backed by a page-table entry pointing to a physical frame; access to an unmapped page faults. |
 | **Microkernel** | Kernel that keeps only IPC, scheduling and basic memory management in kernel mode; other services run as user-space servers. |
+| **Misc device** | Simple character device registered with `misc_register()` under major 10. |
 | **`mmap()`** | System call that creates a virtual memory mapping (VMA) in a process. |
 | **`.modinfo`** | ELF section of a `.ko` holding `key=value` module metadata. |
 | **Module parameter** | Module variable settable at load time (`name=value`) and exposed in `/sys/module/<mod>/parameters/`. |
@@ -2411,7 +2582,10 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | **`Module.symvers`** | Build output listing exported symbols and their CRCs, used by modpost. |
 | **modversions** | Per-symbol CRC checking of a module's imports against the kernel (`CONFIG_MODVERSIONS`). |
 | **Monolithic kernel** | Kernel whose services (syscalls, mm, filesystems, networking, drivers) all run in one privileged address space and call each other directly. |
+| **Netlink** | Socket-based kernel ↔ user-space messaging; rtnetlink is how `ip` configures interfaces. |
+| **Network device** | Packet interface (`struct net_device`, e.g. `eth0`) with no `/dev` node; used via sockets, `ioctl()` and netlink. |
 | **Page** | Smallest unit of memory the MMU maps and protects (4 KiB on x86_64; 4/16/64 KiB on ARM64). |
+| **Page cache** | RAM cache of file and block-device data, kept in pages. |
 | **Page fault** | CPU exception on access to an unmapped or protected page, handled by the kernel. |
 | **Page frame / PFN** | A physical page, and its number (`phys >> PAGE_SHIFT`). |
 | **PCB** | Process control block: textbook per-process descriptor (address space, open files, credentials); in Linux, the shared structs a `task_struct` points to. |
@@ -2446,6 +2620,7 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 | **tracefs** | Pseudo-filesystem (`/sys/kernel/tracing`) exposing ftrace controls and output. |
 | **Tracepoint** | Static, named trace hook compiled into kernel source; a more stable interface than kprobes. |
 | **UAPI** | User-space API headers (`include/uapi/`), exported to `/usr/include`; a stable ABI. |
+| **udev** | User-space device manager that sets permissions and symlinks for `/dev` nodes from kernel uevents. |
 | **uprobe** | Dynamic probe (Linux 3.5+) on an instruction in a user-space binary or library, placed by file + offset; affects every process mapping that file. |
 | **Upstreaming** | Getting a change merged into mainline so that the community maintains it. |
 | **USDT** | User Statically Defined Tracing: static probe markers in user programs, activated via uprobes. |
