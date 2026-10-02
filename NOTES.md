@@ -2236,6 +2236,31 @@ User space reaches hardware through one of three driver interfaces, and the choi
   - *Raw notes said "all devices short of mass storage"; network interfaces are the other exception.*
 - **Network devices** are named, not numbered: there is no major:minor and no `/dev/eth0`. Configuration tools use `ioctl()` on a socket (`ifconfig`: `SIOCGIFADDR` and friends) or, in modern tools, **netlink** (`ip` uses rtnetlink). *Raw notes said "socket API + ioctl"; netlink is the modern addition.*
 
+### Flushing buffered block I/O: `sync`
+
+Because block I/O is buffered, a `write()` returns once the data is in the page cache. The page is then a **dirty page**: newer in RAM than on disk. The kernel's flusher threads write it back later (**writeback**). A crash or power cut before writeback loses the data. `sync` forces the writeback now.
+
+> ⚠️ Verify: the raw note is just `sync; sync`. It is most likely the instructor showing how to flush buffered block-device writes. Check the context.
+
+- **`sync` (command) / `sync(2)`:** writes all dirty pages and filesystem metadata, on every filesystem, to disk.
+- **Why `sync; sync`?** It is an old Unix habit. On early Unix, `sync()` only *scheduled* the writes and could return before they finished, so admins typed it two or three times before a shutdown to give the disk time. POSIX still allows that behaviour. **On Linux, `sync()` waits for the I/O to complete** (since 1.3.20), so one `sync` is enough. The second one does no harm.
+- **Narrower variants:** `fsync(fd)` flushes one file's data and metadata. `fdatasync(fd)` flushes the data and only the metadata needed to read it back. `syncfs(fd)` flushes one filesystem. `sync FILE` and `sync -f FILE` are the command-line versions of `fsync` and `syncfs` (coreutils ≥ 8.24).
+- **Drive caches:** filesystems issue a cache-flush request (`REQ_PREFLUSH`/`REQ_FUA`) to the drive. Without it, the data could sit in the drive's own volatile write cache.
+- **Automatic writeback:** a dirty page is written back after about 30 s (`vm.dirty_expire_centisecs` = 3000). Flusher threads wake every 5 s (`vm.dirty_writeback_centisecs` = 500). A writer is throttled when dirty memory passes `vm.dirty_ratio`.
+
+```bash
+grep -E '^(Dirty|Writeback):' /proc/meminfo      # how much data is waiting to reach disk
+sync                                             # flush all dirty data and metadata; returns when it is on disk
+sync -f /home                                    # flush only the filesystem holding /home (syncfs)
+sync /home/alex/file.txt                         # flush just this file (fsync)
+sysctl vm.dirty_expire_centisecs vm.dirty_writeback_centisecs   # show the writeback timers
+sudo blockdev --flushbufs /dev/sda               # flush and drop the device's cached buffers (BLKFLSBUF ioctl)
+sync; echo 3 | sudo tee /proc/sys/vm/drop_caches # flush first, then drop clean page cache, dentries and inodes (benchmarking)
+```
+
+- **Key point:** `drop_caches` drops only *clean* pages. Run `sync` first, or dirty pages stay in the cache.
+- **Emergency:** the magic SysRq `s` key (`echo s > /proc/sysrq-trigger`) does an emergency sync from the kernel, even when user space is hung. The usual sequence before a forced reboot is `s` (sync), `u` (remount read-only), `b` (reboot).
+
 ### Device mapper: virtual block devices
 
 The **device mapper** (`dm`, `drivers/md/dm*.c`) is a kernel framework for creating **virtual block devices layered on top of other block devices**. Each virtual device has a **table** that maps ranges of its sectors to a **target** (a module that decides what to do with them). User space configures it through `/dev/mapper/control` with `ioctl()`s, usually via `dmsetup`, LVM or `cryptsetup`.
@@ -2351,7 +2376,8 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 - **Wrong unwind order:** create in the order region → cdev → class → device, and destroy in reverse in `module_exit` and on error paths (`goto`).
 - **Forgetting `.owner = THIS_MODULE`:** the module can be unloaded while a file is still open, and the next call jumps into freed code.
 - **Sleeping in `ndo_start_xmit()`:** it runs with bottom halves disabled.
-- **Expecting a write to a block device to be on disk:** it is in the page cache until written back. Use `fsync()` or `O_DIRECT`/`O_SYNC`.
+- **Expecting a write to a block device to be on disk:** it is in the page cache until written back. Use `fsync()` or `O_DIRECT`/`O_SYNC`, or run `sync`.
+- **`drop_caches` without `sync`:** dirty pages are not dropped, so the "cold cache" benchmark is not cold.
 
 ### Revision questions
 
@@ -2546,6 +2572,9 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | `blk_mq_alloc_disk()` + `add_disk()` | Block device (6.x) |
 | `dmsetup ls` / `dmsetup table`; `/dev/mapper/` | Device mapper: virtual block devices (LVM, dm-crypt, dm-verity) |
 | `alloc_etherdev()` + `register_netdev()`; `ndo_start_xmit()` is atomic | Network device |
+| `sync` / `fsync()` / `fdatasync()` / `syncfs()` | Flush dirty page cache to disk: all / one file / one file's data / one filesystem. On Linux, `sync` waits, so one is enough. |
+| `grep -E 'Dirty|Writeback' /proc/meminfo` | Data still waiting for writeback |
+| `sync; echo 3 > /proc/sys/vm/drop_caches` | Flush, then drop clean caches (cold-cache benchmarks) |
 
 **Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`; `modules_disabled=1` cannot be undone without a reboot; never sleep under a spinlock or in an RCU read section; take an IRQ-shared lock with `spin_lock_irqsave()`.
 
@@ -2578,6 +2607,7 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **Demand paging** | Allocating or loading a physical page only when a mapped virtual page is first accessed. |
 | **`depmod`** | Tool that generates `modules.dep` (the module dependency list) for `modprobe`. |
 | **Device mapper** | Kernel framework for virtual block devices mapped onto other block devices through targets (LVM, dm-crypt, dm-verity). |
+| **Dirty page** | Page-cache page changed in RAM but not yet written back to disk. |
 | **Distribution kernel** | Kernel built and patched by a distro (Ubuntu, Fedora, …) from a stable/LTS release. |
 | **EFI stub** | Code linked into the kernel image that makes it a PE/COFF EFI application that UEFI can run directly. |
 | **`EXPORT_SYMBOL_GPL`** | Export macro restricting a symbol to GPL-compatible modules. |
@@ -2670,6 +2700,7 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **`vmlinux`** | Uncompressed ELF kernel image with symbols, used for debugging. |
 | **`vmlinuz`** | Compressed bootable kernel image installed in `/boot`. |
 | **vsyscall** | Legacy x86_64 fixed-address page for fast time calls; now emulated. |
+| **Writeback** | Writing dirty pages from the page cache to disk, done by flusher threads or forced by `sync`/`fsync()`. |
 | **Yama** | LSM that restricts `ptrace()` scope (`kernel.yama.ptrace_scope`). |
 | **zstd** | Zstandard compression: good ratio and fast decompression; the common default for kernel, initramfs and modules. |
 
@@ -2689,3 +2720,4 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 - Page size, "AAPL/A12/M1 16k by default": why A12 specifically? Apple used 16K pages on earlier A-series chips too.
 - "Android 15+ 16k page size by default": did the instructor mean 16K is *supported* from Android 15 (and required of apps on Play), or that specific devices ship 16K by default?
 - Synchronisation (§12): raw notes so far are only the heading "Synchronization RCU, RWLocks and Spinlocks". Section 12 is background material; check it against the lecture as notes come in.
+- Devices (§13): raw notes had only "sync; sync". Was this about flushing buffered block-device writes, or something else? (One `sync` is enough on Linux.)
