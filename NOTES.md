@@ -18,6 +18,7 @@
 - [11. Pages and Page Size](#11-pages-and-page-size)
 - [12. Synchronisation: Spinlocks, RW Locks and RCU](#12-synchronisation-spinlocks-rw-locks-and-rcu)
 - [13. Device Types: Character, Block and Network](#13-device-types-character-block-and-network)
+- [14. The OOM Killer: `oom_score`, `oom_score_adj` and `oom_adj`](#14-the-oom-killer-oom_score-oom_score_adj-and-oom_adj)
 - [Labs & Exercises](#labs--exercises)
 - [Quick Reference](#quick-reference)
 - [Glossary](#glossary)
@@ -2601,6 +2602,137 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 
 ---
 
+## 14. The OOM Killer: `oom_score`, `oom_score_adj` and `oom_adj`
+
+> **Remember**
+>
+> - When the kernel cannot reclaim enough memory for an allocation, the **OOM killer** (`mm/oom_kill.c`) picks one process and sends it `SIGKILL`.
+> - Victim = highest **badness**: RSS + swap entries + page-table pages, shifted by **`oom_score_adj`**.
+> - `/proc/<pid>/oom_score` (read-only) shows the badness. `/proc/<pid>/oom_score_adj` (−1000…+1000) is the knob. `oom_adj` (−17…+15) is the **deprecated** old knob.
+> - `oom_score_adj = -1000` means "never kill". PID 1 and kernel threads are never chosen.
+
+### Overview
+
+Linux **overcommits** memory: `mmap()`/`malloc()` succeed because pages are only allocated on first touch (§3, demand paging). If many processes then touch their memory and reclaim (dropping page cache, writeback, swap, compaction) fails, the page allocator calls `out_of_memory()`. Rather than let the whole system deadlock, the kernel sacrifices one process.
+
+### How it works
+
+```text
+alloc_pages() ──fails after reclaim/compaction retries──► __alloc_pages_may_oom()
+                                                              │
+                                                              ▼
+                                                      out_of_memory()          mm/oom_kill.c
+                                                              │  vm.panic_on_oom=1 → panic instead
+                                                              │  vm.oom_kill_allocating_task=1 → kill caller
+                                                              ▼
+                                                      select_bad_process()
+                                                      for each process: oom_badness()
+                                                              │ highest score wins
+                                                              ▼
+                                                      oom_kill_process()
+                                                      ├─ dump_header(): "invoked oom-killer", meminfo, task list (vm.oom_dump_tasks)
+                                                      ├─ SIGKILL victim (+ other processes sharing its mm)
+                                                      └─ wake oom_reaper kthread: unmaps victim's anonymous memory
+                                                         at once, without waiting for it to exit
+```
+
+`oom_badness()` in 6.12 (simplified):
+
+```text
+if PID 1 or kernel thread or oom_score_adj == -1000 or in vfork:  not eligible
+points  = rss_pages + swap_entries + page_table_pages      // memory the kill would free
+points += oom_score_adj * (totalpages / 1000)              // adj in thousandths of RAM+swap
+```
+
+So `oom_score_adj` is "± this many thousandths of total memory". For example, +500 makes a process look as if it used an extra 50% of RAM+swap.
+
+### The three `/proc/<pid>/` files
+
+| File | Range | R/W | Meaning |
+| ---- | ----- | --- | ------- |
+| `oom_score` | 0 … 2000 (see below) | Read-only | Current badness, scaled. Higher = killed first. 0 = not eligible. |
+| `oom_score_adj` | −1000 … +1000 | R/W | Bias added to badness. −1000 = never kill (`OOM_SCORE_ADJ_MIN`), +1000 = always first. |
+| `oom_adj` | −17 … +15 | R/W, **deprecated** | Legacy (pre-2.6.36) interface, kept for compatibility. −17 = `OOM_DISABLE`. Scaled to/from `oom_score_adj` (`adj × 1000 / 17`). Writing it logs a one-time "is deprecated" warning. |
+
+- **`oom_score` scaling:** `fs/proc/base.c` shows `(1000 + badness × 1000 / totalpages) × 2 / 3`. So a process using no memory with `oom_score_adj = 0` reads **666**, not 0. Checked: `cat /proc/self/oom_score` → `666` on the 6.8 test box and the 6.12 Pi. Many docs (and `proc.rst` in older kernels) still say 0–1000.
+- `oom_score_adj` is per **process** (`task->signal`), shared by all threads and **inherited across `fork()`**.
+- **Raising** it (less important) is always allowed for your own processes. **Lowering** it below the last value set by a privileged writer needs **`CAP_SYS_RESOURCE`**.
+- `systemd` sets it from the unit option `OOMScoreAdjust=`. `sshd` sets −1000 for its listener so you can still log in.
+
+### cgroups v2
+
+With a memory limit (`memory.max`), the OOM killer runs **inside the cgroup** and picks a victim among its tasks only. Victim selection works the same way, but `totalpages` becomes the cgroup's limit.
+
+- `memory.oom.group = 1`: kill the **whole cgroup** together (e.g. all processes of a container) rather than one task.
+- `memory.events`: `oom` / `oom_kill` counters.
+- User-space killers (`systemd-oomd`, `earlyoom`, Android `lmkd`) act **earlier** on pressure (PSI, `/proc/pressure/memory`) to avoid the kernel OOM path, which only runs when things are already very bad.
+
+### Commands / debugging
+
+```sh
+cat /proc/$$/oom_score                          # badness of this shell (666 = ~no memory, adj 0)
+cat /proc/$$/oom_score_adj                      # current bias (default 0)
+echo 500 > /proc/$$/oom_score_adj               # make this shell a preferred victim (no root needed)
+choom -p $$                                     # util-linux: show score and adj for a PID
+choom -n -1000 -- ./critical_daemon             # start a program that is never OOM-killed (needs CAP_SYS_RESOURCE)
+for p in /proc/[0-9]*; do                       # loop over every process
+  printf '%s %s %s\n' "$(cat $p/oom_score 2>/dev/null)" "${p#/proc/}" "$(cat $p/comm 2>/dev/null)"  # score, PID, name
+done | sort -rn | head                          # top 10 OOM candidates
+sysctl vm.overcommit_memory vm.panic_on_oom vm.oom_kill_allocating_task vm.oom_dump_tasks  # OOM policy knobs
+dmesg | grep -iE 'out of memory|oom-kill|killed process'   # find past OOM kills and their victims
+journalctl -k -g 'oom'                          # same, from the persistent kernel log
+echo f > /proc/sysrq-trigger                    # (root) trigger the OOM killer manually: test only!
+```
+
+Sysctls (`/proc/sys/vm/`):
+
+| Sysctl | Default | Effect |
+| ------ | ------- | ------ |
+| `overcommit_memory` | 0 | 0 = heuristic overcommit; 1 = always allow; 2 = strict (commit limit = swap + `overcommit_ratio`% of RAM; allocations fail with `ENOMEM` instead of OOM later) |
+| `panic_on_oom` | 0 | 1 = panic instead of killing (e.g. clusters that fail over); 2 = panic even for cgroup OOM |
+| `oom_kill_allocating_task` | 0 | 1 = kill the task that triggered the OOM, without scanning (faster on huge systems) |
+| `oom_dump_tasks` | 1 | Print the task table (pid, rss, pgtables, swapents, `oom_score_adj`) on each kill |
+
+### Pitfalls
+
+- Setting `oom_score_adj = -1000` on a memory-hungry process: when it leaks, the kernel kills everything else instead.
+- Relying on `malloc()` returning `NULL`: with overcommit it succeeds, and the process is killed later on first touch.
+- Using `oom_adj` in new scripts: use `oom_score_adj` (finer, −1000…1000).
+- Kernel code: a large `GFP_KERNEL` allocation in a driver can trigger the OOM killer. Use `__GFP_NORETRY` / `__GFP_RETRY_MAYFAIL` to fail instead, and always handle `NULL`. `GFP_ATOMIC` allocations never invoke the OOM killer: they simply fail.
+- Reading `oom_score` as a percentage: since 6.x it is scaled to 0–2000 × ⅔. Compare scores only with each other.
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| `oom_adj` listed alongside the others | It still exists but is **deprecated** (since 2.6.36). Use `oom_score_adj`. |
+
+### Revision questions
+
+1. Which three quantities make up a process's OOM badness, and how does `oom_score_adj` modify it?
+2. An idle `sleep` process shows `oom_score` 666. Why not 0?
+3. How do you make a critical daemon immune to the OOM killer, and what privilege is needed? What is the risk?
+4. With `vm.overcommit_memory = 2`, what happens instead of an OOM kill?
+
+<details>
+<summary>Answers</summary>
+
+1. RSS + swap entries + page-table pages (memory a kill would free). `oom_score_adj × totalpages / 1000` is added, so each unit is 1/1000 of RAM+swap. −1000 excludes the task.
+2. `/proc/<pid>/oom_score` reports `(1000 + badness × 1000 / totalpages) × 2 / 3`. With badness ≈ 0 that is 1000 × 2/3 = 666. Only ineligible tasks (adj −1000, PID 1, kthreads) show 0.
+3. Write −1000 to `/proc/<pid>/oom_score_adj` (or `OOMScoreAdjust=-1000`, `choom -n -1000`). Lowering it needs `CAP_SYS_RESOURCE`. Risk: if that daemon leaks, every other process is killed first.
+4. Strict accounting: allocations beyond the commit limit fail immediately with `ENOMEM` (`mmap`/`brk`/`fork`), so the program can handle the error itself.
+
+</details>
+
+### Source pointers
+
+- `mm/oom_kill.c` (`out_of_memory()`, `select_bad_process()`, `oom_badness()`, `oom_kill_process()`, `oom_reaper()`), `mm/page_alloc.c` (`__alloc_pages_may_oom()`)
+- `fs/proc/base.c` (`proc_oom_score()`, `oom_adj_write()`, `oom_score_adj_write()`), `include/uapi/linux/oom.h` (`OOM_SCORE_ADJ_MIN/MAX`, `OOM_DISABLE`)
+- `mm/memcontrol.c` (cgroup OOM), `Documentation/admin-guide/cgroup-v2.rst` (`memory.oom.group`)
+- `Documentation/filesystems/proc.rst` (`oom_score_adj`), `Documentation/admin-guide/sysctl/vm.rst`, `Documentation/mm/overcommit-accounting.rst`
+
+---
+
 ## Labs & Exercises
 
 *None yet.*
@@ -2776,7 +2908,20 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | `grep -E 'Dirty|Writeback' /proc/meminfo` | Data still waiting for writeback |
 | `sync; echo 3 > /proc/sys/vm/drop_caches` | Flush, then drop clean caches (cold-cache benchmarks) |
 
-**Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`; `modules_disabled=1` cannot be undone without a reboot; never sleep under a spinlock or in an RCU read section; take an IRQ-shared lock with `spin_lock_irqsave()`.
+### OOM killer (§14)
+
+| Item | Meaning |
+| ---- | ------- |
+| `/proc/<pid>/oom_score` | Read-only badness; 6.x scale `(1000 + badness·1000/total)·2/3`, idle ≈ 666, 0 = not eligible |
+| `/proc/<pid>/oom_score_adj` | −1000 (never kill) … +1000 (kill first); lowering needs `CAP_SYS_RESOURCE`; inherited on `fork()` |
+| `/proc/<pid>/oom_adj` | **Deprecated** −17 (`OOM_DISABLE`) … +15; mapped to `oom_score_adj` |
+| Badness | RSS + swap entries + page-table pages + `adj × total/1000`; PID 1 and kthreads exempt |
+| `vm.overcommit_memory` / `vm.panic_on_oom` | 0/1/2 overcommit policy; panic instead of kill |
+| `choom`, `OOMScoreAdjust=` | Set the adj from the shell / a systemd unit |
+| `dmesg \| grep -i oom` | Find "Out of memory: Killed process ..." |
+| `memory.oom.group` (cgroup v2) | Kill the whole cgroup together |
+
+**Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`; `modules_disabled=1` cannot be undone without a reboot; never sleep under a spinlock or in an RCU read section; `oom_score_adj = -1000` on a leaky process makes the kernel kill everything else; take an IRQ-shared lock with `spin_lock_irqsave()`.
 
 ---
 
@@ -2856,6 +3001,10 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **Monolithic kernel** | Kernel whose services (syscalls, mm, filesystems, networking, drivers) all run in one privileged address space and call each other directly. |
 | **Netlink** | Socket-based kernel ↔ user-space messaging; rtnetlink is how `ip` configures interfaces. |
 | **Network device** | Packet interface (`struct net_device`, e.g. `eth0`) with no `/dev` node; used via sockets, `ioctl()` and netlink. |
+| **OOM killer** | Kernel mechanism (`mm/oom_kill.c`) that `SIGKILL`s the highest-badness process when memory cannot be reclaimed. |
+| **OOM reaper** | `oom_reaper` kernel thread that frees an OOM victim's anonymous memory without waiting for it to exit. |
+| **`oom_score_adj`** | Per-process OOM bias, −1000 (never kill) to +1000, in `/proc/<pid>/`; replaces the deprecated `oom_adj`. |
+| **Overcommit** | Granting more virtual memory than RAM+swap, relying on demand paging; policy in `vm.overcommit_memory`. |
 | **Page** | Smallest unit of memory the MMU maps and protects (4 KiB on x86_64; 4/16/64 KiB on ARM64). |
 | **Page cache** | RAM cache of file and block-device data, kept in pages. |
 | **Page fault** | CPU exception on access to an unmapped or protected page, handled by the kernel. |
