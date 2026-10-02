@@ -2010,6 +2010,12 @@ A **page** is the smallest unit of memory the **MMU** maps: every virtual-to-phy
 - **Page** (virtual) vs **page frame** (the physical page it maps to). A **PFN** (page frame number) is `phys_addr >> PAGE_SHIFT`.
 - `PAGE_SIZE` = 4096 by default; `PAGE_SHIFT` = log2(`PAGE_SIZE`) = 12. `PAGE_SIZE` is defined as `1UL << PAGE_SHIFT`, so the shift is the fundamental constant.
 - An address splits into **page number** (upper bits) and **offset in page** (low `PAGE_SHIFT` bits). `PAGE_MASK` = `~(PAGE_SIZE - 1)` clears the offset.
+- **Page sizes are always powers of two** (4K = 2^12, 16K = 2^14, 64K = 2^16, 2M = 2^21, 1G = 2^30). This is what lets the MMU split an address into page number and offset by **taking bit fields**, with no division:
+  - page number = `addr >> PAGE_SHIFT`, offset = `addr & ~PAGE_MASK`, page start = `addr & PAGE_MASK`;
+  - aligning is a mask: `PAGE_ALIGN(x)` = `(x + PAGE_SIZE - 1) & PAGE_MASK`;
+  - pages are **naturally aligned** (a 2 MiB huge page starts on a 2 MiB boundary), so the low `PAGE_SHIFT` bits of every page's address are 0. The hardware reuses those bits in page-table entries for flags (present, R/W, user, dirty, accessed, NX...).
+  - Huge-page sizes are powers of two because they are one whole page-table level: 4K × 512 = 2M, 2M × 512 = 1G.
+  - The buddy allocator works in power-of-two blocks too: **order** *n* = 2^*n* contiguous pages (`alloc_pages(gfp, order)`).
 - Memory is still **byte-addressable**; the page is the granularity of *mapping and protection*, not of addressing. *Raw notes said "minimal unit that can be addressed"; more precisely it is the minimal unit the MMU can map.*
 - The kernel keeps one `struct page` (64 bytes) per physical page frame: about 1.6% of RAM with 4 KiB pages, less with larger pages.
 - **Huge pages** map a larger block at a higher page-table level (x86_64: 2 MiB and 1 GiB) via hugetlbfs or **THP** (Transparent Huge Pages).
@@ -2146,6 +2152,7 @@ readelf -lW /bin/ls | grep LOAD                    # "Align" column: 0x1000 = 4K
 2. Why can a 16K-page ARM64 kernel cover a 47-bit address space with only 3 page-table levels, whereas x86_64 needs 4 levels for 48 bits?
 3. Give two benefits and two costs of moving from 4 KiB to 16 KiB pages.
 4. Where is the ARM64 translation granule configured in hardware, and how does Linux choose it?
+5. Why must page sizes be powers of two? Give two things in the kernel or MMU that depend on it.
 
 <details>
 <summary>Answers</summary>
@@ -2154,6 +2161,7 @@ readelf -lW /bin/ls | grep LOAD                    # "Align" column: 0x1000 = 4K
 2. A 16 KiB table holds 2048 8-byte entries (11 bits per level), and the offset is 14 bits: 14 + 3×11 = 47. With 4 KiB pages each level gives 9 bits and the offset 12: 12 + 4×9 = 48.
 3. Benefits: greater TLB reach (fewer misses), fewer/shallower page tables, fewer page faults. Costs: internal fragmentation and higher memory use; software/ELF files assuming 4 KiB break.
 4. `TCR_EL1.TG0` (user half) and `TG1` (kernel half); supported granules appear in `ID_AA64MMFR0_EL1`. Linux picks one at build time with `CONFIG_ARM64_{4K,16K,64K}_PAGES`.
+5. With a power-of-two size, the page number and offset are just bit fields of the address. The MMU splits an address with wiring/shifts, and the kernel uses `>> PAGE_SHIFT` and `& PAGE_MASK` instead of division. Also: natural alignment leaves the low bits of each page address as zero, so PTEs store flags there. Huge pages are exactly one table level (512×). The buddy allocator's orders are 2^n pages.
 
 </details>
 
@@ -2874,7 +2882,7 @@ Sysctls (`/proc/sys/vm/`):
 
 | Item | Meaning |
 | ---- | ------- |
-| `PAGE_SIZE` / `PAGE_SHIFT` / `PAGE_MASK` | 4096 / 12 / `~0xfff` on x86_64; `PAGE_SIZE = 1UL << PAGE_SHIFT` |
+| `PAGE_SIZE` / `PAGE_SHIFT` / `PAGE_MASK` | 4096 / 12 / `~0xfff` on x86_64; `PAGE_SIZE = 1UL << PAGE_SHIFT`; page sizes are always powers of two (split address by shift/mask) |
 | `getconf PAGESIZE` / `sysconf(_SC_PAGESIZE)` | Page size at run time (never hard-code 4096) |
 | x86_64 page sizes | 4 KiB base; 2 MiB / 1 GiB huge |
 | ARM64 granule | `TCR_EL1.TG0/TG1`; 4K/16K/64K chosen by `CONFIG_ARM64_*_PAGES` at build |
