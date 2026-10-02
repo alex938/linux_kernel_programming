@@ -460,6 +460,52 @@ $ grep libc /proc/$$/maps
 
 One shared library → **one mapping per segment**: headers (`r--`), code `.text` (`r-x`), read-only data (`r--`), **RELRO** (`r--`, made read-only after linking), writable data `.data`/`.bss` (`rw-`). The code pages are **shared** physically by every process that uses libc. Only written pages get private copies.
 
+### `/proc/<pid>/maps` vs `/proc/<pid>/smaps`
+
+Both list the same VMAs, one per mapping, in the same order. `maps` gives one line per VMA: **where** things are mapped. `smaps` adds a block of counters under each line: **how much physical memory** each VMA actually uses.
+
+| | `maps` | `smaps` |
+| - | ------ | ------- |
+| Content | Range, perms, offset, dev, inode, path | Same header line + ~25 `Key: value kB` fields + `VmFlags` |
+| Answers | "What is mapped where?" | "How much RAM/swap does each mapping use, and is it shared?" |
+| Cost | Cheap | **Expensive**: walks the page tables of every VMA (`mmap_lock` held for read) |
+| Summary form | n/a | `/proc/<pid>/smaps_rollup`: all VMAs summed into one block (since 4.14) |
+
+Example `smaps` entry (libc code segment, values illustrative):
+
+```text
+7de3a0c28000-7de3a0db1000 r-xp 00028000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
+Size:               1572 kB    # virtual size of the VMA (end - start)
+KernelPageSize:        4 kB    # page size the kernel uses for this VMA
+MMUPageSize:           4 kB    # page size the MMU uses (differs only on some arches)
+Rss:                1024 kB    # resident: pages of this VMA currently in RAM
+Pss:                  52 kB    # proportional: each shared page divided by number of sharers
+Shared_Clean:       1024 kB    # resident, mapped by >1 process, not modified
+Shared_Dirty:          0 kB    # resident, mapped by >1 process, modified
+Private_Clean:         0 kB    # resident, only this process, not modified
+Private_Dirty:         0 kB    # resident, only this process, modified (true private cost)
+Referenced:         1024 kB    # pages recently accessed (accessed bit set)
+Anonymous:             0 kB    # pages not backed by a file (heap, stack, CoW copies)
+Swap:                  0 kB    # pages of this VMA currently swapped out
+Locked:                0 kB    # pages pinned in RAM by mlock()
+THPeligible:           0       # 1 if transparent huge pages could back this VMA
+VmFlags: rd ex mr mw me sd     # VMA flags: read, exec, may-read, may-write, may-exec, soft-dirty
+```
+
+Key memory metrics:
+
+| Metric | Definition | Use |
+| ------ | ---------- | --- |
+| **VSZ** / `Size` | Virtual size: everything mapped, touched or not | Almost meaningless for RAM use (demand paging) |
+| **RSS** / `Rss` | Resident pages, **shared pages counted in full** for every process | Summing RSS over processes **over-counts** shared libs |
+| **PSS** / `Pss` | Resident pages, each shared page divided by its number of mappers | Summing PSS over all processes ≈ real RAM used |
+| **USS** | `Private_Clean + Private_Dirty` | RAM freed if this process exits |
+
+- `Rss = Shared_Clean + Shared_Dirty + Private_Clean + Private_Dirty`.
+- "Shared" means *currently mapped by more than one process*, not "a `MAP_SHARED` mapping". A `MAP_SHARED` page only this process maps counts as `Private_*`.
+- Clean pages can be dropped and re-read from the file under memory pressure. Dirty anonymous pages can only go to swap.
+- `VmFlags` exposes `vm_area_struct->vm_flags` (e.g. `ht` = hugetlb, `lo` = locked, `dd` = don't dump, `sd` = soft-dirty).
+
 ### Where the kernel's own memory shows up
 
 `maps` shows only user mappings. Kernel memory usage is in **`/proc/meminfo`**:
@@ -486,6 +532,10 @@ One shared library → **one mapping per segment**: headers (`r--`), code `.text
 
 ```sh
 cat /proc/$$/maps                       # layout of the current shell ($$ = shell's PID)
+cat /proc/$$/smaps                      # same VMAs, plus per-VMA Rss/Pss/Swap/flags counters
+cat /proc/$$/smaps_rollup               # all VMAs summed: total Rss/Pss/Swap for the process
+awk '/^Pss:/ {s += $2} END {print s " kB"}' /proc/$$/smaps   # add up PSS by hand (same as rollup)
+pmap -X $$                              # smaps as a table (procps); pmap -x = Rss/Dirty only
 grep -m1 'address sizes' /proc/cpuinfo  # physical/virtual address bits the CPU supports
 grep -o la57 /proc/cpuinfo | head -1    # prints la57 if the CPU supports 5-level paging (x86)
 grep -E 'X86_5LEVEL|ARM64_VA_BITS|PGTABLE_LEVELS' /boot/config-$(uname -r)   # paging config
@@ -514,6 +564,7 @@ sysctl vm.mmap_min_addr                 # lowest address user space may map (655
 2. Why can't a driver `memcpy()` from a pointer passed in an `ioctl()` argument?
 3. The test box has `CONFIG_X86_5LEVEL=y`. Why is its user space still 47 bits?
 4. A program `mmap()`s 1 GiB and `MemFree` barely changes. Why?
+5. Ten processes each show 10 MiB RSS, mostly libc. Is 100 MiB of RAM in use? Which `smaps` field gives a fair total?
 
 <details>
 <summary>Answers</summary>
@@ -522,6 +573,7 @@ sysctl vm.mmap_min_addr                 # lowest address user space may map (655
 2. It is a user virtual address. It may be unmapped, paged out or malicious (pointing into the kernel), and SMAP/PAN block direct access. `copy_from_user()` validates the range and handles faults.
 3. The CPU also needs `la57`. Without it the kernel falls back to 4-level paging at boot. Even with it, addresses above 47 bits are only handed out when requested via an `mmap()` hint.
 4. `mmap()` only creates a VMA. Pages are allocated on first touch (demand paging).
+5. No. RSS counts every shared page in full in every process, so libc's pages are counted ten times. `Pss` divides each shared page among its mappers, so summing `Pss` (e.g. from `smaps_rollup`) across processes approximates the real total.
 
 </details>
 
@@ -2446,6 +2498,8 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | x86_64 user / kernel (4-level) | `0x0`–`0x7fff_ffff_ffff` / from `0xffff_8000_0000_0000` |
 | `copy_{from,to}_user()` | Only safe way to touch user memory; may sleep |
 | `/proc/<pid>/maps` | range, perms (`p`/`s`), offset, dev, inode, path |
+| `/proc/<pid>/smaps` / `smaps_rollup` | Per-VMA (or summed) `Rss`, `Pss`, `Shared_*`/`Private_*`, `Swap`, `VmFlags`; slow (walks page tables) |
+| RSS vs PSS vs USS | RSS counts shared pages fully; PSS splits them by sharers; USS = private only |
 | `/proc/meminfo` | Kernel usage: `Slab`, `KernelStack`, `PageTables`, `VmallocUsed` |
 | `vm.mmap_min_addr` | Lowest mappable address (65536): NULL deref always faults |
 | `[vdso]` / `[vvar]` | Kernel-supplied library + data page: syscall-free `clock_gettime` |
@@ -2596,9 +2650,9 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **BTF** | BPF Type Format: compact kernel type information (`/sys/kernel/btf/vmlinux`) that lets bpftrace/BPF use kernel structs without headers. |
 | **bzImage** | x86 "big zImage" format: setup code plus a self-decompressing compressed kernel. |
 | **Canonical address** | 64-bit address whose unused top bits all equal the highest implemented bit; any other address faults. |
-| **`CAP_SYSLOG`** | Capability needed to see real kernel addresses when `kptr_restrict=1`. |
 | **Capability** | One independent slice of root's privileges (`CAP_*`), checked by the kernel per operation. |
 | **Capability sets** | Per-thread bitmasks: Effective, Permitted, Inheritable, Bounding, Ambient. |
+| **`CAP_SYSLOG`** | Capability needed to see real kernel addresses when `kptr_restrict=1`. |
 | **Character device** | Byte-stream device accessed directly through the driver's `file_operations`; `c` in `ls -l /dev`. |
 | **`charp`** | `module_param` type for a string parameter (`char *`); the kernel stores a copy of the value. |
 | **Critical section** | Code accessing shared data that must not run concurrently with other users of that data. |
@@ -2661,6 +2715,7 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **PE32+** | 64-bit Portable Executable format used by UEFI applications (and Windows). |
 | **`PREEMPT_RT`** | Real-time preemption model (mainline since 6.12): spinlocks become sleeping rt_mutex locks, IRQs are threaded. |
 | **`/proc/kallsyms`** | Live kernel (and module) symbol table with runtime addresses. |
+| **PSS** | Proportional set size: resident pages with each shared page divided by its number of mappers; sums correctly across processes. |
 | **`ptrace()`** | System call letting a tracer process stop, inspect and modify a tracee; the basis of gdb and strace. |
 | **qspinlock** | Queued (MCS-based) spinlock implementation used on x86 and ARM64: FIFO, each waiter spins locally. |
 | **Quiescent state** | Point where a CPU cannot be inside an RCU read-side section (context switch, idle, user mode). |
@@ -2669,8 +2724,10 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **Reader-writer lock** | `rwlock_t`: spinning lock allowing many readers or one writer. |
 | **RELRO** | Relocation Read-Only: ELF data made read-only after dynamic linking. |
 | **Rescuer thread** | Per-workqueue `kworker/R-*` thread that guarantees progress under memory pressure. |
+| **RSS** | Resident set size: pages of a process currently in RAM, with shared pages counted in full. |
 | **sched_ext** | Extensible scheduling class (6.12+) whose policy is a BPF program. |
 | **SMAP / PAN** | x86 / ARM64 feature that blocks kernel access to user pages except via the user-copy routines. |
+| **`smaps`** | `/proc/<pid>/smaps`: per-VMA memory accounting (`Rss`, `Pss`, `Swap`, `VmFlags`); `smaps_rollup` sums it. |
 | **Spinlock** | Busy-waiting lock that disables preemption while held; for short critical sections that cannot sleep. |
 | **SRCU** | Sleepable RCU: an RCU variant whose readers may sleep. |
 | **strace** | Tool that prints every system call of a process, using `ptrace()`. |
@@ -2679,14 +2736,14 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **`System.map`** | Link-time kernel symbol table (address, type, name). |
 | **Taint** | Kernel flag recording conditions (e.g. a proprietary module loaded) that affect debugging and support. |
 | **Task list** | Circular doubly-linked list of all processes through `task->tasks`, headed by `init_task`; walked with `for_each_process()`. |
+| **`tasklist_lock`** | Global rwlock protecting the task lists; readers usually use RCU instead. |
 | **`TASK_SIZE`** | Top of the user-space address range. |
 | **`task_struct`** | Kernel structure describing every task (thread, process or kernel thread). |
-| **`tasklist_lock`** | Global rwlock protecting the task lists; readers usually use RCU instead. |
 | **TCB** | Thread control block: textbook per-thread descriptor (state, registers, scheduling); in Linux, part of `task_struct`. |
 | **TGID** | Thread-group ID: what user space calls the PID; each thread has its own TID. |
 | **TID** | Thread ID: the kernel's `task->pid`; returned by `gettid()`. |
-| **`trace_marker`** | tracefs file through which user space writes text events into the ftrace ring buffer. |
 | **tracefs** | Pseudo-filesystem (`/sys/kernel/tracing`) exposing ftrace controls and output. |
+| **`trace_marker`** | tracefs file through which user space writes text events into the ftrace ring buffer. |
 | **Tracepoint** | Static, named trace hook compiled into kernel source; a more stable interface than kprobes. |
 | **UAPI** | User-space API headers (`include/uapi/`), exported to `/usr/include`; a stable ABI. |
 | **udev** | User-space device manager that sets permissions and symlinks for `/dev` nodes from kernel uevents. |
@@ -2694,12 +2751,14 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **Upstreaming** | Getting a change merged into mainline so that the community maintains it. |
 | **USDT** | User Statically Defined Tracing: static probe markers in user programs, activated via uprobes. |
 | **User space** | Lower, per-process part of the virtual address space. |
+| **USS** | Unique set size: `Private_Clean + Private_Dirty`; the RAM freed if the process exits. |
 | **vDSO** | Virtual Dynamic Shared Object: kernel-provided ELF library mapped into every process for syscall-free calls. |
 | **vermagic** | Module string recording the kernel version and key config; must match the running kernel. |
 | **VMA** | `struct vm_area_struct`: one contiguous virtual memory region of a process. |
 | **`vmlinux`** | Uncompressed ELF kernel image with symbols, used for debugging. |
 | **`vmlinuz`** | Compressed bootable kernel image installed in `/boot`. |
 | **vsyscall** | Legacy x86_64 fixed-address page for fast time calls; now emulated. |
+| **VSZ** | Virtual set size: total size of all a process's VMAs, whether or not any pages are resident. |
 | **Writeback** | Writing dirty pages from the page cache to disk, done by flusher threads or forced by `sync`/`fsync()`. |
 | **Yama** | LSM that restricts `ptrace()` scope (`kernel.yama.ptrace_scope`). |
 | **zstd** | Zstandard compression: good ratio and fast decompression; the common default for kernel, initramfs and modules. |
