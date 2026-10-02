@@ -574,6 +574,69 @@ static void dump_vmas(void)                   /* print every VMA of the calling 
 
 For another task's `mm`, take a reference first with `get_task_mm()` and drop it with `mmput()`.
 
+### Maple trees
+
+The **maple tree** (`lib/maple_tree.c`, by Liam Howlett and Matthew Wilcox, merged in **6.1**) is an RCU-safe B-tree that stores **non-overlapping ranges** (`[first, last] → pointer`). Its first user is the VMA tree (`mm->mm_mt`).
+
+**Why it replaced the old scheme.** Before 6.1, each `mm` kept three structures in sync:
+
+| Before 6.1 | Problem | Since 6.1 |
+| ---------- | ------- | --------- |
+| Red-black tree `mm->mm_rb` (lookup) | Binary tree: deep, poor cache locality; not RCU-safe, so every fault needed `mmap_lock` | One **maple tree** `mm->mm_mt` does lookup **and** ordered iteration |
+| Linked list `vm_next`/`vm_prev` (iteration) | Extra pointers to keep consistent on every split/merge | Removed |
+| Per-thread `vmacache` (recent-lookup cache) | Invalidation complexity | Removed (tree is fast enough) |
+
+How it works:
+
+```text
+                    ┌──────────── node (256 B = 4 cache lines) ────────────┐
+                    │ pivot0 │ pivot1 │ pivot2 │ ... │ up to 16 slots       │
+                    └───┬────────┬────────┬────────────────────────────────┘
+                        ▼        ▼        ▼
+        [0, pivot0]  (pivot0, pivot1]  (pivot1, pivot2] ...   ranges, not single keys
+           leaf: slot = VMA pointer, or NULL for an unmapped gap
+```
+
+- **Wide, shallow B-tree:** up to 16 slots per node (10 in "allocation" nodes, which also record the biggest free gap below them). A few levels cover thousands of VMAs.
+- **Range keyed:** each slot covers an address range, and gaps are stored as `NULL` ranges. That makes "find a free gap of N bytes" (`get_unmapped_area()`) a tree search instead of a list walk.
+- **RCU-safe readers:** writers copy-on-write the nodes they change and publish them with RCU, so readers can walk without locks under `rcu_read_lock()`. This is what makes per-VMA locking for page faults possible (6.4, `CONFIG_PER_VMA_LOCK`).
+- **Writers still serialise:** with an internal spinlock, or an external lock (`mmap_lock` for the VMA tree).
+- **Pre-allocation:** writes may need new nodes, so `mmap()` paths pre-allocate (`mas_preallocate()`) before taking locks where allocation is not allowed.
+
+Two APIs:
+
+| API | Functions | Use |
+| --- | --------- | --- |
+| Normal (`mtree_*`) | `mtree_init()`, `mtree_store_range()`, `mtree_load()`, `mtree_erase()`, `mtree_destroy()`, `mt_for_each()` | Simple; handles locking internally |
+| Advanced (`mas_*`) | `MA_STATE()`, `mas_find()`, `mas_walk()`, `mas_store_gfp()`, `mas_preallocate()` | Caller holds the lock; keeps a cursor (`struct ma_state`) for fast repeated operations. `VMA_ITERATOR` wraps this |
+
+Minimal use of the normal API (fragment):
+
+```c
+#include <linux/maple_tree.h>                 /* maple tree API */
+#include <linux/printk.h>                     /* pr_info() */
+
+static DEFINE_MTREE(my_tree);                 /* static, empty maple tree with its own spinlock */
+
+static int maple_demo(void *obj)              /* store obj for range 100..199, then look it up */
+{
+	void *found;                          /* result of the lookup */
+	int ret;                              /* return code */
+
+	ret = mtree_store_range(&my_tree, 100, 199, obj, GFP_KERNEL); /* map [100, 199] -> obj; may sleep */
+	if (ret)                              /* -ENOMEM or -EINVAL */
+		return ret;                   /* pass the error up */
+
+	found = mtree_load(&my_tree, 150);    /* any index in the range returns obj (RCU-safe read) */
+	pr_info("150 -> %p\n", found);        /* prints obj's address */
+
+	mtree_destroy(&my_tree);              /* free all tree nodes (not the stored objects) */
+	return 0;                             /* success */
+}
+```
+
+Other users in 6.12 (checked with `git grep maple_tree.h`): sparse IRQ descriptors (`kernel/irq/irqdesc.c`) and the regmap register cache (`drivers/base/regmap/regcache-maple.c`). Slot counts are for 64-bit. 32-bit kernels use 32 and 21 (`include/linux/maple_tree.h`).
+
 `maps` shows only user mappings. Kernel memory usage is in **`/proc/meminfo`**:
 
 | Field | Meaning |
@@ -641,6 +704,7 @@ sysctl vm.mmap_min_addr                 # lowest address user space may map (655
 4. A program `mmap()`s 1 GiB and `MemFree` barely changes. Why?
 5. Ten processes each show 10 MiB RSS, mostly libc. Is 100 MiB of RAM in use? Which `smaps` field gives a fair total?
 6. What does one line of `/proc/<pid>/maps` correspond to in the kernel, how are these stored in 6.x, and what lock must you hold to walk them?
+7. Give two reasons the maple tree replaced the VMA rbtree + linked list.
 
 <details>
 <summary>Answers</summary>
@@ -651,6 +715,7 @@ sysctl vm.mmap_min_addr                 # lowest address user space may map (655
 4. `mmap()` only creates a VMA. Pages are allocated on first touch (demand paging).
 5. No. RSS counts every shared page in full in every process, so libc's pages are counted ten times. `Pss` divides each shared page among its mappers, so summing `Pss` (e.g. from `smaps_rollup`) across processes approximates the real total.
 6. One `struct vm_area_struct`. Since 6.1 they live in a maple tree in `mm_struct` (`mm->mm_mt`), replacing the rbtree + linked list. Hold `mmap_read_lock(mm)` while walking with `for_each_vma()`.
+7. (a) One wide, cache-friendly B-tree does both lookup and ordered iteration, so the rbtree, list and `vmacache` no longer have to be kept in sync. (b) Readers are RCU-safe, which enables lockless lookups and per-VMA locking for page faults. Bonus: free gaps are stored in the tree, which speeds up `get_unmapped_area()`.
 
 </details>
 
@@ -2579,6 +2644,7 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | `/proc/<pid>/smaps` / `smaps_rollup` | Per-VMA (or summed) `Rss`, `Pss`, `Shared_*`/`Private_*`, `Swap`, `VmFlags`; slow (walks page tables) |
 | RSS vs PSS vs USS | RSS counts shared pages fully; PSS splits them by sharers; USS = private only |
 | `vm_area_struct` (VMA) | One `maps` line; in `mm->mm_mt` maple tree (6.1+); walk with `for_each_vma()` under `mmap_read_lock()` |
+| Maple tree (`<linux/maple_tree.h>`) | RCU-safe range B-tree, 16 slots/node (64-bit); `mtree_store_range()`/`mtree_load()` or `mas_*` with `MA_STATE()` |
 | `find_vma()` vs `vma_lookup()` | `find_vma()` = first VMA ending above addr (may not contain it); `vma_lookup()` = containing VMA or `NULL` |
 | `/proc/meminfo` | Kernel usage: `Slab`, `KernelStack`, `PageTables`, `VmallocUsed` |
 | `vm.mmap_min_addr` | Lowest mappable address (65536): NULL deref always faults |
