@@ -506,7 +506,73 @@ Key memory metrics:
 - Clean pages can be dropped and re-read from the file under memory pressure. Dirty anonymous pages can only go to swap.
 - `VmFlags` exposes `vm_area_struct->vm_flags` (e.g. `ht` = hugetlb, `lo` = locked, `dd` = don't dump, `sd` = soft-dirty).
 
-### Where the kernel's own memory shows up
+### `struct vm_area_struct` (the VMA)
+
+Each line of `/proc/<pid>/maps` is one **`struct vm_area_struct`** (`include/linux/mm_types.h`). It describes one contiguous virtual range with uniform permissions and one backing object. A process's VMAs hang off its **`struct mm_struct`** (`task->mm`), which also holds the page-table root (`mm->pgd`).
+
+```text
+task_struct ──mm──► mm_struct
+                     ├── pgd            page-table root (loaded into CR3 / TTBR0 on switch)
+                     ├── mm_mt          maple tree of VMAs, keyed by address (6.1+)
+                     ├── mmap_lock      rw_semaphore protecting the VMA tree
+                     └── map_count      number of VMAs
+                          │
+                          ▼
+            ┌─────────────┬─────────────┬─────────────┐
+            │ VMA         │ VMA         │ VMA         │ ... one per maps line
+            │ [text r-x]  │ [heap rw-]  │ [stack rw-] │
+            └──┬──────────┴─────────────┴─────────────┘
+               ├── vm_start / vm_end   [start, end): end is exclusive
+               ├── vm_flags            VM_READ|VM_EXEC|VM_SHARED|...
+               ├── vm_file + vm_pgoff  backing file and offset (in pages); NULL = anonymous
+               ├── anon_vma            reverse map for anonymous / CoW pages
+               └── vm_ops              ->fault(), ->open(), ->close() (set by driver mmap)
+```
+
+| Field | Meaning | `maps` column |
+| ----- | ------- | ------------- |
+| `vm_start`, `vm_end` | Range `[vm_start, vm_end)`, page-aligned | `start-end` |
+| `vm_flags` | `VM_READ`, `VM_WRITE`, `VM_EXEC`, `VM_SHARED`, `VM_GROWSDOWN`, `VM_LOCKED`, `VM_IO`, `VM_PFNMAP`... | perms + `p`/`s`; full set in `smaps` `VmFlags` |
+| `vm_page_prot` | Hardware PTE protection bits derived from `vm_flags` | n/a |
+| `vm_file`, `vm_pgoff` | Backing file and offset **in pages** | path, offset (bytes) |
+| `vm_mm` | Owning `mm_struct` | n/a |
+| `anon_vma` | Reverse-mapping anchor for anonymous pages | n/a |
+| `vm_ops` | Callbacks: `fault`, `open`, `close`, `page_mkwrite`... | n/a |
+| `vm_private_data` | Driver's private pointer | n/a |
+
+- **Lookup structure is version-dependent:** before 6.1 VMAs were in a red-black tree (`mm->mm_rb`) plus a sorted linked list (`vm_next`/`vm_prev`). Since **6.1** they are in a **maple tree** (`mm->mm_mt`), and `vm_next` no longer exists.
+- **Locking:** `mmap_lock` (renamed from `mmap_sem` in 5.8) protects the tree: read lock to walk it, write lock for `mmap()`/`munmap()`/`mprotect()`. Since 6.4, `CONFIG_PER_VMA_LOCK` lets page faults lock just one VMA instead.
+- `vm_flags` is `const` since 6.3. Change it with `vm_flags_set()` / `vm_flags_clear()`, not by assigning.
+- Adjacent VMAs with identical flags/backing get **merged**. `mprotect()` on part of a VMA **splits** it. Limit: `vm.max_map_count` (65530 by default).
+- Drivers meet VMAs in `file_operations.mmap(struct file *, struct vm_area_struct *)`: map memory with `remap_pfn_range()` or install `vm_ops->fault`.
+
+Walk the VMAs of the current process (kernel 6.1+; fragment, e.g. called from a module's init):
+
+```c
+#include <linux/mm.h>                         /* vm_area_struct, VMA_ITERATOR, for_each_vma */
+#include <linux/sched.h>                      /* current */
+#include <linux/printk.h>                     /* pr_info() */
+
+static void dump_vmas(void)                   /* print every VMA of the calling process */
+{
+	struct mm_struct *mm = current->mm;   /* address space of the current task */
+	struct vm_area_struct *vma;           /* cursor for the loop */
+	VMA_ITERATOR(vmi, mm, 0);             /* maple-tree iterator starting at address 0 */
+
+	if (!mm)                              /* kernel threads have no user address space */
+		return;                       /* nothing to walk */
+
+	mmap_read_lock(mm);                   /* stop VMAs changing while we walk; may sleep */
+	for_each_vma(vmi, vma)                /* visit each VMA in address order */
+		pr_info("%lx-%lx flags=%lx %s\n",            /* one line per VMA, like maps */
+			vma->vm_start, vma->vm_end,          /* range [start, end) */
+			vma->vm_flags,                       /* raw VM_* flags */
+			vma->vm_file ? "file" : "anon");     /* backed by a file or anonymous */
+	mmap_read_unlock(mm);                 /* release the read lock */
+}
+```
+
+For another task's `mm`, take a reference first with `get_task_mm()` and drop it with `mmput()`.
 
 `maps` shows only user mappings. Kernel memory usage is in **`/proc/meminfo`**:
 
@@ -527,6 +593,12 @@ Key memory metrics:
 | `__user` | `<linux/compiler_types.h>` | `sparse` annotation for user pointers | n/a |
 | `TASK_SIZE` | `<asm/processor.h>` | Top of user space for `current` | Any |
 | `PAGE_OFFSET` | `<asm/page.h>` | Start of the kernel's direct map of RAM | Any |
+| `struct vm_area_struct` | `<linux/mm_types.h>` | One VMA: range, flags, backing file, `vm_ops` | n/a |
+| `mmap_read_lock()` / `mmap_write_lock()` | `<linux/mmap_lock.h>` | Lock an `mm`'s VMA tree | Process context, **may sleep** |
+| `vma_lookup(mm, addr)` | `<linux/mm.h>` | VMA **containing** `addr`, or `NULL` | `mmap_lock` held |
+| `find_vma(mm, addr)` | `<linux/mm.h>` | First VMA with `vm_end > addr` (may start **above** `addr`) | `mmap_lock` held |
+| `VMA_ITERATOR()` / `for_each_vma()` | `<linux/mm.h>` | Iterate VMAs (6.1+, maple tree) | `mmap_lock` held |
+| `get_task_mm()` / `mmput()` | `<linux/sched/mm.h>` | Take / drop a reference on another task's `mm` | Process context; `mmput()` may sleep |
 
 ### Commands / debugging
 
@@ -549,6 +621,9 @@ sysctl vm.mmap_min_addr                 # lowest address user space may map (655
 - Dereferencing a `__user` pointer directly: a bug even when it "works". **SMAP** (x86) / **PAN** (ARM64) make it fault. Catch it with `sparse` (`make C=1`).
 - Calling `copy_*_user()` with a spinlock held or in interrupt context: it may sleep on a page fault.
 - Assuming user addresses always fit in 47 bits (breaks under 5-level paging).
+- Using `find_vma()` as "the VMA containing `addr`": it returns the next VMA above if `addr` is in a gap. Check `vma->vm_start <= addr`, or use `vma_lookup()`.
+- Walking VMAs without `mmap_lock`, or keeping a `vma` pointer after unlocking: it can be split, merged or freed (use-after-free).
+- Old code using `vma->vm_next` or `mm->mmap` does not compile on 6.1+. Use `for_each_vma()`.
 
 ### Corrections to raw notes
 
@@ -565,6 +640,7 @@ sysctl vm.mmap_min_addr                 # lowest address user space may map (655
 3. The test box has `CONFIG_X86_5LEVEL=y`. Why is its user space still 47 bits?
 4. A program `mmap()`s 1 GiB and `MemFree` barely changes. Why?
 5. Ten processes each show 10 MiB RSS, mostly libc. Is 100 MiB of RAM in use? Which `smaps` field gives a fair total?
+6. What does one line of `/proc/<pid>/maps` correspond to in the kernel, how are these stored in 6.x, and what lock must you hold to walk them?
 
 <details>
 <summary>Answers</summary>
@@ -574,6 +650,7 @@ sysctl vm.mmap_min_addr                 # lowest address user space may map (655
 3. The CPU also needs `la57`. Without it the kernel falls back to 4-level paging at boot. Even with it, addresses above 47 bits are only handed out when requested via an `mmap()` hint.
 4. `mmap()` only creates a VMA. Pages are allocated on first touch (demand paging).
 5. No. RSS counts every shared page in full in every process, so libc's pages are counted ten times. `Pss` divides each shared page among its mappers, so summing `Pss` (e.g. from `smaps_rollup`) across processes approximates the real total.
+6. One `struct vm_area_struct`. Since 6.1 they live in a maple tree in `mm_struct` (`mm->mm_mt`), replacing the rbtree + linked list. Hold `mmap_read_lock(mm)` while walking with `for_each_vma()`.
 
 </details>
 
@@ -581,7 +658,8 @@ sysctl vm.mmap_min_addr                 # lowest address user space may map (655
 
 - `Documentation/arch/x86/x86_64/mm.rst`, `Documentation/arch/x86/x86_64/5level-paging.rst`, `Documentation/arch/arm64/memory.rst`
 - `arch/x86/include/asm/page_64_types.h` (`TASK_SIZE_MAX`), `include/linux/uaccess.h`
-- `mm/memory.c` (`handle_mm_fault()`), `arch/x86/mm/fault.c` (`exc_page_fault()`), `mm/mmap.c`
+- `mm/memory.c` (`handle_mm_fault()`), `arch/x86/mm/fault.c` (`exc_page_fault()`), `mm/mmap.c` (VMA create/merge/split), `mm/vma.c` (VMA operations, 6.12)
+- `include/linux/mm_types.h` (`struct vm_area_struct`, `struct mm_struct`), `include/linux/mmap_lock.h`, `lib/maple_tree.c`, `Documentation/core-api/maple_tree.rst`, `Documentation/mm/process_addrs.rst`
 - `Documentation/filesystems/proc.rst` (`maps`, `meminfo`)
 
 ---
@@ -2500,6 +2578,8 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | `/proc/<pid>/maps` | range, perms (`p`/`s`), offset, dev, inode, path |
 | `/proc/<pid>/smaps` / `smaps_rollup` | Per-VMA (or summed) `Rss`, `Pss`, `Shared_*`/`Private_*`, `Swap`, `VmFlags`; slow (walks page tables) |
 | RSS vs PSS vs USS | RSS counts shared pages fully; PSS splits them by sharers; USS = private only |
+| `vm_area_struct` (VMA) | One `maps` line; in `mm->mm_mt` maple tree (6.1+); walk with `for_each_vma()` under `mmap_read_lock()` |
+| `find_vma()` vs `vma_lookup()` | `find_vma()` = first VMA ending above addr (may not contain it); `vma_lookup()` = containing VMA or `NULL` |
 | `/proc/meminfo` | Kernel usage: `Slab`, `KernelStack`, `PageTables`, `VmallocUsed` |
 | `vm.mmap_min_addr` | Lowest mappable address (65536): NULL deref always faults |
 | `[vdso]` / `[vvar]` | Kernel-supplied library + data page: syscall-free `clock_gettime` |
@@ -2695,10 +2775,13 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 | **LVM** | Logical Volume Manager: user-space tools that build resizable volumes on device-mapper `linear`/`striped`/`thin` targets. |
 | **Mainline** | Linus Torvalds' upstream kernel tree. |
 | **Major / minor number** | `dev_t` parts of a device node: major selects the driver, minor the device instance. |
+| **Maple tree** | RCU-safe B-tree for non-overlapping ranges; stores a process's VMAs since 6.1. |
 | **Mapped** | A virtual page backed by a page-table entry pointing to a physical frame; access to an unmapped page faults. |
 | **Microkernel** | Kernel that keeps only IPC, scheduling and basic memory management in kernel mode; other services run as user-space servers. |
 | **Misc device** | Simple character device registered with `misc_register()` under major 10. |
 | **`mmap()`** | System call that creates a virtual memory mapping (VMA) in a process. |
+| **`mmap_lock`** | `rw_semaphore` in `mm_struct` protecting the VMA tree (was `mmap_sem` before 5.8). |
+| **`mm_struct`** | Per-process address-space descriptor (`task->mm`): VMA tree, page-table root, `mmap_lock`, counters. |
 | **`.modinfo`** | ELF section of a `.ko` holding `key=value` module metadata. |
 | **Module parameter** | Module variable settable at load time (`name=value`) and exposed in `/sys/module/<mod>/parameters/`. |
 | **`modules_disabled`** | One-way sysctl (`kernel.modules_disabled`) that blocks all module loading and unloading until reboot. |
