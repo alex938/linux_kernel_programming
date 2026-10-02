@@ -1,26 +1,38 @@
 # Advanced Linux Kernel Programming: Revision Notes
 
-**How to use these notes:** read the **Remember** box at the top of each section first. It holds the facts you must know. The rest of the section explains them. Blocks marked ▶ are optional deep dives: skip them on a first pass. Test yourself with the revision questions at the end of each section.
+**How to use these notes**
+
+- The notes are in five **parts**, ordered so that each section builds on earlier ones. The *Builds on* line under each heading says what to read first.
+- Read the **Remember** box at the top of each section first: it holds the facts you must know. The rest of the section explains them.
+- Blocks marked ▶ are optional deep dives: skip them on a first pass.
+- Test yourself with the **revision questions** at the end of each section (answers are folded).
+- Before an exam, read **Quick Reference → Top gotchas**, then the Remember boxes again.
 
 ## Contents
 
 - [Big Picture](#big-picture)
-- [1. Where the Kernel Lives: `/boot` and Kernel Images](#1-where-the-kernel-lives-boot-and-kernel-images)
-- [2. Where Kernels Come From: Distribution vs Vendor (BSP) Kernels](#2-where-kernels-come-from-distribution-vs-vendor-bsp-kernels)
-- [3. Virtual Address Space: User/Kernel Split](#3-virtual-address-space-userkernel-split)
-- [4. vDSO and vsyscall: Kernel Code Mapped into User Space](#4-vdso-and-vsyscall-kernel-code-mapped-into-user-space)
-- [5. The First Processes: PID 0, PID 1 (`init`) and PID 2 (`kthreadd`)](#5-the-first-processes-pid-0-pid-1-init-and-pid-2-kthreadd)
-- [6. Kernel Headers: In-Tree, Module-Build and UAPI](#6-kernel-headers-in-tree-module-build-and-uapi)
-- [7. Loadable Kernel Modules (LKMs)](#7-loadable-kernel-modules-lkms)
-- [8. Linux Capabilities](#8-linux-capabilities)
-- [9. Kernel Architecture: Monolithic vs Microkernel](#9-kernel-architecture-monolithic-vs-microkernel)
-- [10. Tracing: ftrace, kprobes, `trace_marker` and ptrace](#10-tracing-ftrace-kprobes-trace_marker-and-ptrace)
-- [11. Pages and Page Size](#11-pages-and-page-size)
-- [12. Synchronisation: Spinlocks, RW Locks and RCU](#12-synchronisation-spinlocks-rw-locks-and-rcu)
-- [13. Device Types: Character, Block and Network](#13-device-types-character-block-and-network)
-- [14. The OOM Killer: `oom_score`, `oom_score_adj` and `oom_adj`](#14-the-oom-killer-oom_score-oom_score_adj-and-oom_adj)
-- [15. Kernel Memory Allocation: `kmalloc`, `vmalloc` and GFP Flags](#15-kernel-memory-allocation-kmalloc-vmalloc-and-gfp-flags)
-- [16. Heterogeneous CPUs: big.LITTLE and Frequency Governors](#16-heterogeneous-cpus-biglittle-and-frequency-governors)
+- **Part I: Foundations**
+  - [1. Kernel Architecture: Monolithic vs Microkernel](#1-kernel-architecture-monolithic-vs-microkernel)
+  - [2. Where Kernels Come From: Distribution vs Vendor (BSP) Kernels](#2-where-kernels-come-from-distribution-vs-vendor-bsp-kernels)
+  - [3. Where the Kernel Lives: `/boot` and Kernel Images](#3-where-the-kernel-lives-boot-and-kernel-images)
+  - [4. The First Processes: PID 0, PID 1 (`init`) and PID 2 (`kthreadd`)](#4-the-first-processes-pid-0-pid-1-init-and-pid-2-kthreadd)
+- **Part II: Building and Loading Kernel Code**
+  - [5. Kernel Headers: In-Tree, Module-Build and UAPI](#5-kernel-headers-in-tree-module-build-and-uapi)
+  - [6. Loadable Kernel Modules (LKMs)](#6-loadable-kernel-modules-lkms)
+  - [7. Linux Capabilities](#7-linux-capabilities)
+- **Part III: Memory**
+  - [8. Virtual Address Space: User/Kernel Split](#8-virtual-address-space-userkernel-split)
+  - [9. vDSO and vsyscall: Kernel Code Mapped into User Space](#9-vdso-and-vsyscall-kernel-code-mapped-into-user-space)
+  - [10. Process Memory: VMAs, `maps`/`smaps` and Maple Trees](#10-process-memory-vmas-mapssmaps-and-maple-trees)
+  - [11. Pages, Page Size and Page Tables](#11-pages-page-size-and-page-tables)
+  - [12. Kernel Memory Allocation: `kmalloc`, `vmalloc` and GFP Flags](#12-kernel-memory-allocation-kmalloc-vmalloc-and-gfp-flags)
+  - [13. The OOM Killer: `oom_score`, `oom_score_adj` and `oom_adj`](#13-the-oom-killer-oom_score-oom_score_adj-and-oom_adj)
+- **Part IV: Concurrency, CPUs and Devices**
+  - [14. Synchronisation: Spinlocks, RW Locks and RCU](#14-synchronisation-spinlocks-rw-locks-and-rcu)
+  - [15. Heterogeneous CPUs: big.LITTLE and Frequency Governors](#15-heterogeneous-cpus-biglittle-and-frequency-governors)
+  - [16. Device Types: Character, Block and Network](#16-device-types-character-block-and-network)
+- **Part V: Observability**
+  - [17. Tracing: ftrace, kprobes, `trace_marker` and ptrace](#17-tracing-ftrace-kprobes-trace_marker-and-ptrace)
 - [Labs & Exercises](#labs--exercises)
 - [Quick Reference](#quick-reference)
 - [Glossary](#glossary)
@@ -30,36 +42,237 @@
 
 ## Big Picture
 
-How the topics so far fit together:
-
 ```text
-power on → firmware → bootloader (GRUB)
-                          └─ loads /boot/vmlinuz + initramfs ........................ §1
-                                └─ kernel decompresses itself, start_kernel()
-                                      └─ PID 0 (idle) creates PID 1 (init/systemd)
-                                         and PID 2 (kthreadd → all kernel threads) .. §5
+PART I    FOUNDATIONS: what the kernel is and how it starts
+  §1  Linux is monolithic: one shared kernel space; everything is a function call
+  §2  every kernel comes from kernel.org → distro / vendor BSP / Android GKI
+  §3  power on → firmware → bootloader → /boot/vmlinuz + initramfs → start_kernel()
+  §4  PID 0 (idle) → PID 1 (init/systemd) + PID 2 (kthreadd); every thread is a task_struct
 
-every process sees one virtual address space:
-      low half  = user space (private per process) .................................. §3
-      high half = kernel space (shared, kernel mode only) ........................... §3
-      a few kernel pages mapped into user space: [vdso], [vsyscall] ................. §4
+PART II   BUILDING AND LOADING KERNEL CODE
+  §5  headers matching the running kernel ──build──> §6 module (.ko) ──insmod──> running kernel
+  §7  permission to load it (and other privileged operations): capabilities
 
-extending the running kernel:
-      module source ── built against the matching headers (§6) ──> .ko ── insmod ─> §7
-      permission to load it (and other privileged operations): capabilities ......... §8
+PART III  MEMORY
+  §8  every process: user space (low half, private) + kernel space (high half, shared)
+  §9  a few kernel pages mapped into user space (vDSO); real calls enter via `syscall`
+  §10 user space = a set of VMAs (`maps`/`smaps`, maple tree)
+  §11 VMAs → page tables → physical pages (power-of-two sizes)
+  §12 the kernel's own memory: kmalloc / vmalloc / GFP flags
+  §13 when memory runs out: the OOM killer
 
-where the running kernel came from: kernel.org → distro / vendor BSP / Android GKI .. §2
+PART IV   CONCURRENCY, CPUS AND DEVICES
+  §14 locks: spinlock, mutex, RCU      §15 big.LITTLE and frequency governors
+  §16 character, block and network devices
 
-why a module bug is a kernel bug: Linux is monolithic, one shared kernel space ..... §9
-
-watching it all run: ftrace, kprobes, trace_marker, ptrace/strace ................ §10
+PART V    OBSERVABILITY
+  §17 watching it all run: ftrace, kprobes, uprobes, eBPF, trace_marker, ptrace
 ```
 
-**Golden rule so far:** *installed ≠ running*. Everything you build (modules, headers) must match the **running** kernel: `uname -r`.
+**Golden rules**
+
+1. *Installed ≠ running*: everything you build (modules, headers) must match `uname -r` (§3, §5).
+2. A module bug is a kernel bug: there is no isolation in kernel space (§1, §6).
+3. Never dereference a user pointer: use `copy_from_user()` / `copy_to_user()` (§8).
+4. Never sleep in atomic context (spinlock held, IRQ handler): allocate with `GFP_ATOMIC` there, or allocate before taking the lock (§12, §14).
+5. Every allocation can fail, and every init step needs an undo path in reverse order (§6, §12).
 
 ---
 
-## 1. Where the Kernel Lives: `/boot` and Kernel Images
+## 1. Kernel Architecture: Monolithic vs Microkernel
+
+*Builds on: nothing: start here.*
+
+> **Remember**
+>
+> - Linux is a **monolithic kernel**: system calls, the scheduler, memory management, filesystems, networking and drivers all run in **one address space** (kernel space, the high half: `0xffff_8…` on x86_64), in kernel mode, and call each other as **ordinary functions**.
+> - A **microkernel** keeps only the minimum (IPC, scheduling, basic memory management) in kernel mode. Filesystems and drivers run as **user-space servers** that talk by **message passing**.
+> - Monolithic = **fast** (a function call, no IPC or context switch) but **no isolation**: one bad driver or module can corrupt or crash the whole kernel.
+> - Linux is **monolithic but modular**: modules (§6) are loaded into the same single address space, with the same full privileges.
+
+### Overview
+
+The kernel architecture decides where OS services run and how they communicate. Linux keeps everything in one privileged address space for performance. This is why a module bug is a kernel bug, and why kernel code must never trust or directly dereference user pointers (§8).
+
+### How it works
+
+```text
+        MONOLITHIC (Linux)                       MICROKERNEL (QNX, seL4, MINIX 3)
+ ┌──────────────────────────────┐         ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+ │ user space: apps, libc       │         │ app  │ │ FS   │ │ net  │ │driver│  user space
+ │ 0x0000… – 0x0000_7fff_ffff…  │         │      │ │server│ │server│ │server│  (servers)
+ ├──────── syscall ─────────────┤         └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘
+ │ kernel space: 0xffff_8000_…  │            └── IPC messages ─┴────────┘
+ │  syscalls  sched  mm  VFS/FS │         ┌──────────────────────────────────┐
+ │  net stack  drivers  modules │         │ microkernel: IPC, sched, basic mm│  kernel mode
+ │  (all direct function calls) │         └──────────────────────────────────┘
+ └──────────────────────────────┘
+```
+
+| Design | Examples | In kernel mode | Communication | Trade-off |
+| ------ | -------- | -------------- | ------------- | --------- |
+| **Monolithic** | Linux, FreeBSD | Everything | Direct function calls | Fast; one bug can take down everything |
+| **Microkernel** | QNX, seL4, MINIX 3, L4 | IPC, scheduling, basic mm | Message passing (IPC) | Isolation and restartable servers; IPC overhead |
+| **Hybrid** | Windows NT, macOS XNU | Most services, microkernel-style structure | Mostly direct calls | A compromise; in practice close to monolithic |
+
+- On x86_64 with 4-level paging, user space is `0x0000_0000_0000_0000`–`0x0000_7fff_ffff_ffff` and kernel space starts at `0xffff_8000_0000_0000` (§8).
+- Each half is **2^47 bytes = 128 TiB**. *Raw notes said user space is O(2^27); correct is 2^47 (2^27 would be only 128 MiB).*
+- Everything between the two halves (the **non-canonical hole**, almost all of the 2^64 range) is **unaddressable**: any access raises a general-protection fault (#GP). The CPU implements only 48 virtual-address bits, and bits 63–48 must copy bit 47. With 5-level paging (`la57`), there are 57 bits and each half grows to 2^56 = 64 PiB.
+- Linux still moves *some* work to user space where it helps: FUSE filesystems, UIO/VFIO user-space drivers, and eBPF programs (verified, sandboxed code run *in* the kernel).
+- Historical note: the 1992 **Tanenbaum–Torvalds debate** (MINIX microkernel vs Linux monolithic).
+
+### Commands / debugging
+
+```bash
+sudo grep -c ' [tT] ' /proc/kallsyms          # count kernel text (function) symbols: all subsystems share one symbol table
+sudo grep -w -e vfs_read -e tcp_sendmsg -e schedule /proc/kallsyms  # FS, network and scheduler functions side by side in kernel space
+cat /proc/filesystems                          # filesystems the kernel supports, all inside the kernel itself
+lsmod | head                                   # modules loaded into the same kernel address space
+```
+
+### Pitfalls
+
+- "Modular" does not mean "isolated": a loaded module has the same privileges as the rest of the kernel. A NULL dereference in a module can oops the whole kernel.
+- Microkernel does not mean "small Linux". It is a different design with different trade-offs, not just a Linux with fewer drivers.
+
+### Revision questions
+
+1. What makes Linux a monolithic kernel, and why is that fast?
+2. Why does a bug in a loaded module crash the whole system, when a bug in a microkernel's filesystem server might not?
+3. Give one way Linux runs driver or filesystem code in user space.
+
+<details>
+<summary>Answers</summary>
+
+1. All kernel services share one privileged address space and call each other directly, so there is no IPC or context switch between subsystems.
+2. The module runs in the same kernel address space with full privileges, so it can corrupt any kernel data. A microkernel server is a separate user-space process that can be killed and restarted.
+3. FUSE (filesystems) or UIO/VFIO (drivers).
+
+</details>
+
+### Source pointers
+
+- `init/main.c` (`start_kernel()` sets up every subsystem in one image), `kernel/`, `mm/`, `fs/`, `net/`, `drivers/`
+- `Documentation/filesystems/fuse.rst`, `Documentation/driver-api/uio-howto.rst`
+
+---
+
+## 2. Where Kernels Come From: Distribution vs Vendor (BSP) Kernels
+
+*Builds on: §1.*
+
+> **Remember**
+>
+> - **Every** Linux kernel comes from kernel.org (**mainline** → **stable/LTS**). Others add patches on top.
+> - PCs and servers run **distribution kernels**. Phones and boards run **vendor BSP kernels**.
+> - Android **GKI**: one Google-built core kernel, with hardware support in **vendor modules** loaded against a stable **KMI**.
+> - Patching the kernel directly creates a **fork** (endless rebasing), and **GPLv2** requires you to publish the source if you distribute it. Prefer modules, eBPF, or upstreaming.
+> - Build modules against the **exact** kernel you run: "6.8" from Ubuntu ≠ "6.8" from kernel.org.
+
+### Overview
+
+Few systems run a pure mainline kernel. Knowing whether you are on a distro kernel or a vendor kernel tells you which source tree, config and patches your modules must be built against.
+
+### How kernels are derived
+
+```text
+mainline (Linus, torvalds/linux.git)
+   └─> stable / LTS (Greg KH, linux-6.12.y, ...)
+          ├─> distribution kernels (PC/server): Ubuntu 6.8.0-NN-generic, Fedora, RHEL, SUSE, Debian
+          │      + backports, security fixes, distro config
+          └─> Android Common Kernel (ACK, Google) → GKI
+                 └─> SoC vendor BSP kernels (Qualcomm, MediaTek, Samsung, ...)
+                        └─> device (OEM) kernels
+```
+
+| | Distribution kernel | Vendor BSP kernel |
+| - | ------------------- | ----------------- |
+| Supplied by | Ubuntu, Fedora/RHEL, SUSE, Debian | SoC vendor: Qualcomm, MediaTek, NXP, TI, Rockchip, … |
+| Hardware | Generic: one image for many PCs, most drivers as modules | One SoC family; board described by a **Device Tree** |
+| Out-of-tree code | Minimal | Often large (GPU, modem, camera drivers) |
+| Updates | Frequent, via the package manager | Frozen at one LTS; updates depend on the OEM |
+
+- **BSP** (Board Support Package): the vendor's kernel tree, bootloader, Device Trees, drivers and firmware for its SoC.
+- The Pi's kernel (`6.12.x+rpt-rpi-2712`) is itself a vendor kernel (`raspberrypi/linux`).
+
+### GKI (Generic Kernel Image, Android 12+, kernel 5.10+)
+
+```text
+Before GKI (per-device kernel)          With GKI
+┌──────────────────────────────┐        ┌──────────────────────────────┐
+│ one monolithic kernel         │        │ GKI kernel (Google-built,     │  same binary for every
+│ = LTS + Android + SoC vendor  │        │ signed, per LTS branch)       │  device on that branch
+│   + OEM patches, all mixed    │        ├──────── KMI (stable) ────────┤  frozen list of exported
+└──────────────────────────────┘        │ vendor modules (.ko): SoC,    │  symbols + types
+                                         │ board, GPU, modem drivers     │
+                                         └──────────────────────────────┘
+```
+
+| Advantage | Why |
+| --------- | --- |
+| Faster security updates | Google ships a new GKI without every vendor rebasing a private fork |
+| Less fragmentation | One core kernel per branch instead of thousands of device forks |
+| Stable vendor interface | The **KMI** is frozen within a branch, so vendor modules keep loading |
+| Upstream alignment | Core changes must go upstream or into ACK |
+| Central testing | One binary is tested and certified centrally |
+
+- **Trade-offs:** vendors are limited to the KMI symbol list, and module loading at boot adds complexity (`vendor_boot` and `vendor_dlkm` partitions).
+- GKI is a real-world example of §6: hardware support lives in **modules** against a controlled symbol list.
+
+### Licensing: GPLv2 and why not to patch the kernel directly
+
+- The kernel is **GPL-2.0-only**. Anyone who **distributes** a modified kernel must provide the source to recipients.
+- **Avoid patching the kernel directly:**
+  - **Legal:** the changes fall under GPLv2 and must be released with any binary you ship.
+  - **Engineering:** you create a **fork** that must be rebased on every upstream release. This is the root of the Android update problem.
+- **Preferred alternatives:** a **loadable module**, existing extension points (**eBPF**, tracepoints, Device Tree, sysfs), or **upstream** the change.
+- **Modules:** `MODULE_LICENSE("GPL")` unlocks `EXPORT_SYMBOL_GPL()` symbols. A non-GPL licence **taints** the kernel (`P`). Whether a proprietary module is a derivative work is legally disputed (**⚠️ Verify** the course's position).
+
+### Resources and cross-compiling
+
+- **kernelnewbies.org/Linux_6.1** (replace the version): readable summary of what changed in each release.
+- **Elixir (LXR, Linux Cross Reference)** at `elixir.bootlin.com`: browse any version's source with identifier search ("where is this defined/used?"). Offline: `git grep`, `cscope`/`ctags`, `clangd` (all on the test box).
+- **Cross-compiling user-space programs:** the **Android NDK** ships clang toolchains for `aarch64`, `armv7a`, `x86_64` and `riscv64` (`CC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang`). These programs link against Android's **bionic** libc, not glibc. A **statically linked** binary needs no libc on the target, so it runs on any arm64 Linux. *Raw notes listed PPC/MIPS: current NDKs no longer support MIPS (dropped in r17).*
+- **Cross-compiling the kernel or modules** uses the kernel's own build system: `make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-` (GCC) or `make ARCH=arm64 LLVM=1` (clang).
+
+### Pitfalls
+
+- Distro/BSP headers are **not** interchangeable with mainline sources of the same version number.
+- Vendor trees often carry older or modified APIs, so mainline 6.x code may not build on them unchanged.
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| "All changes must be kept open source" | The obligation is triggered by **distribution**. Private changes that are never shipped need not be published. |
+
+### Revision questions
+
+1. Why is it hard to update the kernel on an old Android phone, and how does GKI help?
+2. The test box runs `6.8.0-139-generic`. Is that a mainline kernel?
+3. Give two reasons to write a module instead of patching the kernel.
+
+<details>
+<summary>Answers</summary>
+
+1. Each device runs a vendor BSP kernel with out-of-tree drivers on an old LTS, so updates need the vendor and the OEM to rebase their patches. GKI separates one Google-maintained core kernel from vendor modules that load against a stable KMI, so the core can be updated on its own.
+2. No. It is Ubuntu's distribution kernel: upstream 6.8 plus Ubuntu patches, backports and config. `-139` is Ubuntu's ABI/upload number.
+3. No private fork to rebase on every release. The code stays separate from GPL obligations on the kernel proper (subject to licence). It can be loaded and unloaded without rebuilding the kernel.
+
+</details>
+
+### Source pointers
+
+- `Documentation/process/2.Process.rst`, `Documentation/process/stable-kernel-rules.rst`
+- `COPYING`, `LICENSES/`, `Documentation/process/license-rules.rst`, `Documentation/admin-guide/tainted-kernels.rst`
+- `arch/arm64/boot/dts/qcom/`, `arch/arm64/boot/dts/mediatek/`
+- Android: `source.android.com/docs/core/architecture/kernel` (GKI, KMI)
+
+---
+
+## 3. Where the Kernel Lives: `/boot` and Kernel Images
+
+*Builds on: §2 (which kernel you are running).*
 
 > **Remember**
 >
@@ -99,7 +312,7 @@ Firmware (UEFI/BIOS)
                └─> kernel decompresses itself, initialises
                      └─> unpacks initramfs as rootfs, runs /init
                            └─> mounts real root (/), switch_root
-                                 └─> /sbin/init (systemd) = PID 1   (§5)
+                                 └─> /sbin/init (systemd) = PID 1   (§4)
 ```
 
 **ARM64:** the build output is `arch/arm64/boot/Image` (or `Image.gz`). There is **no self-decompressor**, so the bootloader must unpack `Image.gz` itself. The Pi 5 boots `/boot/firmware/kernel_2712.img` through its own firmware (`config.txt`), not GRUB.
@@ -220,7 +433,7 @@ The instructor's figure of **50–70 MB** is the loaded image plus its basic dat
 | `2` | **Nobody**, not even root | Android |
 
 - **Why hide them:** a leaked kernel address defeats **KASLR**, which turns a memory-corruption bug into code execution. This is defence in depth: root can always change the setting.
-- The check uses the credentials of whoever **opened** the file (§8).
+- The check uses the credentials of whoever **opened** the file (§7).
 
 ### initramfs in depth
 
@@ -277,7 +490,7 @@ Observed on the test box: running `-139`, but `/boot/vmlinuz` points to `-142`. 
 
 ### Pitfalls
 
-- Building a module against a different kernel than `uname -r` → `insmod` fails with `Invalid module format` (vermagic mismatch, §7).
+- Building a module against a different kernel than `uname -r` → `insmod` fails with `Invalid module format` (vermagic mismatch, §6).
 - After an upgrade without a reboot, `/lib/modules/$(uname -r)/build` still points to the old headers. That is **correct** for the running kernel: do not "fix" it.
 - `System.map` addresses ≠ runtime addresses because of **KASLR**. Use `/proc/kallsyms` (as root).
 - Do not delete old kernels from `/boot` by hand. Use the package manager (`apt autoremove`).
@@ -323,569 +536,9 @@ Observed on the test box: running `-139`, but `/boot/vmlinuz` points to `-142`. 
 
 ---
 
-## 2. Where Kernels Come From: Distribution vs Vendor (BSP) Kernels
+## 4. The First Processes: PID 0, PID 1 (`init`) and PID 2 (`kthreadd`)
 
-> **Remember**
->
-> - **Every** Linux kernel comes from kernel.org (**mainline** → **stable/LTS**). Others add patches on top.
-> - PCs and servers run **distribution kernels**. Phones and boards run **vendor BSP kernels**.
-> - Android **GKI**: one Google-built core kernel, with hardware support in **vendor modules** loaded against a stable **KMI**.
-> - Patching the kernel directly creates a **fork** (endless rebasing), and **GPLv2** requires you to publish the source if you distribute it. Prefer modules, eBPF, or upstreaming.
-> - Build modules against the **exact** kernel you run: "6.8" from Ubuntu ≠ "6.8" from kernel.org.
-
-### Overview
-
-Few systems run a pure mainline kernel. Knowing whether you are on a distro kernel or a vendor kernel tells you which source tree, config and patches your modules must be built against.
-
-### How kernels are derived
-
-```text
-mainline (Linus, torvalds/linux.git)
-   └─> stable / LTS (Greg KH, linux-6.12.y, ...)
-          ├─> distribution kernels (PC/server): Ubuntu 6.8.0-NN-generic, Fedora, RHEL, SUSE, Debian
-          │      + backports, security fixes, distro config
-          └─> Android Common Kernel (ACK, Google) → GKI
-                 └─> SoC vendor BSP kernels (Qualcomm, MediaTek, Samsung, ...)
-                        └─> device (OEM) kernels
-```
-
-| | Distribution kernel | Vendor BSP kernel |
-| - | ------------------- | ----------------- |
-| Supplied by | Ubuntu, Fedora/RHEL, SUSE, Debian | SoC vendor: Qualcomm, MediaTek, NXP, TI, Rockchip, … |
-| Hardware | Generic: one image for many PCs, most drivers as modules | One SoC family; board described by a **Device Tree** |
-| Out-of-tree code | Minimal | Often large (GPU, modem, camera drivers) |
-| Updates | Frequent, via the package manager | Frozen at one LTS; updates depend on the OEM |
-
-- **BSP** (Board Support Package): the vendor's kernel tree, bootloader, Device Trees, drivers and firmware for its SoC.
-- The Pi's kernel (`6.12.x+rpt-rpi-2712`) is itself a vendor kernel (`raspberrypi/linux`).
-
-### GKI (Generic Kernel Image, Android 12+, kernel 5.10+)
-
-```text
-Before GKI (per-device kernel)          With GKI
-┌──────────────────────────────┐        ┌──────────────────────────────┐
-│ one monolithic kernel         │        │ GKI kernel (Google-built,     │  same binary for every
-│ = LTS + Android + SoC vendor  │        │ signed, per LTS branch)       │  device on that branch
-│   + OEM patches, all mixed    │        ├──────── KMI (stable) ────────┤  frozen list of exported
-└──────────────────────────────┘        │ vendor modules (.ko): SoC,    │  symbols + types
-                                         │ board, GPU, modem drivers     │
-                                         └──────────────────────────────┘
-```
-
-| Advantage | Why |
-| --------- | --- |
-| Faster security updates | Google ships a new GKI without every vendor rebasing a private fork |
-| Less fragmentation | One core kernel per branch instead of thousands of device forks |
-| Stable vendor interface | The **KMI** is frozen within a branch, so vendor modules keep loading |
-| Upstream alignment | Core changes must go upstream or into ACK |
-| Central testing | One binary is tested and certified centrally |
-
-- **Trade-offs:** vendors are limited to the KMI symbol list, and module loading at boot adds complexity (`vendor_boot` and `vendor_dlkm` partitions).
-- GKI is a real-world example of §7: hardware support lives in **modules** against a controlled symbol list.
-
-### Licensing: GPLv2 and why not to patch the kernel directly
-
-- The kernel is **GPL-2.0-only**. Anyone who **distributes** a modified kernel must provide the source to recipients.
-- **Avoid patching the kernel directly:**
-  - **Legal:** the changes fall under GPLv2 and must be released with any binary you ship.
-  - **Engineering:** you create a **fork** that must be rebased on every upstream release. This is the root of the Android update problem.
-- **Preferred alternatives:** a **loadable module**, existing extension points (**eBPF**, tracepoints, Device Tree, sysfs), or **upstream** the change.
-- **Modules:** `MODULE_LICENSE("GPL")` unlocks `EXPORT_SYMBOL_GPL()` symbols. A non-GPL licence **taints** the kernel (`P`). Whether a proprietary module is a derivative work is legally disputed (**⚠️ Verify** the course's position).
-
-### Resources and cross-compiling
-
-- **kernelnewbies.org/Linux_6.1** (replace the version): readable summary of what changed in each release.
-- **Elixir (LXR, Linux Cross Reference)** at `elixir.bootlin.com`: browse any version's source with identifier search ("where is this defined/used?"). Offline: `git grep`, `cscope`/`ctags`, `clangd` (all on the test box).
-- **Cross-compiling user-space programs:** the **Android NDK** ships clang toolchains for `aarch64`, `armv7a`, `x86_64` and `riscv64` (`CC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang`). These programs link against Android's **bionic** libc, not glibc. A **statically linked** binary needs no libc on the target, so it runs on any arm64 Linux. *Raw notes listed PPC/MIPS: current NDKs no longer support MIPS (dropped in r17).*
-- **Cross-compiling the kernel or modules** uses the kernel's own build system: `make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-` (GCC) or `make ARCH=arm64 LLVM=1` (clang).
-
-### Pitfalls
-
-- Distro/BSP headers are **not** interchangeable with mainline sources of the same version number.
-- Vendor trees often carry older or modified APIs, so mainline 6.x code may not build on them unchanged.
-
-### Corrections to raw notes
-
-| Raw notes said | Correct |
-| -------------- | ------- |
-| "All changes must be kept open source" | The obligation is triggered by **distribution**. Private changes that are never shipped need not be published. |
-
-### Revision questions
-
-1. Why is it hard to update the kernel on an old Android phone, and how does GKI help?
-2. The test box runs `6.8.0-139-generic`. Is that a mainline kernel?
-3. Give two reasons to write a module instead of patching the kernel.
-
-<details>
-<summary>Answers</summary>
-
-1. Each device runs a vendor BSP kernel with out-of-tree drivers on an old LTS, so updates need the vendor and the OEM to rebase their patches. GKI separates one Google-maintained core kernel from vendor modules that load against a stable KMI, so the core can be updated on its own.
-2. No. It is Ubuntu's distribution kernel: upstream 6.8 plus Ubuntu patches, backports and config. `-139` is Ubuntu's ABI/upload number.
-3. No private fork to rebase on every release. The code stays separate from GPL obligations on the kernel proper (subject to licence). It can be loaded and unloaded without rebuilding the kernel.
-
-</details>
-
-### Source pointers
-
-- `Documentation/process/2.Process.rst`, `Documentation/process/stable-kernel-rules.rst`
-- `COPYING`, `LICENSES/`, `Documentation/process/license-rules.rst`, `Documentation/admin-guide/tainted-kernels.rst`
-- `arch/arm64/boot/dts/qcom/`, `arch/arm64/boot/dts/mediatek/`
-- Android: `source.android.com/docs/core/architecture/kernel` (GKI, KMI)
-
----
-
-## 3. Virtual Address Space: User/Kernel Split
-
-> **Remember**
->
-> - Every process has its own **virtual address space**: **user space** in the low half (private), **kernel space** in the high half (shared by all processes, kernel mode only).
-> - x86_64 with 4-level paging: user `0x0000_0000_0000_0000`–`0x0000_7fff_ffff_ffff` (**47 bits, 128 TiB**); kernel from `0xffff_8000_0000_0000`. The gap in between is **non-canonical** and faults.
-> - An address works only if it is **mapped** (a page-table entry points to a physical page). Otherwise the CPU raises a **page fault**.
-> - `mmap()` creates only a **VMA** (a reserved range). Physical pages are allocated **on first touch** (**demand paging**).
-> - Kernel code must **never** dereference a user pointer. Use `copy_from_user()` / `copy_to_user()`.
-
-### Overview
-
-The number of usable address bits depends on the **architecture and the number of page-table levels**, not on installed RAM. 128 TiB of user space does not need 128 TiB of RAM.
-
-### Layout (x86_64, 4-level paging)
-
-```text
-0xffff_ffff_ffff_ffff ┌────────────────────────────┐
-                      │ kernel space (128 TiB)     │  direct map, vmalloc, vmemmap,
-                      │ shared by all processes    │  kernel text (0xffffffff8…)
-0xffff_8000_0000_0000 ├────────────────────────────┤
-                      │ non-canonical hole         │  access → #GP fault
-0x0000_7fff_ffff_ffff ├────────────────────────────┤  ← TASK_SIZE
-                      │ user space (128 TiB)       │  stack (top), mmap/libs,
-                      │ per process                │  heap, text (bottom)
-0x0000_0000_0000_0000 └────────────────────────────┘
-```
-
-| Architecture / config | User space |
-| --------------------- | ---------- |
-| x86 32-bit | 3 GiB (classic **3G/1G split**, kernel at `0xc0000000`) |
-| **x86_64, 4-level (default)** | **128 TiB (47 bits)** |
-| x86_64, 5-level (`CONFIG_X86_5LEVEL` + CPU flag `la57`) | Up to 64 PiB (56 bits); addresses above 47 bits only if requested via an `mmap()` hint |
-| ARM64 (`CONFIG_ARM64_VA_BITS` = 39/47/48/52) | 2^VA_BITS; separate page-table roots for user (`TTBR0_EL1`) and kernel (`TTBR1_EL1`) |
-
-- **Test box:** `CONFIG_X86_5LEVEL=y`, but the vCPU lacks `la57`, so it runs **4-level**: 47-bit user space.
-- **Pi 5:** `ARM64_VA_BITS=47`, 16 KiB pages, 128 TiB user space.
-
-### Mapped vs unmapped (key term)
-
-A virtual page is usable only if it is **mapped**. When a process touches an unmapped address, the MMU raises a **page fault** and the kernel checks whether the address lies in a valid **VMA**:
-
-```text
-page fault
-  ├─ inside a VMA, page not present yet → demand paging: allocate/read page, fill PTE, retry (invisible)
-  └─ no VMA, or wrong permissions      → SIGSEGV (user) / oops (kernel)
-```
-
-- **NULL dereference always faults:** the lowest pages are never mapped (`vm.mmap_min_addr` = 65536). This turns kernel NULL bugs into oopses rather than exploits.
-
-### Reading `/proc/<pid>/maps`: libc example
-
-```text
-$ grep libc /proc/$$/maps
-7de3a0c00000-7de3a0c28000 r--p 00000000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
-7de3a0c28000-7de3a0db1000 r-xp 00028000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
-7de3a0db1000-7de3a0e00000 r--p 001b1000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
-7de3a0e00000-7de3a0e04000 r--p 001ff000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
-7de3a0e04000-7de3a0e06000 rw-p 00203000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
-```
-
-| Column | Meaning |
-| ------ | ------- |
-| `start-end` | Virtual range of one **VMA** (all below `0x7fff_ffff_ffff`, so user space) |
-| `r-xp` | Permissions + `p` private (copy-on-write) / `s` shared |
-| `00028000` | Offset in the file |
-| `fc:00`, `1061951` | Device (major:minor), inode |
-| path | Backing file, or `[heap]`, `[stack]`, `[vdso]`, blank = anonymous |
-
-One shared library → **one mapping per segment**: headers (`r--`), code `.text` (`r-x`), read-only data (`r--`), **RELRO** (`r--`, made read-only after linking), writable data `.data`/`.bss` (`rw-`). The code pages are **shared** physically by every process that uses libc. Only written pages get private copies.
-
-### `/proc/<pid>/maps` vs `/proc/<pid>/smaps`
-
-Both list the same VMAs, one per mapping, in the same order. `maps` gives one line per VMA: **where** things are mapped. `smaps` adds a block of counters under each line: **how much physical memory** each VMA actually uses.
-
-| | `maps` | `smaps` |
-| - | ------ | ------- |
-| Content | Range, perms, offset, dev, inode, path | Same header line + ~25 `Key: value kB` fields + `VmFlags` |
-| Answers | "What is mapped where?" | "How much RAM/swap does each mapping use, and is it shared?" |
-| Cost | Cheap | **Expensive**: walks the page tables of every VMA (`mmap_lock` held for read) |
-| Summary form | n/a | `/proc/<pid>/smaps_rollup`: all VMAs summed into one block (since 4.14) |
-
-Example `smaps` entry (libc code segment, values illustrative):
-
-```text
-7de3a0c28000-7de3a0db1000 r-xp 00028000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
-Size:               1572 kB    # virtual size of the VMA (end - start)
-KernelPageSize:        4 kB    # page size the kernel uses for this VMA
-MMUPageSize:           4 kB    # page size the MMU uses (differs only on some arches)
-Rss:                1024 kB    # resident: pages of this VMA currently in RAM
-Pss:                  52 kB    # proportional: each shared page divided by number of sharers
-Shared_Clean:       1024 kB    # resident, mapped by >1 process, not modified
-Shared_Dirty:          0 kB    # resident, mapped by >1 process, modified
-Private_Clean:         0 kB    # resident, only this process, not modified
-Private_Dirty:         0 kB    # resident, only this process, modified (true private cost)
-Referenced:         1024 kB    # pages recently accessed (accessed bit set)
-Anonymous:             0 kB    # pages not backed by a file (heap, stack, CoW copies)
-Swap:                  0 kB    # pages of this VMA currently swapped out
-Locked:                0 kB    # pages pinned in RAM by mlock()
-THPeligible:           0       # 1 if transparent huge pages could back this VMA
-VmFlags: rd ex mr mw me sd     # VMA flags: read, exec, may-read, may-write, may-exec, soft-dirty
-```
-
-Key memory metrics:
-
-| Metric | Definition | Use |
-| ------ | ---------- | --- |
-| **VSZ** / `Size` | Virtual size: everything mapped, touched or not | Almost meaningless for RAM use (demand paging) |
-| **RSS** / `Rss` | Resident pages, **shared pages counted in full** for every process | Summing RSS over processes **over-counts** shared libs |
-| **PSS** / `Pss` | Resident pages, each shared page divided by its number of mappers | Summing PSS over all processes ≈ real RAM used |
-| **USS** | `Private_Clean + Private_Dirty` | RAM freed if this process exits |
-
-- `Rss = Shared_Clean + Shared_Dirty + Private_Clean + Private_Dirty`.
-- "Shared" means *currently mapped by more than one process*, not "a `MAP_SHARED` mapping". A `MAP_SHARED` page only this process maps counts as `Private_*`.
-- Clean pages can be dropped and re-read from the file under memory pressure. Dirty anonymous pages can only go to swap.
-- `VmFlags` exposes `vm_area_struct->vm_flags` (e.g. `ht` = hugetlb, `lo` = locked, `dd` = don't dump, `sd` = soft-dirty).
-
-### `struct vm_area_struct` (the VMA)
-
-Each line of `/proc/<pid>/maps` is one **`struct vm_area_struct`** (`include/linux/mm_types.h`). It describes one contiguous virtual range with uniform permissions and one backing object. A process's VMAs hang off its **`struct mm_struct`** (`task->mm`), which also holds the page-table root (`mm->pgd`).
-
-```text
-task_struct ──mm──► mm_struct
-                     ├── pgd            page-table root (loaded into CR3 / TTBR0 on switch)
-                     ├── mm_mt          maple tree of VMAs, keyed by address (6.1+)
-                     ├── mmap_lock      rw_semaphore protecting the VMA tree
-                     └── map_count      number of VMAs
-                          │
-                          ▼
-            ┌─────────────┬─────────────┬─────────────┐
-            │ VMA         │ VMA         │ VMA         │ ... one per maps line
-            │ [text r-x]  │ [heap rw-]  │ [stack rw-] │
-            └──┬──────────┴─────────────┴─────────────┘
-               ├── vm_start / vm_end   [start, end): end is exclusive
-               ├── vm_flags            VM_READ|VM_EXEC|VM_SHARED|...
-               ├── vm_file + vm_pgoff  backing file and offset (in pages); NULL = anonymous
-               ├── anon_vma            reverse map for anonymous / CoW pages
-               └── vm_ops              ->fault(), ->open(), ->close() (set by driver mmap)
-```
-
-| Field | Meaning | `maps` column |
-| ----- | ------- | ------------- |
-| `vm_start`, `vm_end` | Range `[vm_start, vm_end)`, page-aligned | `start-end` |
-| `vm_flags` | `VM_READ`, `VM_WRITE`, `VM_EXEC`, `VM_SHARED`, `VM_GROWSDOWN`, `VM_LOCKED`, `VM_IO`, `VM_PFNMAP`... | perms + `p`/`s`; full set in `smaps` `VmFlags` |
-| `vm_page_prot` | Hardware PTE protection bits derived from `vm_flags` | n/a |
-| `vm_file`, `vm_pgoff` | Backing file and offset **in pages** | path, offset (bytes) |
-| `vm_mm` | Owning `mm_struct` | n/a |
-| `anon_vma` | Reverse-mapping anchor for anonymous pages | n/a |
-| `vm_ops` | Callbacks: `fault`, `open`, `close`, `page_mkwrite`... | n/a |
-| `vm_private_data` | Driver's private pointer | n/a |
-
-- **Lookup structure is version-dependent:** before 6.1 VMAs were in a red-black tree (`mm->mm_rb`) plus a sorted linked list (`vm_next`/`vm_prev`). Since **6.1** they are in a **maple tree** (`mm->mm_mt`), and `vm_next` no longer exists.
-- **Locking:** `mmap_lock` (renamed from `mmap_sem` in 5.8) protects the tree: read lock to walk it, write lock for `mmap()`/`munmap()`/`mprotect()`. Since 6.4, `CONFIG_PER_VMA_LOCK` lets page faults lock just one VMA instead.
-- `vm_flags` is `const` since 6.3. Change it with `vm_flags_set()` / `vm_flags_clear()`, not by assigning.
-- Adjacent VMAs with identical flags/backing get **merged**. `mprotect()` on part of a VMA **splits** it. Limit: `vm.max_map_count` (65530 by default).
-- Drivers meet VMAs in `file_operations.mmap(struct file *, struct vm_area_struct *)`: map memory with `remap_pfn_range()` or install `vm_ops->fault`.
-
-Walk the VMAs of the current process (kernel 6.1+; fragment, e.g. called from a module's init):
-
-```c
-#include <linux/mm.h>                         /* vm_area_struct, VMA_ITERATOR, for_each_vma */
-#include <linux/sched.h>                      /* current */
-#include <linux/printk.h>                     /* pr_info() */
-
-static void dump_vmas(void)                   /* print every VMA of the calling process */
-{
-	struct mm_struct *mm = current->mm;   /* address space of the current task */
-	struct vm_area_struct *vma;           /* cursor for the loop */
-	VMA_ITERATOR(vmi, mm, 0);             /* maple-tree iterator starting at address 0 */
-
-	if (!mm)                              /* kernel threads have no user address space */
-		return;                       /* nothing to walk */
-
-	mmap_read_lock(mm);                   /* stop VMAs changing while we walk; may sleep */
-	for_each_vma(vmi, vma)                /* visit each VMA in address order */
-		pr_info("%lx-%lx flags=%lx %s\n",            /* one line per VMA, like maps */
-			vma->vm_start, vma->vm_end,          /* range [start, end) */
-			vma->vm_flags,                       /* raw VM_* flags */
-			vma->vm_file ? "file" : "anon");     /* backed by a file or anonymous */
-	mmap_read_unlock(mm);                 /* release the read lock */
-}
-```
-
-For another task's `mm`, take a reference first with `get_task_mm()` and drop it with `mmput()`.
-
-### Maple trees
-
-The **maple tree** (`lib/maple_tree.c`, by Liam Howlett and Matthew Wilcox, merged in **6.1**) is an RCU-safe B-tree that stores **non-overlapping ranges** (`[first, last] → pointer`). Its first user is the VMA tree (`mm->mm_mt`).
-
-**Why it replaced the old scheme.** Before 6.1, each `mm` kept three structures in sync:
-
-| Before 6.1 | Problem | Since 6.1 |
-| ---------- | ------- | --------- |
-| Red-black tree `mm->mm_rb` (lookup) | Binary tree: deep, poor cache locality; not RCU-safe, so every fault needed `mmap_lock` | One **maple tree** `mm->mm_mt` does lookup **and** ordered iteration |
-| Linked list `vm_next`/`vm_prev` (iteration) | Extra pointers to keep consistent on every split/merge | Removed |
-| Per-thread `vmacache` (recent-lookup cache) | Invalidation complexity | Removed (tree is fast enough) |
-
-How it works:
-
-```text
-                    ┌──────────── node (256 B = 4 cache lines) ────────────┐
-                    │ pivot0 │ pivot1 │ pivot2 │ ... │ up to 16 slots       │
-                    └───┬────────┬────────┬────────────────────────────────┘
-                        ▼        ▼        ▼
-        [0, pivot0]  (pivot0, pivot1]  (pivot1, pivot2] ...   ranges, not single keys
-           leaf: slot = VMA pointer, or NULL for an unmapped gap
-```
-
-- **Wide, shallow B-tree:** up to 16 slots per node (10 in "allocation" nodes, which also record the biggest free gap below them). A few levels cover thousands of VMAs.
-- **Range keyed:** each slot covers an address range, and gaps are stored as `NULL` ranges. That makes "find a free gap of N bytes" (`get_unmapped_area()`) a tree search instead of a list walk.
-- **RCU-safe readers:** writers copy-on-write the nodes they change and publish them with RCU, so readers can walk without locks under `rcu_read_lock()`. This is what makes per-VMA locking for page faults possible (6.4, `CONFIG_PER_VMA_LOCK`).
-- **Writers still serialise:** with an internal spinlock, or an external lock (`mmap_lock` for the VMA tree).
-- **Pre-allocation:** writes may need new nodes, so `mmap()` paths pre-allocate (`mas_preallocate()`) before taking locks where allocation is not allowed.
-
-Two APIs:
-
-| API | Functions | Use |
-| --- | --------- | --- |
-| Normal (`mtree_*`) | `mtree_init()`, `mtree_store_range()`, `mtree_load()`, `mtree_erase()`, `mtree_destroy()`, `mt_for_each()` | Simple; handles locking internally |
-| Advanced (`mas_*`) | `MA_STATE()`, `mas_find()`, `mas_walk()`, `mas_store_gfp()`, `mas_preallocate()` | Caller holds the lock; keeps a cursor (`struct ma_state`) for fast repeated operations. `VMA_ITERATOR` wraps this |
-
-Minimal use of the normal API (fragment):
-
-```c
-#include <linux/maple_tree.h>                 /* maple tree API */
-#include <linux/printk.h>                     /* pr_info() */
-
-static DEFINE_MTREE(my_tree);                 /* static, empty maple tree with its own spinlock */
-
-static int maple_demo(void *obj)              /* store obj for range 100..199, then look it up */
-{
-	void *found;                          /* result of the lookup */
-	int ret;                              /* return code */
-
-	ret = mtree_store_range(&my_tree, 100, 199, obj, GFP_KERNEL); /* map [100, 199] -> obj; may sleep */
-	if (ret)                              /* -ENOMEM or -EINVAL */
-		return ret;                   /* pass the error up */
-
-	found = mtree_load(&my_tree, 150);    /* any index in the range returns obj (RCU-safe read) */
-	pr_info("150 -> %p\n", found);        /* prints obj's address */
-
-	mtree_destroy(&my_tree);              /* free all tree nodes (not the stored objects) */
-	return 0;                             /* success */
-}
-```
-
-Other users in 6.12 (checked with `git grep maple_tree.h`): sparse IRQ descriptors (`kernel/irq/irqdesc.c`) and the regmap register cache (`drivers/base/regmap/regcache-maple.c`). Slot counts are for 64-bit. 32-bit kernels use 32 and 21 (`include/linux/maple_tree.h`).
-
-### From VMAs to physical memory: page tables
-
-VMAs say what *should* be mapped. The **page tables** say what *is* mapped: a per-`mm` tree that turns a virtual address into a physical one (§11 shows the bit split). The MMU walks it in hardware, and the **TLB** caches the results.
-
-| | Register holding the page-table root (a **physical** address) |
-| --- | --- |
-| x86_64 | `CR3`: one root per process (`mm->pgd`). The kernel half is the same in every process's tables. Rewritten on context switch. |
-| ARM64 | `TTBR0_EL1`: user half (per process, switched). `TTBR1_EL1`: kernel half (the same for every process). |
-
-*Raw notes said `TTBR[0/1]_EL0`; the registers are `TTBR0_EL1` / `TTBR1_EL1`. EL0 (user mode) cannot set its own page tables.*
-
-- **Even the kernel uses only virtual addresses** once the MMU is on. To reach RAM it maps it: all of RAM is mapped linearly at `PAGE_OFFSET` (the **direct map**, `__va()`/`__pa()`). Device registers are mapped on demand with `ioremap()`.
-- **Kernel memory is never swapped:** it behaves as if `mlock()`ed. (Page cache and user pages, by contrast, can be reclaimed.)
-- **Naming anonymous VMAs (5.17+):** `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, addr, len, "name")` makes the VMA show as `[anon:name]` in `maps` (`CONFIG_ANON_VMA_NAME`; Android uses it for its heaps). *Raw notes wrote `PP_SET_VMA`.*
-
-### Where the kernel's own memory shows up
-
-`maps` shows only user mappings. Kernel memory usage is in **`/proc/meminfo`**:
-
-| Field | Meaning |
-| ----- | ------- |
-| `Slab` | Kernel object caches (`kmalloc`, dentries, inodes) |
-| `KernelStack` | Kernel stacks of all threads |
-| `PageTables` | Memory used by page tables |
-| `VmallocUsed` | `vmalloc()` area in use |
-| `Percpu` | Per-CPU allocations |
-
-### Key APIs / structures
-
-| Symbol | Header | Purpose | Context |
-| ------ | ------ | ------- | ------- |
-| `copy_from_user()` / `copy_to_user()` | `<linux/uaccess.h>` | Safe user ↔ kernel copy; returns bytes **not** copied | Process context, **may sleep** |
-| `access_ok()` | `<linux/uaccess.h>` | Range lies below the user limit (does not check that it is mapped) | Process context |
-| `__user` | `<linux/compiler_types.h>` | `sparse` annotation for user pointers | n/a |
-| `TASK_SIZE` | `<asm/processor.h>` | Top of user space for `current` | Any |
-| `PAGE_OFFSET` | `<asm/page.h>` | Start of the kernel's direct map of RAM | Any |
-| `struct vm_area_struct` | `<linux/mm_types.h>` | One VMA: range, flags, backing file, `vm_ops` | n/a |
-| `mmap_read_lock()` / `mmap_write_lock()` | `<linux/mmap_lock.h>` | Lock an `mm`'s VMA tree | Process context, **may sleep** |
-| `vma_lookup(mm, addr)` | `<linux/mm.h>` | VMA **containing** `addr`, or `NULL` | `mmap_lock` held |
-| `find_vma(mm, addr)` | `<linux/mm.h>` | First VMA with `vm_end > addr` (may start **above** `addr`) | `mmap_lock` held |
-| `VMA_ITERATOR()` / `for_each_vma()` | `<linux/mm.h>` | Iterate VMAs (6.1+, maple tree) | `mmap_lock` held |
-| `get_task_mm()` / `mmput()` | `<linux/sched/mm.h>` | Take / drop a reference on another task's `mm` | Process context; `mmput()` may sleep |
-
-### Commands / debugging
-
-```sh
-cat /proc/$$/maps                       # layout of the current shell ($$ = shell's PID)
-cat /proc/$$/smaps                      # same VMAs, plus per-VMA Rss/Pss/Swap/flags counters
-cat /proc/$$/smaps_rollup               # all VMAs summed: total Rss/Pss/Swap for the process
-awk '/^Pss:/ {s += $2} END {print s " kB"}' /proc/$$/smaps   # add up PSS by hand (same as rollup)
-pmap -X $$                              # smaps as a table (procps); pmap -x = Rss/Dirty only
-grep -m1 'address sizes' /proc/cpuinfo  # physical/virtual address bits the CPU supports
-grep -o la57 /proc/cpuinfo | head -1    # prints la57 if the CPU supports 5-level paging (x86)
-grep -E 'X86_5LEVEL|ARM64_VA_BITS|PGTABLE_LEVELS' /boot/config-$(uname -r)   # paging config
-cat /proc/meminfo                       # system-wide memory, including kernel usage
-sudo slabtop -o | head -15              # biggest kernel slab caches
-sysctl vm.mmap_min_addr                 # lowest address user space may map (65536)
-```
-
-### Pitfalls
-
-- Dereferencing a `__user` pointer directly: a bug even when it "works". **SMAP** (x86) / **PAN** (ARM64) make it fault. Catch it with `sparse` (`make C=1`).
-- Calling `copy_*_user()` with a spinlock held or in interrupt context: it may sleep on a page fault.
-- Assuming user addresses always fit in 47 bits (breaks under 5-level paging).
-- Using `find_vma()` as "the VMA containing `addr`": it returns the next VMA above if `addr` is in a gap. Check `vma->vm_start <= addr`, or use `vma_lookup()`.
-- Walking VMAs without `mmap_lock`, or keeping a `vma` pointer after unlocking: it can be split, merged or freed (use-after-free).
-- Old code using `vma->vm_next` or `mm->mmap` does not compile on 6.1+. Use `for_each_vma()`.
-
-### Corrections to raw notes
-
-| Raw notes said | Correct |
-| -------------- | ------- |
-| User space is "commonly 37–40 bits" | The range written next to it (`0x0`–`0x7fff_ffff_ffff`) is **47 bits** (x86_64). 39 bits is used on some ARM64/Android configs. |
-| Kernel space at `0xfffffff?????` | Starts at `0xffff_8000_0000_0000` (x86_64, 4-level). The kernel **image** is at `0xffffffff8…`. |
-| `mmap` claims a physical page and maps it | `mmap()` only creates the **VMA**. Pages are allocated lazily on first access, unless `MAP_POPULATE`/`mlock()` is used. |
-| `p` = `MAP_SHARED`, explicitly shared; `p` = `MAP_PRIVATE` | **`s`** = `MAP_SHARED` (writes visible to others and to the file); **`p`** = `MAP_PRIVATE` (copy-on-write: shared until written). |
-| Maple tree for `mm_struct` "in Linux 6.0" | Merged in **6.1**. |
-| `mm_struct` is "the link to the physical pages" | More precisely: `mm->pgd` is the page-table root, loaded into `CR3` / `TTBR0_EL1` on context switch. |
-
-### Revision questions
-
-1. On x86_64 with 4-level paging, what are the user and kernel ranges, and what happens if you access `0x0000_8000_0000_0000`?
-2. Why can't a driver `memcpy()` from a pointer passed in an `ioctl()` argument?
-3. The test box has `CONFIG_X86_5LEVEL=y`. Why is its user space still 47 bits?
-4. A program `mmap()`s 1 GiB and `MemFree` barely changes. Why?
-5. Ten processes each show 10 MiB RSS, mostly libc. Is 100 MiB of RAM in use? Which `smaps` field gives a fair total?
-6. What does one line of `/proc/<pid>/maps` correspond to in the kernel, how are these stored in 6.x, and what lock must you hold to walk them?
-7. Give two reasons the maple tree replaced the VMA rbtree + linked list.
-
-<details>
-<summary>Answers</summary>
-
-1. User `0x0`–`0x0000_7fff_ffff_ffff`, kernel `0xffff_8000_0000_0000`–`0xffff_ffff_ffff_ffff`. `0x0000_8000_0000_0000` is non-canonical, so the CPU raises a general-protection fault (SIGSEGV in user space, an oops in the kernel).
-2. It is a user virtual address. It may be unmapped, paged out or malicious (pointing into the kernel), and SMAP/PAN block direct access. `copy_from_user()` validates the range and handles faults.
-3. The CPU also needs `la57`. Without it the kernel falls back to 4-level paging at boot. Even with it, addresses above 47 bits are only handed out when requested via an `mmap()` hint.
-4. `mmap()` only creates a VMA. Pages are allocated on first touch (demand paging).
-5. No. RSS counts every shared page in full in every process, so libc's pages are counted ten times. `Pss` divides each shared page among its mappers, so summing `Pss` (e.g. from `smaps_rollup`) across processes approximates the real total.
-6. One `struct vm_area_struct`. Since 6.1 they live in a maple tree in `mm_struct` (`mm->mm_mt`), replacing the rbtree + linked list. Hold `mmap_read_lock(mm)` while walking with `for_each_vma()`.
-7. (a) One wide, cache-friendly B-tree does both lookup and ordered iteration, so the rbtree, list and `vmacache` no longer have to be kept in sync. (b) Readers are RCU-safe, which enables lockless lookups and per-VMA locking for page faults. Bonus: free gaps are stored in the tree, which speeds up `get_unmapped_area()`.
-
-</details>
-
-### Source pointers
-
-- `Documentation/arch/x86/x86_64/mm.rst`, `Documentation/arch/x86/x86_64/5level-paging.rst`, `Documentation/arch/arm64/memory.rst`
-- `arch/x86/include/asm/page_64_types.h` (`TASK_SIZE_MAX`), `include/linux/uaccess.h`
-- `mm/memory.c` (`handle_mm_fault()`), `arch/x86/mm/fault.c` (`exc_page_fault()`), `mm/mmap.c` (VMA create/merge/split), `mm/vma.c` (VMA operations, 6.12)
-- `include/linux/mm_types.h` (`struct vm_area_struct`, `struct mm_struct`), `include/linux/mmap_lock.h`, `lib/maple_tree.c`, `Documentation/core-api/maple_tree.rst`, `Documentation/mm/process_addrs.rst`
-- `Documentation/filesystems/proc.rst` (`maps`, `meminfo`)
-
----
-
-## 4. vDSO and vsyscall: Kernel Code Mapped into User Space
-
-> **Remember**
->
-> - The **vDSO** is a small ELF shared library **supplied by the kernel** and mapped into every process as `[vdso]`, with a data page `[vvar]`.
-> - It lets hot, read-only calls (`clock_gettime`, `gettimeofday`, `time`, `getcpu`) run **without entering the kernel**, which avoids a mode switch.
-> - How it works: the kernel keeps the time data in `[vvar]` up to date, and the vDSO code reads that data plus the CPU counter, entirely in user mode.
-> - **vsyscall** is the legacy x86_64 version at a **fixed** address (`0xffffffffff600000`). It is now emulated, because a fixed address helps exploits.
-> - Real x86_64 syscalls use the **`syscall`** instruction with the number in `rax` (`read` = 0).
-> - `strace` cannot see vDSO calls, because no syscall happens.
-
-### How a call reaches the vDSO
-
-```text
-app: gettimeofday(&tv)                    app: getpid()
-   └─> glibc wrapper                         └─> glibc wrapper
-         └─> [vdso] __vdso_gettimeofday           └─> syscall instruction ─> kernel entry ─> sys_getpid
-               reads [vvar] + rdtsc                     (mode switch, ~100 ns+)
-               (user mode only)
-```
-
-- The kernel passes the vDSO address in the auxiliary vector (`AT_SYSINFO_EHDR`). glibc finds it there and binds these functions to it automatically.
-- The vDSO's position is randomised by ASLR. It appears in `ldd` output as `linux-vdso.so.1`, but there is **no file on disk**.
-
-| Machine | vDSO exports |
-| ------- | ------------ |
-| Test box (x86_64, 6.8) | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `getcpu`, `sgx_enter_enclave` |
-| Pi 5 (arm64, 6.12) | `clock_gettime`, `clock_getres`, `gettimeofday`, `getrandom` (6.11+), signal-return trampoline |
-
-### vsyscall (legacy, x86_64 only)
-
-- A page at the fixed address `0xffffffffff600000` providing `gettimeofday`, `time` and `getcpu`. Its fixed, executable address defeats ASLR, so it was replaced by the vDSO.
-- It is kept only for very old static binaries. It is **emulated**: the page is execute-only (`--xp`), and a call traps into the kernel, which does a real syscall. Boot option: `vsyscall=xonly|emulate|none`.
-
-### x86 system-call entry instructions
-
-| Instruction | Where | Notes |
-| ----------- | ----- | ----- |
-| `int 0x80` | 32-bit x86 | Original software-interrupt gate; slowest |
-| `sysenter` / `sysexit` | 32-bit mode | Fast entry, Pentium II onwards |
-| **`syscall` / `sysret`** | **All x86_64** | **The modern 64-bit instruction** |
-
-On 32-bit x86, the vDSO (`linux-gate.so.1`) supplies `__kernel_vsyscall`, which picks the fastest instruction the CPU supports: the "syscall gate".
-
-### Commands / debugging
-
-```sh
-grep -E 'vdso|vvar|vsyscall' /proc/self/maps   # where the kernel-supplied pages are mapped
-LD_SHOW_AUXV=1 /bin/true | grep SYSINFO        # AT_SYSINFO_EHDR = vDSO address passed by the kernel
-ldd /bin/ls | grep vdso                        # linux-vdso.so.1: listed, but no file on disk
-strace -e trace=clock_gettime date             # no clock_gettime syscall shown: served by the vDSO
-cat /sys/devices/system/clocksource/clocksource0/current_clocksource   # tsc = vDSO fast path works
-```
-
-### Pitfalls
-
-- `strace` does not show vDSO calls. Use `ltrace` or `perf` / uprobes instead.
-- If the clocksource cannot be read from user space (e.g. an unstable TSC in a VM), the vDSO falls back to a real syscall and loses its speed advantage.
-- `vsyscall=none` breaks very old static binaries.
-
-### Corrections to raw notes
-
-| Raw notes said | Correct |
-| -------------- | ------- |
-| `memset` is a vDSO function | It is **not** in either vDSO. CPU-optimised `memset` comes from glibc (IFUNC, chosen at load time) or, in the kernel, from **alternatives** patched at boot. **⚠️ Verify.** |
-| vsyscall "syscall gate used in Intel only" | vsyscall is **x86_64-specific** (Intel and AMD). The "syscall gate" is the 32-bit vDSO's `__kernel_vsyscall`. |
-| vsyscall wraps **all** syscalls, picking `int`/`syscall`/`sysenter`; `sysenter` is the modern one | Picking the instruction is `__kernel_vsyscall` in the 32-bit vDSO. The x86_64 vsyscall page only ever had 3 functions. Normal syscalls go through glibc, which executes `syscall` directly. On x86_64 **`syscall`** is the modern instruction. **⚠️ Verify.** |
-| `read` is syscall 3 | 3 on **i386**; **0** on x86_64 (`arch/x86/entry/syscalls/syscall_64.tbl`) |
-
-### Revision questions
-
-1. Why is `clock_gettime()` cheaper than `getpid()`?
-2. Why was vsyscall replaced by the vDSO?
-3. Does the vDSO appear in `ldd` output? Is there a file for it on disk?
-
-<details>
-<summary>Answers</summary>
-
-1. The vDSO serves `clock_gettime()` by reading `[vvar]` and the CPU counter in user mode, with no syscall. `getpid()` is a real syscall.
-2. vsyscall sits at a fixed, executable address in every process, which defeats ASLR and gives exploits useful gadgets. The vDSO is at a randomised address and can be extended with new functions.
-3. Yes, as `linux-vdso.so.1`. There is no file: the image is built into the kernel and mapped at `exec()`.
-
-</details>
-
-### Source pointers
-
-- `arch/x86/entry/vdso/`, `arch/x86/entry/vsyscall/vsyscall_64.c`, `arch/arm64/kernel/vdso/`
-- `lib/vdso/gettimeofday.c` (generic vDSO time code), `man 7 vdso`
-
----
-
-## 5. The First Processes: PID 0, PID 1 (`init`) and PID 2 (`kthreadd`)
+*Builds on: §3 (boot hands over to PID 1). The code examples are modules: see §6.*
 
 > **Remember**
 >
@@ -1002,7 +655,7 @@ sudo grep -w task_struct /proc/slabinfo          # slab cache for task_structs: 
 | `for_each_thread(p, t)` | Every thread `t` of process `p` | `<linux/sched/signal.h>` |
 | `for_each_process_thread(p, t)` | Every thread in the system (nested loop) | `<linux/sched/signal.h>` |
 
-**Locking:** the list changes as tasks fork and exit, so walk it inside `rcu_read_lock()` / `rcu_read_unlock()` (readers; may not sleep, §12). Use `read_lock(&tasklist_lock)` only if you need the list to be stable. To keep using a task after the walk, take a reference with `get_task_struct()` and drop it with `put_task_struct()`. `while_each_thread()` is deprecated: use `for_each_thread()`.
+**Locking:** the list changes as tasks fork and exit, so walk it inside `rcu_read_lock()` / `rcu_read_unlock()` (readers; may not sleep, §14). Use `read_lock(&tasklist_lock)` only if you need the list to be stable. To keep using a task after the walk, take a reference with `get_task_struct()` and drop it with `put_task_struct()`. `while_each_thread()` is deprecated: use `for_each_thread()`.
 
 ```c
 #include <linux/sched/signal.h>	/* for_each_process(), for_each_thread() */
@@ -1158,7 +811,9 @@ pstree -p 1 | head                   # user-space process tree under systemd
 
 ---
 
-## 6. Kernel Headers: In-Tree, Module-Build and UAPI
+## 5. Kernel Headers: In-Tree, Module-Build and UAPI
+
+*Builds on: §2 (distro vs mainline kernels).*
 
 > **Remember**
 >
@@ -1194,7 +849,7 @@ pstree -p 1 | head                   # user-space process tree under systemd
 ~/Advanced_Linux_Kernel_Course/linux7.2/  full source 7.2.8
 ```
 
-Both the `-139` (running) and `-142` (installed) header sets are present. Use `-139` until you reboot (§1).
+Both the `-139` (running) and `-142` (installed) header sets are present. Use `-139` until you reboot (§3).
 
 ### Kernel source tree: top-level directories
 
@@ -1263,7 +918,9 @@ grep -rn 'EXPORT_SYMBOL' kernel/kthread.c | head        # which functions module
 
 ---
 
-## 7. Loadable Kernel Modules (LKMs)
+## 6. Loadable Kernel Modules (LKMs)
+
+*Builds on: §1 (one shared kernel space), §5 (headers).*
 
 > **Remember**
 >
@@ -1285,7 +942,7 @@ hello.c ──Kbuild (make -C /lib/modules/$(uname -r)/build M=$PWD)──> hell
    (modpost checks imports against Module.symvers, adds vermagic + .modinfo)
 
 insmod hello.ko / modprobe hello
-   └─> finit_module() syscall   (needs CAP_SYS_MODULE, §8)
+   └─> finit_module() syscall   (needs CAP_SYS_MODULE, §7)
          ├─ check signature (CONFIG_MODULE_SIG), vermagic, symbol CRCs (modversions)
          ├─ allocate memory, relocate, resolve symbols against exports
          ├─ apply module_param values
@@ -1486,7 +1143,7 @@ Test box: 94 loaded modules, but 219 entries in `/sys/module/`, because of built
 | `panic`, `panic_on_oops` | Reboot N s after a panic; turn an oops into a panic |
 | `pid_max`, `threads-max` | Upper limits for PIDs and threads |
 | `sysrq` | Which magic SysRq functions are allowed |
-| `yama/ptrace_scope` | ptrace restriction level (§10) |
+| `yama/ptrace_scope` | ptrace restriction level (§17) |
 
 **`modules_disabled`:**
 
@@ -1565,9 +1222,11 @@ objcopy -O binary -j .modinfo hello.ko /dev/stdout | tr '\0' '\n'   # dump the r
 
 ---
 
-## 8. Linux Capabilities
+## 7. Linux Capabilities
 
-*Interpreted as **Linux (POSIX) capabilities** (`CAP_*`). **⚠️ Verify**: the raw notes said "kernel capabilities and where to find them". If that meant kernel features/config options, see `/boot/config-$(uname -r)` (§1).*
+*Builds on: §6 (loading modules needs `CAP_SYS_MODULE`).*
+
+*Interpreted as **Linux (POSIX) capabilities** (`CAP_*`). **⚠️ Verify**: the raw notes said "kernel capabilities and where to find them". If that meant kernel features/config options, see `/boot/config-$(uname -r)` (§3).*
 
 > **Remember**
 >
@@ -1599,8 +1258,8 @@ objcopy -O binary -j .modinfo hello.ko /dev/stdout | tr '\0' '\n'   # dump the r
 
 | Capability | # | Grants | Section |
 | ---------- | - | ------ | ------- |
-| `CAP_SYS_MODULE` | 16 | Load/unload modules | §7 |
-| `CAP_SYSLOG` | 34 | Real kernel addresses when `kptr_restrict=1`; `dmesg` when `dmesg_restrict=1` | §1 |
+| `CAP_SYS_MODULE` | 16 | Load/unload modules | §6 |
+| `CAP_SYSLOG` | 34 | Real kernel addresses when `kptr_restrict=1`; `dmesg` when `dmesg_restrict=1` | §3 |
 | `CAP_NET_RAW` | 13 | Raw/packet sockets (`ping`) | |
 | `CAP_NET_ADMIN` | 12 | Network configuration | |
 | `CAP_NET_BIND_SERVICE` | 10 | Bind ports < 1024 | |
@@ -1678,414 +1337,515 @@ sudo setcap cap_net_bind_service=ep ./srv # give a binary one capability (ask fi
 
 ---
 
-## 9. Kernel Architecture: Monolithic vs Microkernel
+## 8. Virtual Address Space: User/Kernel Split
+
+*Builds on: §1 (kernel space is shared by all processes).*
 
 > **Remember**
 >
-> - Linux is a **monolithic kernel**: system calls, the scheduler, memory management, filesystems, networking and drivers all run in **one address space** (kernel space, the high half: `0xffff_8…` on x86_64), in kernel mode, and call each other as **ordinary functions**.
-> - A **microkernel** keeps only the minimum (IPC, scheduling, basic memory management) in kernel mode. Filesystems and drivers run as **user-space servers** that talk by **message passing**.
-> - Monolithic = **fast** (a function call, no IPC or context switch) but **no isolation**: one bad driver or module can corrupt or crash the whole kernel.
-> - Linux is **monolithic but modular**: modules (§7) are loaded into the same single address space, with the same full privileges.
+> - Every process has its own **virtual address space**: **user space** in the low half (private), **kernel space** in the high half (shared by all processes, kernel mode only).
+> - x86_64 with 4-level paging: user `0x0000_0000_0000_0000`–`0x0000_7fff_ffff_ffff` (**47 bits, 128 TiB**); kernel from `0xffff_8000_0000_0000`. The gap in between is **non-canonical** and faults.
+> - An address works only if it is **mapped** (a page-table entry points to a physical page). Otherwise the CPU raises a **page fault**.
+> - `mmap()` creates only a **VMA** (a reserved range). Physical pages are allocated **on first touch** (**demand paging**).
+> - Kernel code must **never** dereference a user pointer. Use `copy_from_user()` / `copy_to_user()`.
 
 ### Overview
 
-The kernel architecture decides where OS services run and how they communicate. Linux keeps everything in one privileged address space for performance. This is why a module bug is a kernel bug, and why kernel code must never trust or directly dereference user pointers (§3).
+The number of usable address bits depends on the **architecture and the number of page-table levels**, not on installed RAM. 128 TiB of user space does not need 128 TiB of RAM.
 
-### How it works
-
-```text
-        MONOLITHIC (Linux)                       MICROKERNEL (QNX, seL4, MINIX 3)
- ┌──────────────────────────────┐         ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
- │ user space: apps, libc       │         │ app  │ │ FS   │ │ net  │ │driver│  user space
- │ 0x0000… – 0x0000_7fff_ffff…  │         │      │ │server│ │server│ │server│  (servers)
- ├──────── syscall ─────────────┤         └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘
- │ kernel space: 0xffff_8000_…  │            └── IPC messages ─┴────────┘
- │  syscalls  sched  mm  VFS/FS │         ┌──────────────────────────────────┐
- │  net stack  drivers  modules │         │ microkernel: IPC, sched, basic mm│  kernel mode
- │  (all direct function calls) │         └──────────────────────────────────┘
- └──────────────────────────────┘
-```
-
-| Design | Examples | In kernel mode | Communication | Trade-off |
-| ------ | -------- | -------------- | ------------- | --------- |
-| **Monolithic** | Linux, FreeBSD | Everything | Direct function calls | Fast; one bug can take down everything |
-| **Microkernel** | QNX, seL4, MINIX 3, L4 | IPC, scheduling, basic mm | Message passing (IPC) | Isolation and restartable servers; IPC overhead |
-| **Hybrid** | Windows NT, macOS XNU | Most services, microkernel-style structure | Mostly direct calls | A compromise; in practice close to monolithic |
-
-- On x86_64 with 4-level paging, user space is `0x0000_0000_0000_0000`–`0x0000_7fff_ffff_ffff` and kernel space starts at `0xffff_8000_0000_0000` (§3).
-- Each half is **2^47 bytes = 128 TiB**. *Raw notes said user space is O(2^27); correct is 2^47 (2^27 would be only 128 MiB).*
-- Everything between the two halves (the **non-canonical hole**, almost all of the 2^64 range) is **unaddressable**: any access raises a general-protection fault (#GP). The CPU implements only 48 virtual-address bits, and bits 63–48 must copy bit 47. With 5-level paging (`la57`), there are 57 bits and each half grows to 2^56 = 64 PiB.
-- Linux still moves *some* work to user space where it helps: FUSE filesystems, UIO/VFIO user-space drivers, and eBPF programs (verified, sandboxed code run *in* the kernel).
-- Historical note: the 1992 **Tanenbaum–Torvalds debate** (MINIX microkernel vs Linux monolithic).
-
-### Commands / debugging
-
-```bash
-sudo grep -c ' [tT] ' /proc/kallsyms          # count kernel text (function) symbols: all subsystems share one symbol table
-sudo grep -w -e vfs_read -e tcp_sendmsg -e schedule /proc/kallsyms  # FS, network and scheduler functions side by side in kernel space
-cat /proc/filesystems                          # filesystems the kernel supports, all inside the kernel itself
-lsmod | head                                   # modules loaded into the same kernel address space
-```
-
-### Pitfalls
-
-- "Modular" does not mean "isolated": a loaded module has the same privileges as the rest of the kernel. A NULL dereference in a module can oops the whole kernel.
-- Microkernel does not mean "small Linux". It is a different design with different trade-offs, not just a Linux with fewer drivers.
-
-### Revision questions
-
-1. What makes Linux a monolithic kernel, and why is that fast?
-2. Why does a bug in a loaded module crash the whole system, when a bug in a microkernel's filesystem server might not?
-3. Give one way Linux runs driver or filesystem code in user space.
-
-<details>
-<summary>Answers</summary>
-
-1. All kernel services share one privileged address space and call each other directly, so there is no IPC or context switch between subsystems.
-2. The module runs in the same kernel address space with full privileges, so it can corrupt any kernel data. A microkernel server is a separate user-space process that can be killed and restarted.
-3. FUSE (filesystems) or UIO/VFIO (drivers).
-
-</details>
-
-### Source pointers
-
-- `init/main.c` (`start_kernel()` sets up every subsystem in one image), `kernel/`, `mm/`, `fs/`, `net/`, `drivers/`
-- `Documentation/filesystems/fuse.rst`, `Documentation/driver-api/uio-howto.rst`
-
----
-
-## 10. Tracing: ftrace, kprobes, `trace_marker` and ptrace
-
-> **Remember**
->
-> - **ftrace** is the kernel's built-in tracer. It writes events into a per-CPU **ring buffer** and is controlled through **tracefs** at `/sys/kernel/tracing`. Pick a tracer by writing to `current_tracer`: `function` (every kernel function call) or `function_graph` (entry + exit, call tree, durations).
-> - A **kprobe** dynamically instruments (almost) **any kernel instruction** at run time, with no recompile or reboot. It works by patching in a breakpoint (`int3` on x86, `BRK` on ARM64), or a jump when optimised. A **kretprobe** fires on function **return**.
-> - kprobes can be used three ways: from a **module** (`register_kprobe()`, GPL-only), from **tracefs** (`kprobe_events`, no code), or from **eBPF** (`bpftrace -e 'kprobe:…'`).
-> - kprobe handlers run in **atomic context**: they must not sleep and must be fast.
-> - **`trace_marker`** lets **user space** write text into the same ftrace ring buffer, so app events get **accurate kernel timestamps** and appear interleaved with kernel events on one timeline. Android's **atrace** (`ATRACE_BEGIN/END`, used by systrace/Perfetto) is built on it: user-mode events piggybacking on kernel tracing.
-> - **`ptrace()`** is the system call one process uses to trace/debug another (stop it, read/write its memory and registers, stop at each syscall). **gdb** and **strace** are built on it. It is a *different mechanism* from ftrace: per-process, stop-based and slow.
-
-### Overview
-
-Tracing answers "what is the kernel actually doing, and when?" without a debugger stopping the system. Static **tracepoints** are fixed hooks compiled into the source. **kprobes** add dynamic hooks wherever you need them. `trace_marker` joins the user-space view to the kernel timeline, so you can correlate "the app started drawing a frame" with "the scheduler preempted it".
-
-### Tracing, profiling, hooking, and the BPF lineage
-
-| Term | Meaning |
-| ---- | ------- |
-| **Tracing** | Record events in a flow (which functions ran, in what order, with what arguments) |
-| **Profiling** | "Gentle" tracing for performance: time spent per function, or statistical sampling (`perf record`) |
-| **Hooking** | Insert a detour so a call runs your code. It may change or skip the original (kprobes can change registers; livepatch/ftrace can redirect functions) |
-
-**BPF lineage:**
-
-| Step | Year / kernel | What |
-| ---- | ------------- | ---- |
-| Classic **BPF** (cBPF) | 1992 (McCanne & Van Jacobson) | Small register-based bytecode VM to filter packets **in the kernel** (what `tcpdump` compiles filters into) |
-| **seccomp-bpf** | 3.5 | cBPF program attached to a process that inspects each **syscall number and arguments**: allow, deny (`EPERM`), kill or trap. Used by Chrome, Android (zygote), systemd, Docker/Podman sandboxing |
-| **eBPF** | 3.18 (`bpf()` syscall), 4.1 (attach to kprobes) | 64-bit "extended" bytecode with maps and helper functions, checked by the **verifier** and JIT-compiled. The kernel provides the hook (kprobe, uprobe, tracepoint, XDP, LSM...); **you** supply the handler from user space, with no module needed. *Raw notes said "4.0-ish".* |
-
-- **tracefs** (`/sys/kernel/tracing`): ftrace control files. **debugfs** (`/sys/kernel/debug`): free-form debug files any driver can create (`debugfs_create_file()`); not an ABI, root only. tracefs used to live at `/sys/kernel/debug/tracing` and is still auto-mounted there.
-- *Raw notes said "to enable probes, kernel text has to be RWX at some point". With `CONFIG_STRICT_KERNEL_RWX`, text is never writable *and* executable. kprobes/ftrace patch it through a temporary writable alias mapping (`text_poke()`) while the text itself stays read-only + executable. Run-time patching is still a sensitive capability, which is why loading probes needs root / `CAP_BPF` + `CAP_PERFMON`.*
-
-### ftrace tracers
-
-ftrace has two parts: **tracers** (one active at a time, chosen via `current_tracer`) and **events** (tracepoints, kprobe events, markers: enabled independently).
-
-| Tracer | What it records | Config (all `=y` on the test box) |
-| ------ | --------------- | ------ |
-| `nop` | Nothing (default); events still work | n/a |
-| `function` | Every kernel function entry, with its caller | `CONFIG_FUNCTION_TRACER` |
-| `function_graph` | Entry **and** exit: an indented call tree with per-function duration | `CONFIG_FUNCTION_GRAPH_TRACER` |
-| `wakeup`, `wakeup_rt` | Worst-case wake-up latency | `CONFIG_SCHED_TRACER` |
-| `irqsoff`, `preemptoff` | Longest time with IRQs / preemption disabled | `CONFIG_IRQSOFF_TRACER`, `CONFIG_PREEMPT_TRACER` |
-
-- **How `function` tracing is nearly free when off:** the compiler inserts a call to `__fentry__` at the start of every function (`-pg -mfentry`). With `CONFIG_DYNAMIC_FTRACE`, the kernel patches these into **NOPs** at boot and only patches the ones you select back into calls.
-- **Always filter.** Tracing every function produces millions of lines per second. Use `set_ftrace_filter` (functions to trace), `set_graph_function` (roots for `function_graph`) and `set_ftrace_pid`.
-- `trace-cmd` is the command-line front end; KernelShark visualises its output.
-
-```bash
-cd /sys/kernel/tracing                          # tracefs control directory (root; ask first on the test box)
-cat available_tracers                           # tracers built into this kernel
-echo do_sys_openat2 > set_graph_function        # graph only calls made beneath do_sys_openat2
-echo function_graph > current_tracer            # select the function_graph tracer
-echo 1 > tracing_on                             # start recording
-cat /etc/hostname > /dev/null                   # do something that opens a file
-echo 0 > tracing_on                             # stop recording
-head -40 trace                                  # view the call tree with durations
-echo nop > current_tracer                       # switch tracing off again
-echo > set_graph_function                       # clear the filter
-sudo trace-cmd record -p function_graph -g do_sys_openat2 cat /etc/hostname   # same thing via trace-cmd
-sudo trace-cmd report | head -40                                              # print the recorded trace
-```
-
-Example `function_graph` output (shape):
+### Layout (x86_64, 4-level paging)
 
 ```text
- 1)               |  do_sys_openat2() {
- 1)               |    getname() {
- 1)   0.912 us    |      kmem_cache_alloc();
- 1)   1.803 us    |    }
- 1) + 12.345 us   |  }
+0xffff_ffff_ffff_ffff ┌────────────────────────────┐
+                      │ kernel space (128 TiB)     │  direct map, vmalloc, vmemmap,
+                      │ shared by all processes    │  kernel text (0xffffffff8…)
+0xffff_8000_0000_0000 ├────────────────────────────┤
+                      │ non-canonical hole         │  access → #GP fault
+0x0000_7fff_ffff_ffff ├────────────────────────────┤  ← TASK_SIZE
+                      │ user space (128 TiB)       │  stack (top), mmap/libs,
+                      │ per process                │  heap, text (bottom)
+0x0000_0000_0000_0000 └────────────────────────────┘
 ```
 
-### How it works: kprobes
+| Architecture / config | User space |
+| --------------------- | ---------- |
+| x86 32-bit | 3 GiB (classic **3G/1G split**, kernel at `0xc0000000`) |
+| **x86_64, 4-level (default)** | **128 TiB (47 bits)** |
+| x86_64, 5-level (`CONFIG_X86_5LEVEL` + CPU flag `la57`) | Up to 64 PiB (56 bits); addresses above 47 bits only if requested via an `mmap()` hint |
+| ARM64 (`CONFIG_ARM64_VA_BITS` = 39/47/48/52) | 2^VA_BITS; separate page-table roots for user (`TTBR0_EL1`) and kernel (`TTBR1_EL1`) |
+
+- **Test box:** `CONFIG_X86_5LEVEL=y`, but the vCPU lacks `la57`, so it runs **4-level**: 47-bit user space.
+- **Pi 5:** `ARM64_VA_BITS=47`, 16 KiB pages, 128 TiB user space.
+
+### Mapped vs unmapped (key term)
+
+A virtual page is usable only if it is **mapped**. When a process touches an unmapped address, the MMU raises a **page fault** and the kernel checks whether the address lies in a valid **VMA**:
 
 ```text
- register_kprobe(&kp)                        CPU executes probed address
-        │                                              │
-        ▼                                              ▼
- save original instruction            int3 trap ─> kprobe handler dispatch
- write int3 (0xCC) over it                         │
- (or a jmp, if optimised: OPTPROBES)               ├─ pre_handler(p, regs)
-                                                   ├─ single-step the saved original
-                                                   │   instruction (out of line)
-                                                   ├─ post_handler (optional)
-                                                   └─ resume after the probe
- kretprobe: at entry, the return address is replaced with a trampoline
-            → the handler runs when the function returns (return value in regs)
+page fault
+  ├─ inside a VMA, page not present yet → demand paging: allocate/read page, fill PTE, retry (invisible)
+  └─ no VMA, or wrong permissions      → SIGSEGV (user) / oops (kernel)
 ```
 
-- **Blacklist:** code the kprobe machinery itself uses cannot be probed (functions marked `NOKPROBE_SYMBOL()`, `__kprobes`, parts of entry code). List them with `/sys/kernel/debug/kprobes/blacklist`.
-- **Inlined or `static` functions** may have no symbol of their own, so probe by address + offset or pick a caller. Check that the symbol exists with `grep -w <sym> /proc/kallsyms`.
-- **Cost:** an `int3` probe costs a trap per hit (~µs). An **optimised** probe (`CONFIG_OPTPROBES`, `debug.kprobes-optimization = 1`) uses a jump and is much cheaper. A probe on a function entry that has an ftrace `fentry` site uses ftrace instead (`CONFIG_KPROBES_ON_FTRACE`).
-- **Test box:** `CONFIG_KPROBES`, `KRETPROBES`, `OPTPROBES`, `KPROBES_ON_FTRACE`, `KPROBE_EVENTS`, `UPROBE_EVENTS` are all `=y`; tracefs is mounted at `/sys/kernel/tracing`.
+- **NULL dereference always faults:** the lowest pages are never mapped (`vm.mmap_min_addr` = 65536). This turns kernel NULL bugs into oopses rather than exploits.
 
-### uprobes: kprobes for user space (Linux 3.5+)
+### Where the kernel's own memory shows up
 
-**uprobes** bring the kprobe idea to **user-space code**. Since Linux 3.5, you can probe any instruction in a user binary or shared library by **file + offset**, usually given as a user **symbol** (e.g. `readline` in `/bin/bash`, `malloc` in libc). A **uretprobe** fires on return.
+`/proc/<pid>/maps` (§10) shows only user mappings. Kernel memory usage is in **`/proc/meminfo`**:
 
-- **Mechanism:** the kernel places a breakpoint (`int3`) in the **page cache page** of the file at that offset, copy-on-write per process. So **every process** that maps the file hits the probe, including processes started later, unless you filter by PID. The trap enters the kernel, which runs the handler (a trace event, BPF program or perf) and then single-steps the original instruction out of line (XOL area).
-- **No ptrace, no recompile:** the target is not stopped and there is no tracer process. Compared with `ltrace`, it is far cheaper, but each hit still costs a user→kernel trap (~1–3 µs).
-- **Symbols:** they need the binary's symbol table (or debuginfo). Stripped binaries can still be probed by raw offset.
-- **USDT** (user statically defined tracing, e.g. `DTRACE_PROBE` in glibc, Python, PostgreSQL) are static NOP markers in user code, activated through uprobes: the user-space analogue of tracepoints.
-- Config: `CONFIG_UPROBES`, `CONFIG_UPROBE_EVENTS` (`=y` on the test box).
-
-```bash
-sudo bpftrace -e 'uprobe:/bin/bash:readline { printf("readline by pid %d\n", pid); }'           # fire on every bash readline() call
-sudo bpftrace -e 'uretprobe:/bin/bash:readline { printf("%s\n", str(retval)); }'                # print each line typed into any bash
-sudo bpftrace -e 'uprobe:/lib/x86_64-linux-gnu/libc.so.6:malloc /pid == 1234/ { @[arg0] = count(); }'  # histogram of malloc sizes for one PID
-sudo perf probe -x /bin/bash readline                                                           # create a uprobe event via perf
-echo 'p:bashrl /bin/bash:0x<offset>' | sudo tee -a /sys/kernel/tracing/uprobe_events            # raw tracefs form: file + offset (offset from nm/objdump)
-```
-
-### Worked example: tracing outbound TCP connections with bpftrace
-
-Class demo: attach a kprobe to `tcp_v4_connect()` and print who opens each IPv4 TCP connection, and to which address. Run it in one terminal, then run `curl` in another.
-
-```bash
-sudo bpftrace -e 'kprobe:tcp_v4_connect {                   /* fire on entry to tcp_v4_connect() */
-	$s = (struct sockaddr_in *)arg1;                     /* arg1 = 2nd argument (uaddr), cast to IPv4 sockaddr */
-	printf("%s %d %s %s\n", username, pid, comm,        /* user name, PID, process name ... */
-	       ntop($s->sin_addr.s_addr));                   /* ... and destination IPv4 address as text */
-}'
-curl -4 https://example.com                                  # in a second terminal: -4 forces IPv4 so the probe fires
-```
-
-Find probe points before writing a script:
-
-```bash
-sudo bpftrace -l 'kprobe:tcp*'                               # list every kprobe-able kernel function starting with "tcp"
-sudo bpftrace -l 'tracepoint:sock:*'                         # list the (stable) socket tracepoints
-sudo bpftrace -lv 'tracepoint:sock:inet_sock_set_state'      # -v also shows the tracepoint's argument fields
-```
-
-
-Example output (illustrative):
-
-```text
-alex 4242 curl 93.184.215.14
-```
-
-- **Signature:** `int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)` in `net/ipv4/tcp_ipv4.c`. In bpftrace, `arg0`, `arg1`, … are the probed function's arguments (read from `pt_regs`: `rdi`, `rsi`, … on x86_64; `x0`, `x1`, … on ARM64), so `arg1` is `uaddr`.
-- **Why the cast works:** bpftrace reads kernel type definitions from **BTF** (`/sys/kernel/btf/vmlinux`, present on the test box), so `struct sockaddr_in` resolves with no headers. On kernels without BTF you need `#include <linux/in.h>` in the script.
-- **Builtins used:** `username` (user name from the UID), `pid` (really the TGID), `comm` (task name, 16 bytes), and `ntop()` (formats an IP address as a string).
-- **IPv6:** `tcp_v4_connect` only sees IPv4. If `example.com` resolves to IPv6, `curl` uses `tcp_v6_connect()` and nothing prints. Use `curl -4`, or also probe `kprobe:tcp_v6_connect` and cast `arg1` to `struct sockaddr_in6 *`.
-- **Scope:** this fires on the `connect()` path only (outbound, before the handshake completes). Accepted (inbound) connections go through `inet_csk_accept()`. bcc's `tcpconnect` tool does the same job with more polish (`sudo tcpconnect-bpfcc` on Ubuntu).
-- **Stable alternative:** the `sock:inet_sock_set_state` tracepoint (`tracepoint:sock:inet_sock_set_state`) sees TCP state changes for IPv4 and IPv6 without depending on internal function names.
-- ⚠️ Not run on the test box: it needs root. The ingredients are present: bpftrace v0.20.2, BTF, and the `tcp_v4_connect` symbol in `/proc/kallsyms`.
-
-### How it works: `trace_marker` and Android atrace
-
-```text
- app / framework                          kernel
- ATRACE_BEGIN("draw")  ─ write() ─>  /sys/kernel/tracing/trace_marker
-   "B|1234|draw"                            │
- ATRACE_END()          ─ write() ─>         ▼
-   "E|1234"                        ftrace ring buffer  <── sched_switch, irq, kprobe events …
-                                            │
-                                    atrace / Perfetto  ──> one timeline (UI: ui.perfetto.dev)
-```
-
-- Anything written to `trace_marker` appears in the trace as a `tracing_mark_write:` event with the writer's PID and a timestamp.
-- Android atrace text format: `B|<pid>|<name>` begins a slice, `E|<pid>` ends it, and `C|<pid>|<name>|<value>` records a counter. **atrace** enables *categories* (`gfx`, `view`, `sched`, `freq`, …) and collects the buffer. **Perfetto** has replaced systrace as the recording/viewing tool.
-- `trace_marker_raw` accepts binary records instead of text.
-- **Why go through the kernel?** Timestamps come from the same trace clock as scheduler, IRQ and kprobe events, so user and kernel events line up accurately on one timeline. atrace is user-mode instrumentation piggybacking on kernel tracing, not a separate tracer.
-
-### ptrace and strace
-
-**`ptrace()`** is the system call behind debuggers and `strace`. The **tracer** attaches to a **tracee**. The kernel then stops the tracee at chosen points and wakes the tracer (via `waitpid()`), which can inspect and modify the tracee before letting it continue.
-
-```text
- strace (tracer)                       kernel                       traced process (tracee)
- ptrace(PTRACE_SEIZE, pid) ──────────> attach                        running …
- ptrace(PTRACE_SYSCALL)    ──────────> resume, stop at next syscall  openat(...) ──┐
- waitpid()  <────────────── syscall-entry stop  <────────────────────────────────┘
- PTRACE_GET_SYSCALL_INFO: read nr + args, print "openat(AT_FDCWD, "/etc/hostname", …"
- ptrace(PTRACE_SYSCALL)    ──────────> run syscall, stop at exit
- waitpid()  <────────────── syscall-exit stop: print " = 3"
-             … two stops and four context switches per system call …
-```
-
-| Request | Purpose |
-| ------- | ------- |
-| `PTRACE_TRACEME` | Child asks to be traced by its parent (how `strace cmd` / `gdb cmd` start) |
-| `PTRACE_ATTACH` / `PTRACE_SEIZE` | Attach to a running process (`SEIZE` does not stop it; preferred) |
-| `PTRACE_SYSCALL` | Continue, stopping at the next syscall entry/exit (strace) |
-| `PTRACE_PEEKDATA` / `POKEDATA`, `GETREGS` / `SETREGS` | Read/write tracee memory and registers (gdb breakpoints) |
-| `PTRACE_CONT` / `PTRACE_DETACH` | Resume / detach |
-
-- **Permissions:** you can trace your own processes (same UID, no setuid). **Yama** `kernel.yama.ptrace_scope` restricts this further: 0 = classic, **1 = only your descendants** (Ubuntu default; test box = 1), 2 = only with `CAP_SYS_PTRACE`, 3 = no ptrace at all. `CAP_SYS_PTRACE` overrides (§8).
-- **Overhead:** each syscall stops the tracee twice, so `strace` can slow syscall-heavy programs by 10–100×. For low overhead, use `perf trace` or `bpftrace` (in-kernel, no stops).
-- A process can have only **one** tracer, so you cannot `strace` a process that `gdb` is already attached to. `TracerPid:` in `/proc/<pid>/status` shows who is tracing it.
-- `ltrace` traces **library** calls (via breakpoints on PLT entries, again using ptrace).
-
-```bash
-strace -f -e trace=openat,read -o out.txt ls    # follow children, only openat/read, write to out.txt
-strace -c ls > /dev/null                        # summary: count and time per syscall
-strace -T -tt -p <pid>                          # attach to a running process (needs ptrace permission), show time per call
-cat /proc/sys/kernel/yama/ptrace_scope          # current Yama ptrace restriction level
-grep TracerPid /proc/<pid>/status               # PID of the process tracing <pid> (0 = none)
-sudo perf trace -s ls                           # strace-like syscall summary without ptrace stops
-```
-
-### Cross-memory attach: `process_vm_readv()` / `process_vm_writev()`
-
-**Cross-memory attach (CMA)** (Linux 3.2+, `CONFIG_CROSS_MEMORY_ATTACH`, on by default) lets a process copy data **directly between its own memory and another process's memory** in one system call. The kernel copies straight from one address space to the other, so the data is copied only once. Nothing is mapped, and the target process does not need to stop. *Raw notes said "xma" and `process_vm_ready`; correct names are CMA and `process_vm_readv`.*
-
-```c
-ssize_t process_vm_readv(pid_t pid,	/* target process (TGID) */
-	const struct iovec *local_iov, unsigned long liovcnt,	/* where to put the data, in our memory */
-	const struct iovec *remote_iov, unsigned long riovcnt,	/* where to read from, in the target's memory */
-	unsigned long flags);	/* must be 0 */
-/* process_vm_writev() has the same arguments and copies the other way */
-```
-
-| Method | Copies | Target must stop? | Calls needed |
-| ------ | ------ | ----------------- | ------------ |
-| `PTRACE_PEEKDATA` / `POKEDATA` | One word (8 bytes) per call | Yes (ptrace-stopped) | One per word: very slow |
-| `/proc/<pid>/mem` + `pread()` / `pwrite()` | Any size, one region per call | No | `open()` plus one per region |
-| Pipe / socket / shared memory | Twice (in and out of a kernel buffer), or needs both sides to set up a mapping | No, but the target must cooperate | Several |
-| **`process_vm_readv()` / `writev()`** | **Once**, many scattered regions per call (`iovec`) | **No** | **One** |
-
-- **Why it is preferred:** single copy, scatter/gather in one call, no cooperation needed from the target. MPI libraries (Open MPI, MPICH) use it for large intra-node messages, and debuggers and profilers use it to read a target's memory quickly.
-- **Permission:** the same check as `ptrace` attach (`PTRACE_MODE_ATTACH_REALCREDS`): same user and not setuid, or `CAP_SYS_PTRACE`. **Yama** `ptrace_scope` applies too, so with the Ubuntu default of 1 you can only read your own descendants unless you have `CAP_SYS_PTRACE`.
-- **Not atomic:** the target keeps running and may change the data mid-copy. A short count is returned if a remote page is unmapped (`EFAULT` only if nothing was copied). Errors: `ESRCH` (no such process), `EPERM` (not allowed).
-- Kernel source: `mm/process_vm_access.c` (it pins the remote pages with `pin_user_pages_remote()` and copies with `copy_page_to_iter()` / `copy_page_from_iter()`).
-
-```bash
-grep CONFIG_CROSS_MEMORY_ATTACH /boot/config-$(uname -r)   # is CMA built in? (=y on Ubuntu)
-man 2 process_vm_readv                                     # full API and error codes
-strace -e trace=process_vm_readv gdb -p <pid> -batch       # see a debugger use it (needs ptrace permission)
-```
+| Field | Meaning |
+| ----- | ------- |
+| `Slab` | Kernel object caches (`kmalloc`, dentries, inodes) |
+| `KernelStack` | Kernel stacks of all threads |
+| `PageTables` | Memory used by page tables |
+| `VmallocUsed` | `vmalloc()` area in use |
+| `Percpu` | Per-CPU allocations |
 
 ### Key APIs / structures
 
-| API | Header | Purpose | Context |
-| --- | ------ | ------- | ------- |
-| `struct kprobe` | `<linux/kprobes.h>` | `.symbol_name` / `.addr` / `.offset`, `.pre_handler`, `.post_handler` | n/a |
-| `register_kprobe()` / `unregister_kprobe()` | `<linux/kprobes.h>` | Plant / remove a probe (`EXPORT_SYMBOL_GPL`) | Process; may sleep |
-| `struct kretprobe`, `register_kretprobe()` | `<linux/kprobes.h>` | Handler on function return; `regs_return_value(regs)` | Process; may sleep |
-| kprobe `pre_handler` | n/a | Your code at the probe point | **Atomic**: no sleep, preemption disabled |
-| `trace_printk()` | `<linux/kernel.h>` | Fast debug print into the ftrace buffer (debug only; prints a warning banner at boot/load) | Any context |
-
-### Code example
-
-Minimal kprobe module (excerpt). Full file and `Makefile`: [`examples/kprobe_demo/`](examples/kprobe_demo/). **Built on 6.8 x86_64** (not loaded).
-
-```c
-static int handler_pre(struct kprobe *p, struct pt_regs *regs)	/* called just before the probed instruction runs */
-{									/* start of handler_pre(): atomic context, must not sleep */
-	pr_info_ratelimited("kprobe_demo: %s hit by %s (pid %d)\n",	/* rate-limited so a busy probe cannot flood the log */
-			    p->symbol_name, current->comm,		/* probed symbol name and the calling task's name */
-			    task_pid_nr(current));			/* calling task's PID */
-	return 0;							/* 0 = continue and execute the probed instruction normally */
-}									/* end of handler_pre() */
-static struct kprobe kp = {		/* the probe descriptor, registered in init */
-	.pre_handler = handler_pre,	/* run handler_pre() on every hit */
-	.symbol_name = "kernel_clone",	/* probe the fork/clone path (the demo takes this from a module parameter) */
-};					/* end of kp */
-/* in init: ret = register_kprobe(&kp);  in exit: unregister_kprobe(&kp); */
-```
+| Symbol | Header | Purpose | Context |
+| ------ | ------ | ------- | ------- |
+| `copy_from_user()` / `copy_to_user()` | `<linux/uaccess.h>` | Safe user ↔ kernel copy; returns bytes **not** copied | Process context, **may sleep** |
+| `access_ok()` | `<linux/uaccess.h>` | Range lies below the user limit (does not check that it is mapped) | Process context |
+| `__user` | `<linux/compiler_types.h>` | `sparse` annotation for user pointers | n/a |
+| `TASK_SIZE` | `<asm/processor.h>` | Top of user space for `current` | Any |
+| `PAGE_OFFSET` | `<asm/page.h>` | Start of the kernel's direct map of RAM | Any |
 
 ### Commands / debugging
 
-kprobe without writing any code, using tracefs (needs root; ask first on the test box):
-
-```bash
-cd /sys/kernel/tracing                                          # tracefs control directory
-echo 'p:myclone kernel_clone' >> kprobe_events                  # define kprobe event "myclone" at kernel_clone entry
-echo 'r:myopen do_sys_openat2 ret=$retval' >> kprobe_events     # define kretprobe event recording the return value
-echo 1 > events/kprobes/enable                                  # enable all kprobe events
-cat trace_pipe                                                  # stream events live (Ctrl-C to stop)
-echo 0 > events/kprobes/enable                                  # disable the events again
-echo > kprobe_events                                            # delete all dynamic kprobe events
-```
-
-Same idea with eBPF, plus `trace_marker`:
-
-```bash
-sudo bpftrace -e 'kprobe:kernel_clone { printf("%s %d\n", comm, pid); }'        # print every fork/clone caller
-sudo bpftrace -e 'kretprobe:do_sys_openat2 { @ret[retval < 0] = count(); }'     # count failed vs successful opens
-echo "hello from user space" | sudo tee /sys/kernel/tracing/trace_marker        # write a marker into the ftrace buffer
-sudo cat /sys/kernel/tracing/trace | grep tracing_mark_write                    # find it in the trace
-sudo trace-cmd record -e sched_switch -e ftrace:print sleep 1                   # record scheduler events plus markers
-sudo cat /sys/kernel/debug/kprobes/list                                         # probes currently registered ([OPTIMIZED], [FTRACE] flags)
+```sh
+grep -m1 'address sizes' /proc/cpuinfo  # physical/virtual address bits the CPU supports
+grep -o la57 /proc/cpuinfo | head -1    # prints la57 if the CPU supports 5-level paging (x86)
+grep -E 'X86_5LEVEL|ARM64_VA_BITS|PGTABLE_LEVELS' /boot/config-$(uname -r)   # paging config
+cat /proc/meminfo                       # system-wide memory, including kernel usage
+sudo slabtop -o | head -15              # biggest kernel slab caches
+sysctl vm.mmap_min_addr                 # lowest address user space may map (65536)
 ```
 
 ### Pitfalls
 
-- **Sleeping in a handler** (`kmalloc(GFP_KERNEL)`, `mutex_lock()`, `copy_from_user()`): "scheduling while atomic" or a deadlock.
-- **Forgetting `unregister_kprobe()`** in `module_exit`: the breakpoint stays and jumps into freed module memory, so the next hit crashes the kernel.
-- **Probing a hot path** (`schedule`, `kmalloc`) with `pr_info()` floods the log and slows the machine. Use rate-limiting, counters, or bpftrace maps.
-- **Relying on function names/arguments:** kprobes attach to internal, unstable functions. They can be renamed, inlined or change signature between kernel versions (e.g. `_do_fork` became `kernel_clone` in 5.10). Prefer stable **tracepoints** where one exists.
-- Leaving `kprobe_events` defined after an experiment: clear them with `echo > kprobe_events`.
+- Dereferencing a `__user` pointer directly: a bug even when it "works". **SMAP** (x86) / **PAN** (ARM64) make it fault. Catch it with `sparse` (`make C=1`).
+- Calling `copy_*_user()` with a spinlock held or in interrupt context: it may sleep on a page fault.
+- Assuming user addresses always fit in 47 bits (breaks under 5-level paging).
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| User space is "commonly 37–40 bits" | The range written next to it (`0x0`–`0x7fff_ffff_ffff`) is **47 bits** (x86_64). 39 bits is used on some ARM64/Android configs. |
+| Kernel space at `0xfffffff?????` | Starts at `0xffff_8000_0000_0000` (x86_64, 4-level). The kernel **image** is at `0xffffffff8…`. |
+| `mmap` claims a physical page and maps it | `mmap()` only creates the **VMA**. Pages are allocated lazily on first access, unless `MAP_POPULATE`/`mlock()` is used. |
 
 ### Revision questions
 
-1. How does a kprobe get control at the probed address on x86, and what makes an "optimised" kprobe cheaper?
-2. What restrictions apply to code in a kprobe `pre_handler`, and why?
-3. How does Android atrace get app events onto the same timeline as scheduler events?
-4. Why might a kprobe-based tool break after a kernel upgrade, and what is the more stable alternative?
-5. What is the difference between the `function` and `function_graph` tracers, and why is function tracing cheap when disabled?
-6. Why is `strace` slow, and why can `strace -p` fail on Ubuntu even for your own process?
-7. How is a uprobe placed, and why does probing `malloc` in libc affect every process unless you filter?
+1. On x86_64 with 4-level paging, what are the user and kernel ranges, and what happens if you access `0x0000_8000_0000_0000`?
+2. Why can't a driver `memcpy()` from a pointer passed in an `ioctl()` argument?
+3. The test box has `CONFIG_X86_5LEVEL=y`. Why is its user space still 47 bits?
+4. A program `mmap()`s 1 GiB and `MemFree` barely changes. Why?
 
 <details>
 <summary>Answers</summary>
 
-1. The first byte of the instruction is replaced with `int3`. The trap handler runs `pre_handler`, single-steps the saved original instruction, then resumes. An optimised probe replaces the instruction with a `jmp` to a detour buffer, which avoids the trap.
-2. It runs in atomic context (from a trap, with preemption disabled), so it must not sleep or take sleeping locks, and it should be short.
-3. The framework writes `B|pid|name` / `E|pid` strings to `/sys/kernel/tracing/trace_marker`. These land in the ftrace ring buffer alongside kernel events, with the same clock.
-4. kprobes hook internal functions, which can be renamed, inlined or change arguments. Static tracepoints (and `raw_tp` in BPF) are the more stable interface.
-5. `function` records each function entry; `function_graph` also hooks the exit, giving a call tree with durations. With dynamic ftrace, the `__fentry__` call sites are patched to NOPs until tracing is enabled.
-6. ptrace stops the tracee at every syscall entry and exit, costing context switches. Yama `ptrace_scope = 1` only allows tracing your own descendants, so attaching to an unrelated process needs `sudo` / `CAP_SYS_PTRACE`.
-7. The kernel writes a breakpoint into the file's page-cache page at the symbol's offset. Every process mapping libc shares that (inode, offset), so all of them trap into the handler.
+1. User `0x0`–`0x0000_7fff_ffff_ffff`, kernel `0xffff_8000_0000_0000`–`0xffff_ffff_ffff_ffff`. `0x0000_8000_0000_0000` is non-canonical, so the CPU raises a general-protection fault (SIGSEGV in user space, an oops in the kernel).
+2. It is a user virtual address. It may be unmapped, paged out or malicious (pointing into the kernel), and SMAP/PAN block direct access. `copy_from_user()` validates the range and handles faults.
+3. The CPU also needs `la57`. Without it the kernel falls back to 4-level paging at boot. Even with it, addresses above 47 bits are only handed out when requested via an `mmap()` hint.
+4. `mmap()` only creates a VMA. Pages are allocated on first touch (demand paging).
 
 </details>
 
 ### Source pointers
 
-- `kernel/kprobes.c`, `arch/x86/kernel/kprobes/` (`core.c`, `opt.c`), `arch/arm64/kernel/probes/`
-- `kernel/trace/trace_kprobe.c`, `kernel/trace/trace.c` (`tracing_mark_write()`), `kernel/trace/ftrace.c`, `kernel/trace/trace_functions_graph.c`
-- `kernel/events/uprobes.c`, `arch/x86/kernel/uprobes.c`, `kernel/trace/trace_uprobe.c`, `Documentation/trace/uprobetracer.rst`
-- `kernel/ptrace.c`, `arch/x86/kernel/ptrace.c`, `security/yama/yama_lsm.c`
-- `samples/kprobes/kprobe_example.c`, `samples/kprobes/kretprobe_example.c`
-- `Documentation/trace/kprobes.rst`, `Documentation/trace/kprobetrace.rst`, `Documentation/trace/ftrace.rst`, `Documentation/admin-guide/LSM/Yama.rst`, `man 2 ptrace`
+- `Documentation/arch/x86/x86_64/mm.rst`, `Documentation/arch/x86/x86_64/5level-paging.rst`, `Documentation/arch/arm64/memory.rst`
+- `arch/x86/include/asm/page_64_types.h` (`TASK_SIZE_MAX`), `include/linux/uaccess.h`
+- `mm/memory.c` (`handle_mm_fault()`), `arch/x86/mm/fault.c` (`exc_page_fault()`)
+- `Documentation/filesystems/proc.rst` (`meminfo`)
 
 ---
 
-## 11. Pages and Page Size
+## 9. vDSO and vsyscall: Kernel Code Mapped into User Space
+
+*Builds on: §8 (kernel pages mapped into user space).*
+
+> **Remember**
+>
+> - The **vDSO** is a small ELF shared library **supplied by the kernel** and mapped into every process as `[vdso]`, with a data page `[vvar]`.
+> - It lets hot, read-only calls (`clock_gettime`, `gettimeofday`, `time`, `getcpu`) run **without entering the kernel**, which avoids a mode switch.
+> - How it works: the kernel keeps the time data in `[vvar]` up to date, and the vDSO code reads that data plus the CPU counter, entirely in user mode.
+> - **vsyscall** is the legacy x86_64 version at a **fixed** address (`0xffffffffff600000`). It is now emulated, because a fixed address helps exploits.
+> - Real x86_64 syscalls use the **`syscall`** instruction with the number in `rax` (`read` = 0).
+> - `strace` cannot see vDSO calls, because no syscall happens.
+
+### How a call reaches the vDSO
+
+```text
+app: gettimeofday(&tv)                    app: getpid()
+   └─> glibc wrapper                         └─> glibc wrapper
+         └─> [vdso] __vdso_gettimeofday           └─> syscall instruction ─> kernel entry ─> sys_getpid
+               reads [vvar] + rdtsc                     (mode switch, ~100 ns+)
+               (user mode only)
+```
+
+- The kernel passes the vDSO address in the auxiliary vector (`AT_SYSINFO_EHDR`). glibc finds it there and binds these functions to it automatically.
+- The vDSO's position is randomised by ASLR. It appears in `ldd` output as `linux-vdso.so.1`, but there is **no file on disk**.
+
+| Machine | vDSO exports |
+| ------- | ------------ |
+| Test box (x86_64, 6.8) | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `getcpu`, `sgx_enter_enclave` |
+| Pi 5 (arm64, 6.12) | `clock_gettime`, `clock_getres`, `gettimeofday`, `getrandom` (6.11+), signal-return trampoline |
+
+### vsyscall (legacy, x86_64 only)
+
+- A page at the fixed address `0xffffffffff600000` providing `gettimeofday`, `time` and `getcpu`. Its fixed, executable address defeats ASLR, so it was replaced by the vDSO.
+- It is kept only for very old static binaries. It is **emulated**: the page is execute-only (`--xp`), and a call traps into the kernel, which does a real syscall. Boot option: `vsyscall=xonly|emulate|none`.
+
+### x86 system-call entry instructions
+
+| Instruction | Where | Notes |
+| ----------- | ----- | ----- |
+| `int 0x80` | 32-bit x86 | Original software-interrupt gate; slowest |
+| `sysenter` / `sysexit` | 32-bit mode | Fast entry, Pentium II onwards |
+| **`syscall` / `sysret`** | **All x86_64** | **The modern 64-bit instruction** |
+
+On 32-bit x86, the vDSO (`linux-gate.so.1`) supplies `__kernel_vsyscall`, which picks the fastest instruction the CPU supports: the "syscall gate".
+
+### Commands / debugging
+
+```sh
+grep -E 'vdso|vvar|vsyscall' /proc/self/maps   # where the kernel-supplied pages are mapped
+LD_SHOW_AUXV=1 /bin/true | grep SYSINFO        # AT_SYSINFO_EHDR = vDSO address passed by the kernel
+ldd /bin/ls | grep vdso                        # linux-vdso.so.1: listed, but no file on disk
+strace -e trace=clock_gettime date             # no clock_gettime syscall shown: served by the vDSO
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource   # tsc = vDSO fast path works
+```
+
+### Pitfalls
+
+- `strace` does not show vDSO calls. Use `ltrace` or `perf` / uprobes instead.
+- If the clocksource cannot be read from user space (e.g. an unstable TSC in a VM), the vDSO falls back to a real syscall and loses its speed advantage.
+- `vsyscall=none` breaks very old static binaries.
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| `memset` is a vDSO function | It is **not** in either vDSO. CPU-optimised `memset` comes from glibc (IFUNC, chosen at load time) or, in the kernel, from **alternatives** patched at boot. **⚠️ Verify.** |
+| vsyscall "syscall gate used in Intel only" | vsyscall is **x86_64-specific** (Intel and AMD). The "syscall gate" is the 32-bit vDSO's `__kernel_vsyscall`. |
+| vsyscall wraps **all** syscalls, picking `int`/`syscall`/`sysenter`; `sysenter` is the modern one | Picking the instruction is `__kernel_vsyscall` in the 32-bit vDSO. The x86_64 vsyscall page only ever had 3 functions. Normal syscalls go through glibc, which executes `syscall` directly. On x86_64 **`syscall`** is the modern instruction. **⚠️ Verify.** |
+| `read` is syscall 3 | 3 on **i386**; **0** on x86_64 (`arch/x86/entry/syscalls/syscall_64.tbl`) |
+
+### Revision questions
+
+1. Why is `clock_gettime()` cheaper than `getpid()`?
+2. Why was vsyscall replaced by the vDSO?
+3. Does the vDSO appear in `ldd` output? Is there a file for it on disk?
+
+<details>
+<summary>Answers</summary>
+
+1. The vDSO serves `clock_gettime()` by reading `[vvar]` and the CPU counter in user mode, with no syscall. `getpid()` is a real syscall.
+2. vsyscall sits at a fixed, executable address in every process, which defeats ASLR and gives exploits useful gadgets. The vDSO is at a randomised address and can be extended with new functions.
+3. Yes, as `linux-vdso.so.1`. There is no file: the image is built into the kernel and mapped at `exec()`.
+
+</details>
+
+### Source pointers
+
+- `arch/x86/entry/vdso/`, `arch/x86/entry/vsyscall/vsyscall_64.c`, `arch/arm64/kernel/vdso/`
+- `lib/vdso/gettimeofday.c` (generic vDSO time code), `man 7 vdso`
+
+---
+
+## 10. Process Memory: VMAs, `maps`/`smaps` and Maple Trees
+
+*Builds on: §4 (`task_struct` → `mm`), §8 (user space).*
+
+> **Remember**
+>
+> - Each line of `/proc/<pid>/maps` is one **VMA** (`struct vm_area_struct`): a contiguous range of user virtual addresses with one set of permissions and one backing object (a file, or anonymous memory).
+> - `maps` says **where** things are mapped. `smaps` adds **how much RAM** each VMA uses: `Rss`, `Pss`, `Shared_*`/`Private_*`, `Swap`.
+> - **RSS** counts shared pages in full for every process. **PSS** divides them among the sharers, so PSS sums correctly across processes.
+> - A process's VMAs hang off its `mm_struct` (`task->mm`). Since **6.1** they are stored in a **maple tree**. Walk them with `for_each_vma()` while holding `mmap_read_lock()`.
+> - Permissions column: `p` = private (copy-on-write), `s` = shared.
+
+### Overview
+
+A process's user address space (§8) is not one big block: it is a sorted set of **VMAs**, one per mapped region (program text, heap, each library segment, stacks, `mmap()` areas). This section reads them from user space (`maps`, `smaps`), then looks at the kernel structures behind them (`vm_area_struct`, `mm_struct`, the maple tree). Which physical pages back each VMA is the job of the page tables (§11).
+
+### Reading `/proc/<pid>/maps`: libc example
+
+```text
+$ grep libc /proc/$$/maps
+7de3a0c00000-7de3a0c28000 r--p 00000000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
+7de3a0c28000-7de3a0db1000 r-xp 00028000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
+7de3a0db1000-7de3a0e00000 r--p 001b1000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
+7de3a0e00000-7de3a0e04000 r--p 001ff000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
+7de3a0e04000-7de3a0e06000 rw-p 00203000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
+```
+
+| Column | Meaning |
+| ------ | ------- |
+| `start-end` | Virtual range of one **VMA** (all below `0x7fff_ffff_ffff`, so user space) |
+| `r-xp` | Permissions + `p` private (copy-on-write) / `s` shared |
+| `00028000` | Offset in the file |
+| `fc:00`, `1061951` | Device (major:minor), inode |
+| path | Backing file, or `[heap]`, `[stack]`, `[vdso]`, blank = anonymous |
+
+One shared library → **one mapping per segment**: headers (`r--`), code `.text` (`r-x`), read-only data (`r--`), **RELRO** (`r--`, made read-only after linking), writable data `.data`/`.bss` (`rw-`). The code pages are **shared** physically by every process that uses libc. Only written pages get private copies.
+
+- **Naming anonymous VMAs (5.17+):** `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, addr, len, "name")` makes the VMA show as `[anon:name]` in `maps` (`CONFIG_ANON_VMA_NAME`; Android uses it for its heaps). *Raw notes wrote `PP_SET_VMA`.*
+
+### `/proc/<pid>/maps` vs `/proc/<pid>/smaps`
+
+Both list the same VMAs, one per mapping, in the same order. `maps` gives one line per VMA: **where** things are mapped. `smaps` adds a block of counters under each line: **how much physical memory** each VMA actually uses.
+
+| | `maps` | `smaps` |
+| - | ------ | ------- |
+| Content | Range, perms, offset, dev, inode, path | Same header line + ~25 `Key: value kB` fields + `VmFlags` |
+| Answers | "What is mapped where?" | "How much RAM/swap does each mapping use, and is it shared?" |
+| Cost | Cheap | **Expensive**: walks the page tables of every VMA (`mmap_lock` held for read) |
+| Summary form | n/a | `/proc/<pid>/smaps_rollup`: all VMAs summed into one block (since 4.14) |
+
+Example `smaps` entry (libc code segment, values illustrative):
+
+```text
+7de3a0c28000-7de3a0db1000 r-xp 00028000 fc:00 1061951  /usr/lib/x86_64-linux-gnu/libc.so.6
+Size:               1572 kB    # virtual size of the VMA (end - start)
+KernelPageSize:        4 kB    # page size the kernel uses for this VMA
+MMUPageSize:           4 kB    # page size the MMU uses (differs only on some arches)
+Rss:                1024 kB    # resident: pages of this VMA currently in RAM
+Pss:                  52 kB    # proportional: each shared page divided by number of sharers
+Shared_Clean:       1024 kB    # resident, mapped by >1 process, not modified
+Shared_Dirty:          0 kB    # resident, mapped by >1 process, modified
+Private_Clean:         0 kB    # resident, only this process, not modified
+Private_Dirty:         0 kB    # resident, only this process, modified (true private cost)
+Referenced:         1024 kB    # pages recently accessed (accessed bit set)
+Anonymous:             0 kB    # pages not backed by a file (heap, stack, CoW copies)
+Swap:                  0 kB    # pages of this VMA currently swapped out
+Locked:                0 kB    # pages pinned in RAM by mlock()
+THPeligible:           0       # 1 if transparent huge pages could back this VMA
+VmFlags: rd ex mr mw me sd     # VMA flags: read, exec, may-read, may-write, may-exec, soft-dirty
+```
+
+Key memory metrics:
+
+| Metric | Definition | Use |
+| ------ | ---------- | --- |
+| **VSZ** / `Size` | Virtual size: everything mapped, touched or not | Almost meaningless for RAM use (demand paging) |
+| **RSS** / `Rss` | Resident pages, **shared pages counted in full** for every process | Summing RSS over processes **over-counts** shared libs |
+| **PSS** / `Pss` | Resident pages, each shared page divided by its number of mappers | Summing PSS over all processes ≈ real RAM used |
+| **USS** | `Private_Clean + Private_Dirty` | RAM freed if this process exits |
+
+- `Rss = Shared_Clean + Shared_Dirty + Private_Clean + Private_Dirty`.
+- "Shared" means *currently mapped by more than one process*, not "a `MAP_SHARED` mapping". A `MAP_SHARED` page only this process maps counts as `Private_*`.
+- Clean pages can be dropped and re-read from the file under memory pressure. Dirty anonymous pages can only go to swap.
+- `VmFlags` exposes `vm_area_struct->vm_flags` (e.g. `ht` = hugetlb, `lo` = locked, `dd` = don't dump, `sd` = soft-dirty).
+
+### `struct vm_area_struct` (the VMA)
+
+Each line of `/proc/<pid>/maps` is one **`struct vm_area_struct`** (`include/linux/mm_types.h`). It describes one contiguous virtual range with uniform permissions and one backing object. A process's VMAs hang off its **`struct mm_struct`** (`task->mm`), which also holds the page-table root (`mm->pgd`).
+
+```text
+task_struct ──mm──► mm_struct
+                     ├── pgd            page-table root (loaded into CR3 / TTBR0 on switch)
+                     ├── mm_mt          maple tree of VMAs, keyed by address (6.1+)
+                     ├── mmap_lock      rw_semaphore protecting the VMA tree
+                     └── map_count      number of VMAs
+                          │
+                          ▼
+            ┌─────────────┬─────────────┬─────────────┐
+            │ VMA         │ VMA         │ VMA         │ ... one per maps line
+            │ [text r-x]  │ [heap rw-]  │ [stack rw-] │
+            └──┬──────────┴─────────────┴─────────────┘
+               ├── vm_start / vm_end   [start, end): end is exclusive
+               ├── vm_flags            VM_READ|VM_EXEC|VM_SHARED|...
+               ├── vm_file + vm_pgoff  backing file and offset (in pages); NULL = anonymous
+               ├── anon_vma            reverse map for anonymous / CoW pages
+               └── vm_ops              ->fault(), ->open(), ->close() (set by driver mmap)
+```
+
+| Field | Meaning | `maps` column |
+| ----- | ------- | ------------- |
+| `vm_start`, `vm_end` | Range `[vm_start, vm_end)`, page-aligned | `start-end` |
+| `vm_flags` | `VM_READ`, `VM_WRITE`, `VM_EXEC`, `VM_SHARED`, `VM_GROWSDOWN`, `VM_LOCKED`, `VM_IO`, `VM_PFNMAP`... | perms + `p`/`s`; full set in `smaps` `VmFlags` |
+| `vm_page_prot` | Hardware PTE protection bits derived from `vm_flags` | n/a |
+| `vm_file`, `vm_pgoff` | Backing file and offset **in pages** | path, offset (bytes) |
+| `vm_mm` | Owning `mm_struct` | n/a |
+| `anon_vma` | Reverse-mapping anchor for anonymous pages | n/a |
+| `vm_ops` | Callbacks: `fault`, `open`, `close`, `page_mkwrite`... | n/a |
+| `vm_private_data` | Driver's private pointer | n/a |
+
+- **Lookup structure is version-dependent:** before 6.1 VMAs were in a red-black tree (`mm->mm_rb`) plus a sorted linked list (`vm_next`/`vm_prev`). Since **6.1** they are in a **maple tree** (`mm->mm_mt`), and `vm_next` no longer exists.
+- **Locking:** `mmap_lock` (renamed from `mmap_sem` in 5.8) protects the tree: read lock to walk it, write lock for `mmap()`/`munmap()`/`mprotect()`. Since 6.4, `CONFIG_PER_VMA_LOCK` lets page faults lock just one VMA instead.
+- `vm_flags` is `const` since 6.3. Change it with `vm_flags_set()` / `vm_flags_clear()`, not by assigning.
+- Adjacent VMAs with identical flags/backing get **merged**. `mprotect()` on part of a VMA **splits** it. Limit: `vm.max_map_count` (65530 by default).
+- Drivers meet VMAs in `file_operations.mmap(struct file *, struct vm_area_struct *)`: map memory with `remap_pfn_range()` or install `vm_ops->fault`.
+
+Walk the VMAs of the current process (kernel 6.1+; fragment, e.g. called from a module's init):
+
+```c
+#include <linux/mm.h>                         /* vm_area_struct, VMA_ITERATOR, for_each_vma */
+#include <linux/sched.h>                      /* current */
+#include <linux/printk.h>                     /* pr_info() */
+
+static void dump_vmas(void)                   /* print every VMA of the calling process */
+{
+	struct mm_struct *mm = current->mm;   /* address space of the current task */
+	struct vm_area_struct *vma;           /* cursor for the loop */
+	VMA_ITERATOR(vmi, mm, 0);             /* maple-tree iterator starting at address 0 */
+
+	if (!mm)                              /* kernel threads have no user address space */
+		return;                       /* nothing to walk */
+
+	mmap_read_lock(mm);                   /* stop VMAs changing while we walk; may sleep */
+	for_each_vma(vmi, vma)                /* visit each VMA in address order */
+		pr_info("%lx-%lx flags=%lx %s\n",            /* one line per VMA, like maps */
+			vma->vm_start, vma->vm_end,          /* range [start, end) */
+			vma->vm_flags,                       /* raw VM_* flags */
+			vma->vm_file ? "file" : "anon");     /* backed by a file or anonymous */
+	mmap_read_unlock(mm);                 /* release the read lock */
+}
+```
+
+For another task's `mm`, take a reference first with `get_task_mm()` and drop it with `mmput()`.
+
+### Maple trees
+
+The **maple tree** (`lib/maple_tree.c`, by Liam Howlett and Matthew Wilcox, merged in **6.1**) is an RCU-safe B-tree that stores **non-overlapping ranges** (`[first, last] → pointer`). Its first user is the VMA tree (`mm->mm_mt`).
+
+**Why it replaced the old scheme.** Before 6.1, each `mm` kept three structures in sync:
+
+| Before 6.1 | Problem | Since 6.1 |
+| ---------- | ------- | --------- |
+| Red-black tree `mm->mm_rb` (lookup) | Binary tree: deep, poor cache locality; not RCU-safe, so every fault needed `mmap_lock` | One **maple tree** `mm->mm_mt` does lookup **and** ordered iteration |
+| Linked list `vm_next`/`vm_prev` (iteration) | Extra pointers to keep consistent on every split/merge | Removed |
+| Per-thread `vmacache` (recent-lookup cache) | Invalidation complexity | Removed (tree is fast enough) |
+
+<details>
+<summary>▶ Deep dive: maple tree internals, API and example</summary>
+
+How it works:
+
+```text
+                    ┌──────────── node (256 B = 4 cache lines) ────────────┐
+                    │ pivot0 │ pivot1 │ pivot2 │ ... │ up to 16 slots       │
+                    └───┬────────┬────────┬────────────────────────────────┘
+                        ▼        ▼        ▼
+        [0, pivot0]  (pivot0, pivot1]  (pivot1, pivot2] ...   ranges, not single keys
+           leaf: slot = VMA pointer, or NULL for an unmapped gap
+```
+
+- **Wide, shallow B-tree:** up to 16 slots per node (10 in "allocation" nodes, which also record the biggest free gap below them). A few levels cover thousands of VMAs.
+- **Range keyed:** each slot covers an address range, and gaps are stored as `NULL` ranges. That makes "find a free gap of N bytes" (`get_unmapped_area()`) a tree search instead of a list walk.
+- **RCU-safe readers:** writers copy-on-write the nodes they change and publish them with RCU, so readers can walk without locks under `rcu_read_lock()`. This is what makes per-VMA locking for page faults possible (6.4, `CONFIG_PER_VMA_LOCK`).
+- **Writers still serialise:** with an internal spinlock, or an external lock (`mmap_lock` for the VMA tree).
+- **Pre-allocation:** writes may need new nodes, so `mmap()` paths pre-allocate (`mas_preallocate()`) before taking locks where allocation is not allowed.
+
+Two APIs:
+
+| API | Functions | Use |
+| --- | --------- | --- |
+| Normal (`mtree_*`) | `mtree_init()`, `mtree_store_range()`, `mtree_load()`, `mtree_erase()`, `mtree_destroy()`, `mt_for_each()` | Simple; handles locking internally |
+| Advanced (`mas_*`) | `MA_STATE()`, `mas_find()`, `mas_walk()`, `mas_store_gfp()`, `mas_preallocate()` | Caller holds the lock; keeps a cursor (`struct ma_state`) for fast repeated operations. `VMA_ITERATOR` wraps this |
+
+Minimal use of the normal API (fragment):
+
+```c
+#include <linux/maple_tree.h>                 /* maple tree API */
+#include <linux/printk.h>                     /* pr_info() */
+
+static DEFINE_MTREE(my_tree);                 /* static, empty maple tree with its own spinlock */
+
+static int maple_demo(void *obj)              /* store obj for range 100..199, then look it up */
+{
+	void *found;                          /* result of the lookup */
+	int ret;                              /* return code */
+
+	ret = mtree_store_range(&my_tree, 100, 199, obj, GFP_KERNEL); /* map [100, 199] -> obj; may sleep */
+	if (ret)                              /* -ENOMEM or -EINVAL */
+		return ret;                   /* pass the error up */
+
+	found = mtree_load(&my_tree, 150);    /* any index in the range returns obj (RCU-safe read) */
+	pr_info("150 -> %p\n", found);        /* prints obj's address */
+
+	mtree_destroy(&my_tree);              /* free all tree nodes (not the stored objects) */
+	return 0;                             /* success */
+}
+```
+
+Other users in 6.12 (checked with `git grep maple_tree.h`): sparse IRQ descriptors (`kernel/irq/irqdesc.c`) and the regmap register cache (`drivers/base/regmap/regcache-maple.c`). Slot counts are for 64-bit. 32-bit kernels use 32 and 21 (`include/linux/maple_tree.h`).
+
+</details>
+
+### Key APIs / structures
+
+| Symbol | Header | Purpose | Context |
+| ------ | ------ | ------- | ------- |
+| `struct vm_area_struct` | `<linux/mm_types.h>` | One VMA: range, flags, backing file, `vm_ops` | n/a |
+| `mmap_read_lock()` / `mmap_write_lock()` | `<linux/mmap_lock.h>` | Lock an `mm`'s VMA tree | Process context, **may sleep** |
+| `vma_lookup(mm, addr)` | `<linux/mm.h>` | VMA **containing** `addr`, or `NULL` | `mmap_lock` held |
+| `find_vma(mm, addr)` | `<linux/mm.h>` | First VMA with `vm_end > addr` (may start **above** `addr`) | `mmap_lock` held |
+| `VMA_ITERATOR()` / `for_each_vma()` | `<linux/mm.h>` | Iterate VMAs (6.1+, maple tree) | `mmap_lock` held |
+| `get_task_mm()` / `mmput()` | `<linux/sched/mm.h>` | Take / drop a reference on another task's `mm` | Process context; `mmput()` may sleep |
+
+### Commands / debugging
+
+```sh
+cat /proc/$$/maps                       # layout of the current shell ($$ = shell's PID)
+cat /proc/$$/smaps                      # same VMAs, plus per-VMA Rss/Pss/Swap/flags counters
+cat /proc/$$/smaps_rollup               # all VMAs summed: total Rss/Pss/Swap for the process
+awk '/^Pss:/ {s += $2} END {print s " kB"}' /proc/$$/smaps   # add up PSS by hand (same as rollup)
+pmap -X $$                              # smaps as a table (procps); pmap -x = Rss/Dirty only
+```
+
+### Pitfalls
+
+- Using `find_vma()` as "the VMA containing `addr`": it returns the next VMA above if `addr` is in a gap. Check `vma->vm_start <= addr`, or use `vma_lookup()`.
+- Walking VMAs without `mmap_lock`, or keeping a `vma` pointer after unlocking: it can be split, merged or freed (use-after-free).
+- Old code using `vma->vm_next` or `mm->mmap` does not compile on 6.1+. Use `for_each_vma()`.
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| `p` = `MAP_SHARED`, explicitly shared; `p` = `MAP_PRIVATE` | **`s`** = `MAP_SHARED` (writes visible to others and to the file); **`p`** = `MAP_PRIVATE` (copy-on-write: shared until written). |
+| Maple tree for `mm_struct` "in Linux 6.0" | Merged in **6.1**. |
+| `mm_struct` is "the link to the physical pages" | More precisely: `mm->pgd` is the page-table root, loaded into `CR3` / `TTBR0_EL1` on context switch. |
+
+### Revision questions
+
+1. Ten processes each show 10 MiB RSS, mostly libc. Is 100 MiB of RAM in use? Which `smaps` field gives a fair total?
+2. What does one line of `/proc/<pid>/maps` correspond to in the kernel, how are these stored in 6.x, and what lock must you hold to walk them?
+3. Give two reasons the maple tree replaced the VMA rbtree + linked list.
+
+<details>
+<summary>Answers</summary>
+
+1. No. RSS counts every shared page in full in every process, so libc's pages are counted ten times. `Pss` divides each shared page among its mappers, so summing `Pss` (e.g. from `smaps_rollup`) across processes approximates the real total.
+2. One `struct vm_area_struct`. Since 6.1 they live in a maple tree in `mm_struct` (`mm->mm_mt`), replacing the rbtree + linked list. Hold `mmap_read_lock(mm)` while walking with `for_each_vma()`.
+3. (a) One wide, cache-friendly B-tree does both lookup and ordered iteration, so the rbtree, list and `vmacache` no longer have to be kept in sync. (b) Readers are RCU-safe, which enables lockless lookups and per-VMA locking for page faults. Bonus: free gaps are stored in the tree, which speeds up `get_unmapped_area()`.
+
+</details>
+
+### Source pointers
+
+- `include/linux/mm_types.h` (`struct vm_area_struct`, `struct mm_struct`), `include/linux/mmap_lock.h`
+- `mm/mmap.c` (VMA create/merge/split), `mm/vma.c` (VMA operations, 6.12), `fs/proc/task_mmu.c` (`maps`/`smaps` output)
+- `lib/maple_tree.c`, `Documentation/core-api/maple_tree.rst`, `Documentation/mm/process_addrs.rst`
+- `Documentation/filesystems/proc.rst` (`maps`, `smaps`)
+
+---
+
+## 11. Pages, Page Size and Page Tables
+
+*Builds on: §8, §10 (VMAs are backed by pages).*
+
+> **Remember**
+>
+> - A **page** is the smallest unit the MMU maps and protects: 4 KiB on x86_64; 4, 16 or 64 KiB on ARM64, fixed when the kernel is built.
+> - Page sizes are **always powers of two**, so an address splits into page number (`addr >> PAGE_SHIFT`) and offset (`addr & ~PAGE_MASK`) with no division.
+> - **Page tables** turn virtual pages into physical frames. Root: `CR3` on x86_64, `TTBR0_EL1` (user) / `TTBR1_EL1` (kernel) on ARM64. The **TLB** caches translations.
+> - Even the kernel uses only virtual addresses: all RAM is mapped into kernel space (the **direct map**).
+> - Never hard-code 4096: use `PAGE_SIZE` / `PAGE_SHIFT` in the kernel, `sysconf(_SC_PAGESIZE)` in user space.
 
 ### Overview
 
@@ -2129,6 +1889,20 @@ ARM64, 16 KiB pages (TCR_EL1.TGx = 16K granule), 47-bit VA, 3 levels
 ```
 
 Bigger pages give a bigger offset field, more entries per table, and so **fewer levels** for the same VA size, meaning shorter page walks.
+
+### Page tables: from virtual to physical
+
+VMAs say what *should* be mapped. The **page tables** say what *is* mapped: a per-`mm` tree that turns a virtual address into a physical one (the bit split is shown above). The MMU walks it in hardware, and the **TLB** caches the results.
+
+| | Register holding the page-table root (a **physical** address) |
+| --- | --- |
+| x86_64 | `CR3`: one root per process (`mm->pgd`). The kernel half is the same in every process's tables. Rewritten on context switch. |
+| ARM64 | `TTBR0_EL1`: user half (per process, switched). `TTBR1_EL1`: kernel half (the same for every process). |
+
+*Raw notes said `TTBR[0/1]_EL0`; the registers are `TTBR0_EL1` / `TTBR1_EL1`. EL0 (user mode) cannot set its own page tables.*
+
+- **Even the kernel uses only virtual addresses** once the MMU is on. To reach RAM it maps it: all of RAM is mapped linearly at `PAGE_OFFSET` (the **direct map**, `__va()`/`__pa()`). Device registers are mapped on demand with `ioremap()`.
+- **Kernel memory is never swapped:** it behaves as if `mlock()`ed. (Page cache and user pages, by contrast, can be reclaimed.)
 
 ### Page sizes by architecture
 
@@ -2260,7 +2034,287 @@ readelf -lW /bin/ls | grep LOAD                    # "Align" column: 0x1000 = 4K
 
 ---
 
-## 12. Synchronisation: Spinlocks, RW Locks and RCU
+## 12. Kernel Memory Allocation: `kmalloc`, `vmalloc` and GFP Flags
+
+*Builds on: §11 (everything is allocated in pages).*
+
+> **Remember**
+>
+> - The kernel has no `malloc()`. It uses `kmalloc(size, gfp)` / `kfree()`, where **GFP flags** say *how* to allocate (may it sleep? which zone?).
+> - **`GFP_KERNEL`**: may sleep (process context). **`GFP_ATOMIC`**: never sleeps (IRQ/spinlock context) but fails more easily.
+> - `kmalloc()` memory is **physically contiguous** (direct map). `vmalloc()` is only **virtually** contiguous: use it for big buffers that no hardware touches.
+> - Physical contiguity only matters for **DMA** and hardware. Otherwise you work purely with virtual addresses.
+> - Everything is ultimately pages: think in `PAGE_SIZE`, never in 4096.
+
+### Overview
+
+User space has a private address space and a `malloc()` heap that hides allocation details. In the kernel, every piece of code shares **one** address space. The allocator must know the caller's context: a call that sleeps to reclaim memory would deadlock or crash in an interrupt handler. So every allocation states its constraints.
+
+### How it works: the allocator layers
+
+```text
+ kmalloc / kzalloc / kmalloc_obj      kmem_cache_alloc (your own cache)     vmalloc / kvmalloc
+            │                                   │                               │
+            ▼                                   ▼                               │
+   kmalloc-8 … kmalloc-8k caches ──► SLUB slab allocator (mm/slub.c)            │
+            │ (> 2 pages: straight to the page allocator)                       │
+            ▼                                                                   ▼
+             buddy page allocator: alloc_pages(gfp, order) → 2^order contiguous pages
+                                    │       (zones: DMA, DMA32, NORMAL, MOVABLE)
+                                    ▼
+                         physical page frames (struct page)
+      kmalloc: pages used via the direct map      vmalloc: separate pages, stitched together in
+      (physically contiguous)                       the vmalloc area by new page tables
+```
+
+| Allocator | Contiguous | Max size | Speed | Typical use |
+| --------- | ---------- | -------- | ----- | ----------- |
+| `kmalloc()` / `kzalloc()` | Physically + virtually | `KMALLOC_MAX_SIZE` (4 MiB on x86_64 4K pages); fails more often above a few pages | Fast | Objects, small/medium buffers, anything DMA'd via the streaming API |
+| `kmem_cache_alloc()` | Physically | One object | Fastest; less waste | Many objects of one type (`task_struct`, inodes, your driver's structs) |
+| `vmalloc()` | Virtually only | Large (limited by vmalloc space) | Slower: page-table setup, TLB cost; **may sleep** | Large buffers: module code, big tables |
+| `kvmalloc()` | Tries `kmalloc`, falls back to `vmalloc` | Large | Best of both | Large buffers of unknown size; free with `kvfree()` |
+| `alloc_pages()` / `__get_free_pages()` | Physically, 2^order pages | `MAX_PAGE_ORDER` (10: 4 MiB) | Fast | Page-granular buffers, page cache, building blocks |
+| `dma_alloc_coherent()` | Physically (as the **device** sees it) | Platform-dependent | Slow | DMA buffers shared with hardware |
+
+### GFP flags
+
+| Flag | May sleep? | Use |
+| ---- | ---------- | --- |
+| `GFP_KERNEL` | Yes (reclaim, I/O, even the OOM killer, §13) | Default in process context |
+| `GFP_ATOMIC` | **No**; may use emergency reserves | IRQ handlers, softirqs, under a spinlock |
+| `GFP_NOWAIT` | No; no reserves | Opportunistic allocations that can fail cheaply |
+| `GFP_NOIO` / `GFP_NOFS` | Yes, but no I/O / no filesystem calls | Inside block / filesystem code (avoids recursion deadlocks). Prefer `memalloc_noio_save()` / `memalloc_nofs_save()` scopes |
+| `GFP_USER` / `GFP_HIGHUSER` | Yes | Pages that are mapped to user space |
+| `GFP_DMA` / `GFP_DMA32` | n/a (zone modifier) | Memory below 16 MiB / 4 GiB for limited devices (prefer the DMA API) |
+| `__GFP_ZERO` | n/a (modifier) | Zero the memory (`kzalloc()` = `kmalloc(..., gfp \| __GFP_ZERO)`) |
+| `__GFP_NOWARN`, `__GFP_NORETRY`, `__GFP_RETRY_MAYFAIL`, `__GFP_NOFAIL` | n/a (modifiers) | Silence the failure warning / give up early / try hard but may fail / never fail (avoid) |
+
+### Key APIs / structures
+
+| API | Header | Purpose | Context |
+| --- | ------ | ------- | ------- |
+| `kmalloc(size, gfp)`, `kzalloc()`, `kfree()` | `<linux/slab.h>` | General allocation (zeroed with `kzalloc`) | Per GFP flag; `kfree()` any context |
+| `kmalloc_array(n, size, gfp)`, `kcalloc()` | `<linux/slab.h>` | Arrays with **overflow-checked** `n * size` | Per GFP flag |
+| `kmalloc_obj(*p, gfp)`, `kmalloc_objs(*p, n, gfp)` | `<linux/slab.h>` | **Linux 7.0+:** type-aware forms of `kmalloc(sizeof(*p), gfp)` / `kmalloc_array()`; no `sizeof` to get wrong | Per GFP flag |
+| `krealloc()`, `kstrdup()`, `kmemdup()` | `<linux/slab.h>`, `<linux/string.h>` | Resize; duplicate a string / buffer | Per GFP flag |
+| `kmem_cache_create()` / `KMEM_CACHE()`, `kmem_cache_alloc()` / `kmem_cache_zalloc()`, `kmem_cache_free()`, `kmem_cache_destroy()` | `<linux/slab.h>` | Dedicated object cache | Create/destroy: process context |
+| `vmalloc()`, `vzalloc()`, `vfree()` | `<linux/vmalloc.h>` | Virtually contiguous memory | **Process context, may sleep** |
+| `kvmalloc()`, `kvfree()` | `<linux/slab.h>` | kmalloc, falling back to vmalloc | Process context (`GFP_KERNEL`-compatible flags) |
+| `alloc_pages(gfp, order)`, `__free_pages()`, `__get_free_pages()`, `free_pages()` | `<linux/gfp.h>` | Buddy allocator: 2^order pages | Per GFP flag |
+| `devm_kzalloc(dev, size, gfp)` | `<linux/device.h>` | Allocation freed automatically when the driver detaches | Probe path |
+| `dma_alloc_coherent(dev, size, &dma_handle, gfp)` | `<linux/dma-mapping.h>` | Buffer the device and the CPU can both access | Usually process context |
+| `virt_to_phys()`, `page_address()`, `is_vmalloc_addr()`, `vmalloc_to_page()` | `<linux/io.h>`, `<linux/mm.h>` | Translate between address kinds | Any |
+
+- `kmalloc_obj` example: `p = kmalloc(sizeof(*p), GFP_KERNEL);` becomes `p = kmalloc_obj(*p, GFP_KERNEL);`. It was added in **7.0**, and a tree-wide Coccinelle conversion is ongoing (7.x). It is **not** in 6.8 or 6.12 (the test box), so course code for 6.x must use `kmalloc()`. ⚠️ Verify the exact 7.x signature against the course kernel (some revisions of the series made the GFP argument optional).
+
+### Code example
+
+Complete module: [`examples/kmalloc_demo/kmalloc_demo.c`](examples/kmalloc_demo/kmalloc_demo.c) + [`Makefile`](examples/kmalloc_demo/Makefile). It allocates with `kzalloc()`, `vmalloc()`, a `KMEM_CACHE()` and `alloc_pages()`, prints each address kind, and unwinds in reverse order with `goto`. **Built on 6.8 x86_64** (not loaded).
+
+Core pattern:
+
+```c
+struct foo *p;                                /* pointer to the new object */
+
+p = kzalloc(sizeof(*p), GFP_KERNEL);          /* zeroed allocation; sizeof(*p) stays correct if the type changes */
+if (!p)                                       /* allocations can fail: always check */
+	return -ENOMEM;                       /* standard error for out of memory */
+/* ... use p ... */
+kfree(p);                                     /* free it; kfree(NULL) is a safe no-op */
+```
+
+### Commands / debugging
+
+```sh
+cat /proc/buddyinfo                           # free blocks per order per zone (fragmentation at a glance)
+sudo slabtop -o | head -20                    # biggest slab caches
+sudo cat /proc/slabinfo | grep kmalloc        # kmalloc-* size classes and object counts
+grep -E 'Slab|SReclaimable|SUnreclaim|VmallocUsed' /proc/meminfo   # slab and vmalloc totals
+sudo cat /proc/vmallocinfo | head             # every vmalloc area and who allocated it
+ls /sys/kernel/slab/                          # per-cache SLUB tunables and statistics
+cat /proc/zoneinfo | grep -E 'Node|free '     # free pages per zone
+```
+
+Debug options: **KASAN** (`CONFIG_KASAN`: out-of-bounds and use-after-free), **kmemleak** (`CONFIG_DEBUG_KMEMLEAK`, then `cat /sys/kernel/debug/kmemleak`), `slub_debug=FZPU` boot parameter (red zones, poisoning, owner tracking).
+
+### Pitfalls
+
+- `GFP_KERNEL` (or `vmalloc()`) in atomic context: "BUG: sleeping function called from invalid context".
+- Forgetting to check for `NULL`, or freeing on only some error paths (use the `goto` unwind pattern).
+- Mismatched free: `vfree()` for `vmalloc`, `kvfree()` for `kvmalloc`, `kmem_cache_free()` for caches, and the **same order** for `__free_pages()`.
+- `kmalloc(n * size)`: the multiplication can overflow. Use `kmalloc_array()` / `kcalloc()` / `array_size()`.
+- `virt_to_phys()` on vmalloc or stack memory: wrong address. DMA from such buffers corrupts memory. Use the DMA API.
+- Large `kmalloc()` (high order) after long uptime: may fail from fragmentation even with plenty of free memory. Use `kvmalloc()`.
+- Leaks: kernel memory is never freed at process exit. A leak in a module persists until reboot.
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| 16K = "default on Apple/Android 15+" | Apple silicon uses 16K. Android 15 *supports* 16K devices; 4K is still the common default (see §11). |
+| "VM_AREA: virtually contiguous allocation of physical pages" | A VMA is a range of *user* virtual addresses (§10). Kernel `vmalloc()` areas are a different thing (`struct vm_struct`, `/proc/vmallocinfo`). |
+| Physical contiguity: "you don't normally care" | True for virtual users. But `kmalloc()` *is* physically contiguous, and DMA buffers must be allocated with the DMA API. |
+
+### Revision questions
+
+1. Which GFP flag do you use in an interrupt handler, and why not `GFP_KERNEL`?
+2. When would you choose `vmalloc()` over `kmalloc()`, and what are its costs?
+3. Why can `kmalloc(64 KiB)` fail while `/proc/meminfo` shows gigabytes free?
+4. What does `kmalloc_obj()` improve over `kmalloc(sizeof(...))`?
+
+<details>
+<summary>Answers</summary>
+
+1. `GFP_ATOMIC`. `GFP_KERNEL` may sleep to reclaim memory, and sleeping in interrupt context is illegal (there is no task to put to sleep).
+2. For large buffers that only the CPU accesses, where physical contiguity is impossible or unnecessary. Costs: slower (page-table setup and TLB pressure), may sleep, not usable for DMA, `virt_to_phys()` is invalid.
+3. 64 KiB from kmalloc needs an order-4 block (16 contiguous pages). After fragmentation, free memory may exist only as scattered single pages (`/proc/buddyinfo`). Use `kvmalloc()`.
+4. The size comes from the pointer's type, so you cannot pass the wrong `sizeof`. The allocator can also see the type, which enables future hardening and alignment choices (7.0+).
+
+</details>
+
+### Source pointers
+
+- `include/linux/slab.h`, `mm/slub.c`, `mm/slab_common.c` (kmalloc size classes), `mm/page_alloc.c` (buddy allocator), `mm/vmalloc.c`, `include/linux/gfp_types.h` (flag definitions and docs)
+- `Documentation/core-api/memory-allocation.rst` (which allocator and flags to use), `Documentation/core-api/dma-api.rst`, `Documentation/mm/slub.rst`, `Documentation/dev-tools/kasan.rst`, `Documentation/dev-tools/kmemleak.rst`
+
+---
+
+## 13. The OOM Killer: `oom_score`, `oom_score_adj` and `oom_adj`
+
+*Builds on: §10 (RSS), §12 (allocation and GFP flags).*
+
+> **Remember**
+>
+> - When the kernel cannot reclaim enough memory for an allocation, the **OOM killer** (`mm/oom_kill.c`) picks one process and sends it `SIGKILL`.
+> - Victim = highest **badness**: RSS + swap entries + page-table pages, shifted by **`oom_score_adj`**.
+> - `/proc/<pid>/oom_score` (read-only) shows the badness. `/proc/<pid>/oom_score_adj` (−1000…+1000) is the knob. `oom_adj` (−17…+15) is the **deprecated** old knob.
+> - `oom_score_adj = -1000` means "never kill". PID 1 and kernel threads are never chosen.
+
+### Overview
+
+Linux **overcommits** memory: `mmap()`/`malloc()` succeed because pages are only allocated on first touch (§8, demand paging). If many processes then touch their memory and reclaim (dropping page cache, writeback, swap, compaction) fails, the page allocator calls `out_of_memory()`. Rather than let the whole system deadlock, the kernel sacrifices one process.
+
+### How it works
+
+```text
+alloc_pages() ──fails after reclaim/compaction retries──► __alloc_pages_may_oom()
+                                                              │
+                                                              ▼
+                                                      out_of_memory()          mm/oom_kill.c
+                                                              │  vm.panic_on_oom=1 → panic instead
+                                                              │  vm.oom_kill_allocating_task=1 → kill caller
+                                                              ▼
+                                                      select_bad_process()
+                                                      for each process: oom_badness()
+                                                              │ highest score wins
+                                                              ▼
+                                                      oom_kill_process()
+                                                      ├─ dump_header(): "invoked oom-killer", meminfo, task list (vm.oom_dump_tasks)
+                                                      ├─ SIGKILL victim (+ other processes sharing its mm)
+                                                      └─ wake oom_reaper kthread: unmaps victim's anonymous memory
+                                                         at once, without waiting for it to exit
+```
+
+`oom_badness()` in 6.12 (simplified):
+
+```text
+if PID 1 or kernel thread or oom_score_adj == -1000 or in vfork:  not eligible
+points  = rss_pages + swap_entries + page_table_pages      // memory the kill would free
+points += oom_score_adj * (totalpages / 1000)              // adj in thousandths of RAM+swap
+```
+
+So `oom_score_adj` is "± this many thousandths of total memory". For example, +500 makes a process look as if it used an extra 50% of RAM+swap.
+
+### The three `/proc/<pid>/` files
+
+| File | Range | R/W | Meaning |
+| ---- | ----- | --- | ------- |
+| `oom_score` | 0 … 2000 (see below) | Read-only | Current badness, scaled. Higher = killed first. 0 = not eligible. |
+| `oom_score_adj` | −1000 … +1000 | R/W | Bias added to badness. −1000 = never kill (`OOM_SCORE_ADJ_MIN`), +1000 = always first. |
+| `oom_adj` | −17 … +15 | R/W, **deprecated** | Legacy (pre-2.6.36) interface, kept for compatibility. −17 = `OOM_DISABLE`. Scaled to/from `oom_score_adj` (`adj × 1000 / 17`). Writing it logs a one-time "is deprecated" warning. |
+
+- **`oom_score` scaling:** `fs/proc/base.c` shows `(1000 + badness × 1000 / totalpages) × 2 / 3`. So a process using no memory with `oom_score_adj = 0` reads **666**, not 0. Checked: `cat /proc/self/oom_score` → `666` on the 6.8 test box and the 6.12 Pi. Many docs (and `proc.rst` in older kernels) still say 0–1000.
+- `oom_score_adj` is per **process** (`task->signal`), shared by all threads and **inherited across `fork()`**.
+- **Raising** it (less important) is always allowed for your own processes. **Lowering** it below the last value set by a privileged writer needs **`CAP_SYS_RESOURCE`**.
+- `systemd` sets it from the unit option `OOMScoreAdjust=`. `sshd` sets −1000 for its listener so you can still log in.
+
+### cgroups v2
+
+With a memory limit (`memory.max`), the OOM killer runs **inside the cgroup** and picks a victim among its tasks only. Victim selection works the same way, but `totalpages` becomes the cgroup's limit.
+
+- `memory.oom.group = 1`: kill the **whole cgroup** together (e.g. all processes of a container) rather than one task.
+- `memory.events`: `oom` / `oom_kill` counters.
+- User-space killers (`systemd-oomd`, `earlyoom`, Android `lmkd`) act **earlier** on pressure (PSI, `/proc/pressure/memory`) to avoid the kernel OOM path, which only runs when things are already very bad.
+
+### Commands / debugging
+
+```sh
+cat /proc/$$/oom_score                          # badness of this shell (666 = ~no memory, adj 0)
+cat /proc/$$/oom_score_adj                      # current bias (default 0)
+echo 500 > /proc/$$/oom_score_adj               # make this shell a preferred victim (no root needed)
+choom -p $$                                     # util-linux: show score and adj for a PID
+choom -n -1000 -- ./critical_daemon             # start a program that is never OOM-killed (needs CAP_SYS_RESOURCE)
+for p in /proc/[0-9]*; do                       # loop over every process
+  printf '%s %s %s\n' "$(cat $p/oom_score 2>/dev/null)" "${p#/proc/}" "$(cat $p/comm 2>/dev/null)"  # score, PID, name
+done | sort -rn | head                          # top 10 OOM candidates
+sysctl vm.overcommit_memory vm.panic_on_oom vm.oom_kill_allocating_task vm.oom_dump_tasks  # OOM policy knobs
+dmesg | grep -iE 'out of memory|oom-kill|killed process'   # find past OOM kills and their victims
+journalctl -k -g 'oom'                          # same, from the persistent kernel log
+echo f > /proc/sysrq-trigger                    # (root) trigger the OOM killer manually: test only!
+```
+
+Sysctls (`/proc/sys/vm/`):
+
+| Sysctl | Default | Effect |
+| ------ | ------- | ------ |
+| `overcommit_memory` | 0 | 0 = heuristic overcommit; 1 = always allow; 2 = strict (commit limit = swap + `overcommit_ratio`% of RAM; allocations fail with `ENOMEM` instead of OOM later) |
+| `panic_on_oom` | 0 | 1 = panic instead of killing (e.g. clusters that fail over); 2 = panic even for cgroup OOM |
+| `oom_kill_allocating_task` | 0 | 1 = kill the task that triggered the OOM, without scanning (faster on huge systems) |
+| `oom_dump_tasks` | 1 | Print the task table (pid, rss, pgtables, swapents, `oom_score_adj`) on each kill |
+
+### Pitfalls
+
+- Setting `oom_score_adj = -1000` on a memory-hungry process: when it leaks, the kernel kills everything else instead.
+- Relying on `malloc()` returning `NULL`: with overcommit it succeeds, and the process is killed later on first touch.
+- Using `oom_adj` in new scripts: use `oom_score_adj` (finer, −1000…1000).
+- Kernel code: a large `GFP_KERNEL` allocation in a driver can trigger the OOM killer. Use `__GFP_NORETRY` / `__GFP_RETRY_MAYFAIL` to fail instead, and always handle `NULL`. `GFP_ATOMIC` allocations never invoke the OOM killer: they simply fail.
+- Reading `oom_score` as a percentage: since 6.x it is scaled to 0–2000 × ⅔. Compare scores only with each other.
+
+### Corrections to raw notes
+
+| Raw notes said | Correct |
+| -------------- | ------- |
+| `oom_adj` listed alongside the others | It still exists but is **deprecated** (since 2.6.36). Use `oom_score_adj`. |
+
+### Revision questions
+
+1. Which three quantities make up a process's OOM badness, and how does `oom_score_adj` modify it?
+2. An idle `sleep` process shows `oom_score` 666. Why not 0?
+3. How do you make a critical daemon immune to the OOM killer, and what privilege is needed? What is the risk?
+4. With `vm.overcommit_memory = 2`, what happens instead of an OOM kill?
+
+<details>
+<summary>Answers</summary>
+
+1. RSS + swap entries + page-table pages (memory a kill would free). `oom_score_adj × totalpages / 1000` is added, so each unit is 1/1000 of RAM+swap. −1000 excludes the task.
+2. `/proc/<pid>/oom_score` reports `(1000 + badness × 1000 / totalpages) × 2 / 3`. With badness ≈ 0 that is 1000 × 2/3 = 666. Only ineligible tasks (adj −1000, PID 1, kthreads) show 0.
+3. Write −1000 to `/proc/<pid>/oom_score_adj` (or `OOMScoreAdjust=-1000`, `choom -n -1000`). Lowering it needs `CAP_SYS_RESOURCE`. Risk: if that daemon leaks, every other process is killed first.
+4. Strict accounting: allocations beyond the commit limit fail immediately with `ENOMEM` (`mmap`/`brk`/`fork`), so the program can handle the error itself.
+
+</details>
+
+### Source pointers
+
+- `mm/oom_kill.c` (`out_of_memory()`, `select_bad_process()`, `oom_badness()`, `oom_kill_process()`, `oom_reaper()`), `mm/page_alloc.c` (`__alloc_pages_may_oom()`)
+- `fs/proc/base.c` (`proc_oom_score()`, `oom_adj_write()`, `oom_score_adj_write()`), `include/uapi/linux/oom.h` (`OOM_SCORE_ADJ_MIN/MAX`, `OOM_DISABLE`)
+- `mm/memcontrol.c` (cgroup OOM), `Documentation/admin-guide/cgroup-v2.rst` (`memory.oom.group`)
+- `Documentation/filesystems/proc.rst` (`oom_score_adj`), `Documentation/admin-guide/sysctl/vm.rst`, `Documentation/mm/overcommit-accounting.rst`
+
+---
+
+## 14. Synchronisation: Spinlocks, RW Locks and RCU
+
+*Builds on: §4 (tasks), §6 (module code runs concurrently).*
 
 > **Remember**
 > - A **spinlock** busy-waits and disables preemption: hold it briefly and **never sleep** while holding it. Use `spin_lock_irqsave()` if an interrupt handler also takes the lock.
@@ -2496,7 +2550,79 @@ dmesg | grep -E 'BUG: sleeping function|BUG: scheduling while atomic|rcu_.*stall
 
 ---
 
-## 13. Device Types: Character, Block and Network
+## 15. Heterogeneous CPUs: big.LITTLE and Frequency Governors
+
+*Builds on: §14 (SMP: many CPUs at once).*
+
+> **Remember**
+>
+> - **big.LITTLE** (ARM; Intel calls it P-cores/E-cores) mixes fast, power-hungry cores with slow, efficient ones. Some SoCs have three tiers (big/medium/little).
+> - A higher frequency is not "better" by itself: power grows roughly with *f × V²*, so heat and battery drain rise faster than speed.
+> - **cpufreq governors** set each core's frequency dynamically. The scheduler's **EAS** (Energy Aware Scheduling) chooses *which kind* of core runs each task.
+
+### How it works
+
+```text
+             scheduler (EAS: picks a CPU using the energy model + task utilisation)
+                    │
+     ┌──────────────┼──────────────┐
+  little cores    medium         big cores        each cluster = one cpufreq "policy"
+  (A5x, in-order) (A7x)          (X-series)       sharing a clock
+     │               │               │
+  cpufreq governor per policy: schedutil reads the scheduler's utilisation → requests OPP
+     │
+  cpufreq driver (cppc, acpi-cpufreq, scmi, qcom-cpufreq-hw...) → sets the frequency/voltage pair (OPP)
+```
+
+| Governor | Behaviour |
+| -------- | --------- |
+| `schedutil` | Default on most modern kernels: frequency follows the scheduler's per-CPU utilisation (PELT) |
+| `performance` | Always the maximum frequency |
+| `powersave` | Always the minimum (with `intel_pstate` active mode, a different "balanced" algorithm) |
+| `ondemand` / `conservative` | Older load-sampling governors: jump / step up when busy |
+| `userspace` | User space writes the frequency |
+
+- **CPU capacity:** the kernel gives each CPU a relative capacity (`/sys/devices/system/cpu/cpu*/cpu_capacity`, 1024 = biggest), from Device Tree or ACPI. Unequal capacities enable **EAS** (`CONFIG_ENERGY_MODEL`, ARM64 mainly).
+- **Idle states (cpuidle)** are the other half of power management: governors `menu` / `teo` pick how deeply an idle core sleeps.
+- x86 hybrid CPUs (Alder Lake+) rely on hardware hints (**ITMT**, Thread Director) plus `intel_pstate`.
+
+### Commands / debugging
+
+```sh
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor             # active governor for CPU 0's policy
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors  # governors you can choose
+grep . /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq          # current frequency of every CPU (kHz)
+grep . /sys/devices/system/cpu/cpu*/cpu_capacity 2>/dev/null          # relative capacity (big = 1024), on ARM
+lscpu -e                                                              # per-CPU max/min MHz: reveals big vs little
+cpupower frequency-info                                               # driver, limits, governor (linux-tools)
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor   # (root) pin to max speed
+```
+
+The test box is a KVM guest, so it usually has **no cpufreq** directory (the host controls frequency). Try these on the Pi 5 (4 × Cortex-A76, all the same, so not big.LITTLE, but it has cpufreq; Raspberry Pi OS selects `ondemand`, checked on 6.12).
+
+### Revision questions
+
+1. Why might a phone run a background sync on a little core at low frequency even though a big core would finish sooner?
+2. What does `schedutil` use to choose a frequency?
+
+<details>
+<summary>Answers</summary>
+
+1. Energy per task: dynamic power grows roughly with *f·V²*. The little core at low voltage often uses less total energy, even though it takes longer, and the task is not latency-sensitive (race-to-idle does not always win).
+2. The scheduler's own utilisation signal (PELT) for the CPUs in the policy, scaled to the maximum frequency with some headroom. It updates on scheduler events, not by periodic sampling.
+
+</details>
+
+### Source pointers
+
+- `drivers/cpufreq/` (`cpufreq.c`, drivers), `kernel/sched/cpufreq_schedutil.c`, `kernel/sched/fair.c` (EAS: `find_energy_efficient_cpu()`), `drivers/cpuidle/`
+- `Documentation/admin-guide/pm/cpufreq.rst`, `Documentation/scheduler/sched-energy.rst`, `Documentation/scheduler/sched-capacity.rst`
+
+---
+
+## 16. Device Types: Character, Block and Network
+
+*Builds on: §6 (drivers are modules), §14 (locking).*
 
 > **Remember**
 > - Linux follows the Unix convention of **three device classes**: **character**, **block** and **network**.
@@ -2713,357 +2839,390 @@ cat /sys/block/sda/queue/scheduler               # block I/O scheduler for the d
 
 ---
 
-## 14. The OOM Killer: `oom_score`, `oom_score_adj` and `oom_adj`
+## 17. Tracing: ftrace, kprobes, `trace_marker` and ptrace
+
+*Builds on: §6 (kprobes from a module), §9 (syscalls).*
 
 > **Remember**
 >
-> - When the kernel cannot reclaim enough memory for an allocation, the **OOM killer** (`mm/oom_kill.c`) picks one process and sends it `SIGKILL`.
-> - Victim = highest **badness**: RSS + swap entries + page-table pages, shifted by **`oom_score_adj`**.
-> - `/proc/<pid>/oom_score` (read-only) shows the badness. `/proc/<pid>/oom_score_adj` (−1000…+1000) is the knob. `oom_adj` (−17…+15) is the **deprecated** old knob.
-> - `oom_score_adj = -1000` means "never kill". PID 1 and kernel threads are never chosen.
+> - **ftrace** is the kernel's built-in tracer. It writes events into a per-CPU **ring buffer** and is controlled through **tracefs** at `/sys/kernel/tracing`. Pick a tracer by writing to `current_tracer`: `function` (every kernel function call) or `function_graph` (entry + exit, call tree, durations).
+> - A **kprobe** dynamically instruments (almost) **any kernel instruction** at run time, with no recompile or reboot. It works by patching in a breakpoint (`int3` on x86, `BRK` on ARM64), or a jump when optimised. A **kretprobe** fires on function **return**.
+> - kprobes can be used three ways: from a **module** (`register_kprobe()`, GPL-only), from **tracefs** (`kprobe_events`, no code), or from **eBPF** (`bpftrace -e 'kprobe:…'`).
+> - kprobe handlers run in **atomic context**: they must not sleep and must be fast.
+> - **`trace_marker`** lets **user space** write text into the same ftrace ring buffer, so app events get **accurate kernel timestamps** and appear interleaved with kernel events on one timeline. Android's **atrace** (`ATRACE_BEGIN/END`, used by systrace/Perfetto) is built on it: user-mode events piggybacking on kernel tracing.
+> - **`ptrace()`** is the system call one process uses to trace/debug another (stop it, read/write its memory and registers, stop at each syscall). **gdb** and **strace** are built on it. It is a *different mechanism* from ftrace: per-process, stop-based and slow.
+> - **uprobes** (3.5+) do the same for **user-space** code, by file + offset. **eBPF** lets you attach your own verified handler to kprobes, uprobes or tracepoints from user space (e.g. `bpftrace`), with no module.
 
 ### Overview
 
-Linux **overcommits** memory: `mmap()`/`malloc()` succeed because pages are only allocated on first touch (§3, demand paging). If many processes then touch their memory and reclaim (dropping page cache, writeback, swap, compaction) fails, the page allocator calls `out_of_memory()`. Rather than let the whole system deadlock, the kernel sacrifices one process.
+Tracing answers "what is the kernel actually doing, and when?" without a debugger stopping the system. Static **tracepoints** are fixed hooks compiled into the source. **kprobes** add dynamic hooks wherever you need them. `trace_marker` joins the user-space view to the kernel timeline, so you can correlate "the app started drawing a frame" with "the scheduler preempted it".
 
-### How it works
+### Tracing, profiling, hooking, and the BPF lineage
+
+| Term | Meaning |
+| ---- | ------- |
+| **Tracing** | Record events in a flow (which functions ran, in what order, with what arguments) |
+| **Profiling** | "Gentle" tracing for performance: time spent per function, or statistical sampling (`perf record`) |
+| **Hooking** | Insert a detour so a call runs your code. It may change or skip the original (kprobes can change registers; livepatch/ftrace can redirect functions) |
+
+**BPF lineage:**
+
+| Step | Year / kernel | What |
+| ---- | ------------- | ---- |
+| Classic **BPF** (cBPF) | 1992 (McCanne & Van Jacobson) | Small register-based bytecode VM to filter packets **in the kernel** (what `tcpdump` compiles filters into) |
+| **seccomp-bpf** | 3.5 | cBPF program attached to a process that inspects each **syscall number and arguments**: allow, deny (`EPERM`), kill or trap. Used by Chrome, Android (zygote), systemd, Docker/Podman sandboxing |
+| **eBPF** | 3.18 (`bpf()` syscall), 4.1 (attach to kprobes) | 64-bit "extended" bytecode with maps and helper functions, checked by the **verifier** and JIT-compiled. The kernel provides the hook (kprobe, uprobe, tracepoint, XDP, LSM...); **you** supply the handler from user space, with no module needed. *Raw notes said "4.0-ish".* |
+
+- **tracefs** (`/sys/kernel/tracing`): ftrace control files. **debugfs** (`/sys/kernel/debug`): free-form debug files any driver can create (`debugfs_create_file()`); not an ABI, root only. tracefs used to live at `/sys/kernel/debug/tracing` and is still auto-mounted there.
+- *Raw notes said "to enable probes, kernel text has to be RWX at some point". With `CONFIG_STRICT_KERNEL_RWX`, text is never writable *and* executable. kprobes/ftrace patch it through a temporary writable alias mapping (`text_poke()`) while the text itself stays read-only + executable. Run-time patching is still a sensitive capability, which is why loading probes needs root / `CAP_BPF` + `CAP_PERFMON`.*
+
+### ftrace tracers
+
+ftrace has two parts: **tracers** (one active at a time, chosen via `current_tracer`) and **events** (tracepoints, kprobe events, markers: enabled independently).
+
+| Tracer | What it records | Config (all `=y` on the test box) |
+| ------ | --------------- | ------ |
+| `nop` | Nothing (default); events still work | n/a |
+| `function` | Every kernel function entry, with its caller | `CONFIG_FUNCTION_TRACER` |
+| `function_graph` | Entry **and** exit: an indented call tree with per-function duration | `CONFIG_FUNCTION_GRAPH_TRACER` |
+| `wakeup`, `wakeup_rt` | Worst-case wake-up latency | `CONFIG_SCHED_TRACER` |
+| `irqsoff`, `preemptoff` | Longest time with IRQs / preemption disabled | `CONFIG_IRQSOFF_TRACER`, `CONFIG_PREEMPT_TRACER` |
+
+- **How `function` tracing is nearly free when off:** the compiler inserts a call to `__fentry__` at the start of every function (`-pg -mfentry`). With `CONFIG_DYNAMIC_FTRACE`, the kernel patches these into **NOPs** at boot and only patches the ones you select back into calls.
+- **Always filter.** Tracing every function produces millions of lines per second. Use `set_ftrace_filter` (functions to trace), `set_graph_function` (roots for `function_graph`) and `set_ftrace_pid`.
+- `trace-cmd` is the command-line front end; KernelShark visualises its output.
+
+```bash
+cd /sys/kernel/tracing                          # tracefs control directory (root; ask first on the test box)
+cat available_tracers                           # tracers built into this kernel
+echo do_sys_openat2 > set_graph_function        # graph only calls made beneath do_sys_openat2
+echo function_graph > current_tracer            # select the function_graph tracer
+echo 1 > tracing_on                             # start recording
+cat /etc/hostname > /dev/null                   # do something that opens a file
+echo 0 > tracing_on                             # stop recording
+head -40 trace                                  # view the call tree with durations
+echo nop > current_tracer                       # switch tracing off again
+echo > set_graph_function                       # clear the filter
+sudo trace-cmd record -p function_graph -g do_sys_openat2 cat /etc/hostname   # same thing via trace-cmd
+sudo trace-cmd report | head -40                                              # print the recorded trace
+```
+
+Example `function_graph` output (shape):
 
 ```text
-alloc_pages() ──fails after reclaim/compaction retries──► __alloc_pages_may_oom()
-                                                              │
-                                                              ▼
-                                                      out_of_memory()          mm/oom_kill.c
-                                                              │  vm.panic_on_oom=1 → panic instead
-                                                              │  vm.oom_kill_allocating_task=1 → kill caller
-                                                              ▼
-                                                      select_bad_process()
-                                                      for each process: oom_badness()
-                                                              │ highest score wins
-                                                              ▼
-                                                      oom_kill_process()
-                                                      ├─ dump_header(): "invoked oom-killer", meminfo, task list (vm.oom_dump_tasks)
-                                                      ├─ SIGKILL victim (+ other processes sharing its mm)
-                                                      └─ wake oom_reaper kthread: unmaps victim's anonymous memory
-                                                         at once, without waiting for it to exit
+ 1)               |  do_sys_openat2() {
+ 1)               |    getname() {
+ 1)   0.912 us    |      kmem_cache_alloc();
+ 1)   1.803 us    |    }
+ 1) + 12.345 us   |  }
 ```
 
-`oom_badness()` in 6.12 (simplified):
+### How it works: kprobes
 
 ```text
-if PID 1 or kernel thread or oom_score_adj == -1000 or in vfork:  not eligible
-points  = rss_pages + swap_entries + page_table_pages      // memory the kill would free
-points += oom_score_adj * (totalpages / 1000)              // adj in thousandths of RAM+swap
+ register_kprobe(&kp)                        CPU executes probed address
+        │                                              │
+        ▼                                              ▼
+ save original instruction            int3 trap ─> kprobe handler dispatch
+ write int3 (0xCC) over it                         │
+ (or a jmp, if optimised: OPTPROBES)               ├─ pre_handler(p, regs)
+                                                   ├─ single-step the saved original
+                                                   │   instruction (out of line)
+                                                   ├─ post_handler (optional)
+                                                   └─ resume after the probe
+ kretprobe: at entry, the return address is replaced with a trampoline
+            → the handler runs when the function returns (return value in regs)
 ```
 
-So `oom_score_adj` is "± this many thousandths of total memory". For example, +500 makes a process look as if it used an extra 50% of RAM+swap.
+- **Blacklist:** code the kprobe machinery itself uses cannot be probed (functions marked `NOKPROBE_SYMBOL()`, `__kprobes`, parts of entry code). List them with `/sys/kernel/debug/kprobes/blacklist`.
+- **Inlined or `static` functions** may have no symbol of their own, so probe by address + offset or pick a caller. Check that the symbol exists with `grep -w <sym> /proc/kallsyms`.
+- **Cost:** an `int3` probe costs a trap per hit (~µs). An **optimised** probe (`CONFIG_OPTPROBES`, `debug.kprobes-optimization = 1`) uses a jump and is much cheaper. A probe on a function entry that has an ftrace `fentry` site uses ftrace instead (`CONFIG_KPROBES_ON_FTRACE`).
+- **Test box:** `CONFIG_KPROBES`, `KRETPROBES`, `OPTPROBES`, `KPROBES_ON_FTRACE`, `KPROBE_EVENTS`, `UPROBE_EVENTS` are all `=y`; tracefs is mounted at `/sys/kernel/tracing`.
 
-### The three `/proc/<pid>/` files
+### uprobes: kprobes for user space (Linux 3.5+)
 
-| File | Range | R/W | Meaning |
-| ---- | ----- | --- | ------- |
-| `oom_score` | 0 … 2000 (see below) | Read-only | Current badness, scaled. Higher = killed first. 0 = not eligible. |
-| `oom_score_adj` | −1000 … +1000 | R/W | Bias added to badness. −1000 = never kill (`OOM_SCORE_ADJ_MIN`), +1000 = always first. |
-| `oom_adj` | −17 … +15 | R/W, **deprecated** | Legacy (pre-2.6.36) interface, kept for compatibility. −17 = `OOM_DISABLE`. Scaled to/from `oom_score_adj` (`adj × 1000 / 17`). Writing it logs a one-time "is deprecated" warning. |
+**uprobes** bring the kprobe idea to **user-space code**. Since Linux 3.5, you can probe any instruction in a user binary or shared library by **file + offset**, usually given as a user **symbol** (e.g. `readline` in `/bin/bash`, `malloc` in libc). A **uretprobe** fires on return.
 
-- **`oom_score` scaling:** `fs/proc/base.c` shows `(1000 + badness × 1000 / totalpages) × 2 / 3`. So a process using no memory with `oom_score_adj = 0` reads **666**, not 0. Checked: `cat /proc/self/oom_score` → `666` on the 6.8 test box and the 6.12 Pi. Many docs (and `proc.rst` in older kernels) still say 0–1000.
-- `oom_score_adj` is per **process** (`task->signal`), shared by all threads and **inherited across `fork()`**.
-- **Raising** it (less important) is always allowed for your own processes. **Lowering** it below the last value set by a privileged writer needs **`CAP_SYS_RESOURCE`**.
-- `systemd` sets it from the unit option `OOMScoreAdjust=`. `sshd` sets −1000 for its listener so you can still log in.
+- **Mechanism:** the kernel places a breakpoint (`int3`) in the **page cache page** of the file at that offset, copy-on-write per process. So **every process** that maps the file hits the probe, including processes started later, unless you filter by PID. The trap enters the kernel, which runs the handler (a trace event, BPF program or perf) and then single-steps the original instruction out of line (XOL area).
+- **No ptrace, no recompile:** the target is not stopped and there is no tracer process. Compared with `ltrace`, it is far cheaper, but each hit still costs a user→kernel trap (~1–3 µs).
+- **Symbols:** they need the binary's symbol table (or debuginfo). Stripped binaries can still be probed by raw offset.
+- **USDT** (user statically defined tracing, e.g. `DTRACE_PROBE` in glibc, Python, PostgreSQL) are static NOP markers in user code, activated through uprobes: the user-space analogue of tracepoints.
+- Config: `CONFIG_UPROBES`, `CONFIG_UPROBE_EVENTS` (`=y` on the test box).
 
-### cgroups v2
-
-With a memory limit (`memory.max`), the OOM killer runs **inside the cgroup** and picks a victim among its tasks only. Victim selection works the same way, but `totalpages` becomes the cgroup's limit.
-
-- `memory.oom.group = 1`: kill the **whole cgroup** together (e.g. all processes of a container) rather than one task.
-- `memory.events`: `oom` / `oom_kill` counters.
-- User-space killers (`systemd-oomd`, `earlyoom`, Android `lmkd`) act **earlier** on pressure (PSI, `/proc/pressure/memory`) to avoid the kernel OOM path, which only runs when things are already very bad.
-
-### Commands / debugging
-
-```sh
-cat /proc/$$/oom_score                          # badness of this shell (666 = ~no memory, adj 0)
-cat /proc/$$/oom_score_adj                      # current bias (default 0)
-echo 500 > /proc/$$/oom_score_adj               # make this shell a preferred victim (no root needed)
-choom -p $$                                     # util-linux: show score and adj for a PID
-choom -n -1000 -- ./critical_daemon             # start a program that is never OOM-killed (needs CAP_SYS_RESOURCE)
-for p in /proc/[0-9]*; do                       # loop over every process
-  printf '%s %s %s\n' "$(cat $p/oom_score 2>/dev/null)" "${p#/proc/}" "$(cat $p/comm 2>/dev/null)"  # score, PID, name
-done | sort -rn | head                          # top 10 OOM candidates
-sysctl vm.overcommit_memory vm.panic_on_oom vm.oom_kill_allocating_task vm.oom_dump_tasks  # OOM policy knobs
-dmesg | grep -iE 'out of memory|oom-kill|killed process'   # find past OOM kills and their victims
-journalctl -k -g 'oom'                          # same, from the persistent kernel log
-echo f > /proc/sysrq-trigger                    # (root) trigger the OOM killer manually: test only!
+```bash
+sudo bpftrace -e 'uprobe:/bin/bash:readline { printf("readline by pid %d\n", pid); }'           # fire on every bash readline() call
+sudo bpftrace -e 'uretprobe:/bin/bash:readline { printf("%s\n", str(retval)); }'                # print each line typed into any bash
+sudo bpftrace -e 'uprobe:/lib/x86_64-linux-gnu/libc.so.6:malloc /pid == 1234/ { @[arg0] = count(); }'  # histogram of malloc sizes for one PID
+sudo perf probe -x /bin/bash readline                                                           # create a uprobe event via perf
+echo 'p:bashrl /bin/bash:0x<offset>' | sudo tee -a /sys/kernel/tracing/uprobe_events            # raw tracefs form: file + offset (offset from nm/objdump)
 ```
 
-Sysctls (`/proc/sys/vm/`):
+### Worked example: tracing outbound TCP connections with bpftrace
 
-| Sysctl | Default | Effect |
-| ------ | ------- | ------ |
-| `overcommit_memory` | 0 | 0 = heuristic overcommit; 1 = always allow; 2 = strict (commit limit = swap + `overcommit_ratio`% of RAM; allocations fail with `ENOMEM` instead of OOM later) |
-| `panic_on_oom` | 0 | 1 = panic instead of killing (e.g. clusters that fail over); 2 = panic even for cgroup OOM |
-| `oom_kill_allocating_task` | 0 | 1 = kill the task that triggered the OOM, without scanning (faster on huge systems) |
-| `oom_dump_tasks` | 1 | Print the task table (pid, rss, pgtables, swapents, `oom_score_adj`) on each kill |
+Class demo: attach a kprobe to `tcp_v4_connect()` and print who opens each IPv4 TCP connection, and to which address. Run it in one terminal, then run `curl` in another.
 
-### Pitfalls
+```bash
+sudo bpftrace -e 'kprobe:tcp_v4_connect {                   /* fire on entry to tcp_v4_connect() */
+	$s = (struct sockaddr_in *)arg1;                     /* arg1 = 2nd argument (uaddr), cast to IPv4 sockaddr */
+	printf("%s %d %s %s\n", username, pid, comm,        /* user name, PID, process name ... */
+	       ntop($s->sin_addr.s_addr));                   /* ... and destination IPv4 address as text */
+}'
+curl -4 https://example.com                                  # in a second terminal: -4 forces IPv4 so the probe fires
+```
 
-- Setting `oom_score_adj = -1000` on a memory-hungry process: when it leaks, the kernel kills everything else instead.
-- Relying on `malloc()` returning `NULL`: with overcommit it succeeds, and the process is killed later on first touch.
-- Using `oom_adj` in new scripts: use `oom_score_adj` (finer, −1000…1000).
-- Kernel code: a large `GFP_KERNEL` allocation in a driver can trigger the OOM killer. Use `__GFP_NORETRY` / `__GFP_RETRY_MAYFAIL` to fail instead, and always handle `NULL`. `GFP_ATOMIC` allocations never invoke the OOM killer: they simply fail.
-- Reading `oom_score` as a percentage: since 6.x it is scaled to 0–2000 × ⅔. Compare scores only with each other.
+Find probe points before writing a script:
 
-### Corrections to raw notes
+```bash
+sudo bpftrace -l 'kprobe:tcp*'                               # list every kprobe-able kernel function starting with "tcp"
+sudo bpftrace -l 'tracepoint:sock:*'                         # list the (stable) socket tracepoints
+sudo bpftrace -lv 'tracepoint:sock:inet_sock_set_state'      # -v also shows the tracepoint's argument fields
+```
 
-| Raw notes said | Correct |
-| -------------- | ------- |
-| `oom_adj` listed alongside the others | It still exists but is **deprecated** (since 2.6.36). Use `oom_score_adj`. |
-
-### Revision questions
-
-1. Which three quantities make up a process's OOM badness, and how does `oom_score_adj` modify it?
-2. An idle `sleep` process shows `oom_score` 666. Why not 0?
-3. How do you make a critical daemon immune to the OOM killer, and what privilege is needed? What is the risk?
-4. With `vm.overcommit_memory = 2`, what happens instead of an OOM kill?
-
-<details>
-<summary>Answers</summary>
-
-1. RSS + swap entries + page-table pages (memory a kill would free). `oom_score_adj × totalpages / 1000` is added, so each unit is 1/1000 of RAM+swap. −1000 excludes the task.
-2. `/proc/<pid>/oom_score` reports `(1000 + badness × 1000 / totalpages) × 2 / 3`. With badness ≈ 0 that is 1000 × 2/3 = 666. Only ineligible tasks (adj −1000, PID 1, kthreads) show 0.
-3. Write −1000 to `/proc/<pid>/oom_score_adj` (or `OOMScoreAdjust=-1000`, `choom -n -1000`). Lowering it needs `CAP_SYS_RESOURCE`. Risk: if that daemon leaks, every other process is killed first.
-4. Strict accounting: allocations beyond the commit limit fail immediately with `ENOMEM` (`mmap`/`brk`/`fork`), so the program can handle the error itself.
-
-</details>
-
-### Source pointers
-
-- `mm/oom_kill.c` (`out_of_memory()`, `select_bad_process()`, `oom_badness()`, `oom_kill_process()`, `oom_reaper()`), `mm/page_alloc.c` (`__alloc_pages_may_oom()`)
-- `fs/proc/base.c` (`proc_oom_score()`, `oom_adj_write()`, `oom_score_adj_write()`), `include/uapi/linux/oom.h` (`OOM_SCORE_ADJ_MIN/MAX`, `OOM_DISABLE`)
-- `mm/memcontrol.c` (cgroup OOM), `Documentation/admin-guide/cgroup-v2.rst` (`memory.oom.group`)
-- `Documentation/filesystems/proc.rst` (`oom_score_adj`), `Documentation/admin-guide/sysctl/vm.rst`, `Documentation/mm/overcommit-accounting.rst`
-
----
-
-## 15. Kernel Memory Allocation: `kmalloc`, `vmalloc` and GFP Flags
-
-> **Remember**
->
-> - The kernel has no `malloc()`. It uses `kmalloc(size, gfp)` / `kfree()`, where **GFP flags** say *how* to allocate (may it sleep? which zone?).
-> - **`GFP_KERNEL`**: may sleep (process context). **`GFP_ATOMIC`**: never sleeps (IRQ/spinlock context) but fails more easily.
-> - `kmalloc()` memory is **physically contiguous** (direct map). `vmalloc()` is only **virtually** contiguous: use it for big buffers that no hardware touches.
-> - Physical contiguity only matters for **DMA** and hardware. Otherwise you work purely with virtual addresses.
-> - Everything is ultimately pages: think in `PAGE_SIZE`, never in 4096.
-
-### Overview
-
-User space has a private address space and a `malloc()` heap that hides allocation details. In the kernel, every piece of code shares **one** address space. The allocator must know the caller's context: a call that sleeps to reclaim memory would deadlock or crash in an interrupt handler. So every allocation states its constraints.
-
-### How it works: the allocator layers
+Example output (illustrative):
 
 ```text
- kmalloc / kzalloc / kmalloc_obj      kmem_cache_alloc (your own cache)     vmalloc / kvmalloc
-            │                                   │                               │
-            ▼                                   ▼                               │
-   kmalloc-8 … kmalloc-8k caches ──► SLUB slab allocator (mm/slub.c)            │
-            │ (> 2 pages: straight to the page allocator)                       │
-            ▼                                                                   ▼
-             buddy page allocator: alloc_pages(gfp, order) → 2^order contiguous pages
-                                    │       (zones: DMA, DMA32, NORMAL, MOVABLE)
-                                    ▼
-                         physical page frames (struct page)
-      kmalloc: pages used via the direct map      vmalloc: separate pages, stitched together in
-      (physically contiguous)                       the vmalloc area by new page tables
+alex 4242 curl 93.184.215.14
 ```
 
-| Allocator | Contiguous | Max size | Speed | Typical use |
-| --------- | ---------- | -------- | ----- | ----------- |
-| `kmalloc()` / `kzalloc()` | Physically + virtually | `KMALLOC_MAX_SIZE` (4 MiB on x86_64 4K pages); fails more often above a few pages | Fast | Objects, small/medium buffers, anything DMA'd via the streaming API |
-| `kmem_cache_alloc()` | Physically | One object | Fastest; less waste | Many objects of one type (`task_struct`, inodes, your driver's structs) |
-| `vmalloc()` | Virtually only | Large (limited by vmalloc space) | Slower: page-table setup, TLB cost; **may sleep** | Large buffers: module code, big tables |
-| `kvmalloc()` | Tries `kmalloc`, falls back to `vmalloc` | Large | Best of both | Large buffers of unknown size; free with `kvfree()` |
-| `alloc_pages()` / `__get_free_pages()` | Physically, 2^order pages | `MAX_PAGE_ORDER` (10: 4 MiB) | Fast | Page-granular buffers, page cache, building blocks |
-| `dma_alloc_coherent()` | Physically (as the **device** sees it) | Platform-dependent | Slow | DMA buffers shared with hardware |
+- **Signature:** `int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)` in `net/ipv4/tcp_ipv4.c`. In bpftrace, `arg0`, `arg1`, … are the probed function's arguments (read from `pt_regs`: `rdi`, `rsi`, … on x86_64; `x0`, `x1`, … on ARM64), so `arg1` is `uaddr`.
+- **Why the cast works:** bpftrace reads kernel type definitions from **BTF** (`/sys/kernel/btf/vmlinux`, present on the test box), so `struct sockaddr_in` resolves with no headers. On kernels without BTF you need `#include <linux/in.h>` in the script.
+- **Builtins used:** `username` (user name from the UID), `pid` (really the TGID), `comm` (task name, 16 bytes), and `ntop()` (formats an IP address as a string).
+- **IPv6:** `tcp_v4_connect` only sees IPv4. If `example.com` resolves to IPv6, `curl` uses `tcp_v6_connect()` and nothing prints. Use `curl -4`, or also probe `kprobe:tcp_v6_connect` and cast `arg1` to `struct sockaddr_in6 *`.
+- **Scope:** this fires on the `connect()` path only (outbound, before the handshake completes). Accepted (inbound) connections go through `inet_csk_accept()`. bcc's `tcpconnect` tool does the same job with more polish (`sudo tcpconnect-bpfcc` on Ubuntu).
+- **Stable alternative:** the `sock:inet_sock_set_state` tracepoint (`tracepoint:sock:inet_sock_set_state`) sees TCP state changes for IPv4 and IPv6 without depending on internal function names.
+- ⚠️ Not run on the test box: it needs root. The ingredients are present: bpftrace v0.20.2, BTF, and the `tcp_v4_connect` symbol in `/proc/kallsyms`.
 
-### GFP flags
+### How it works: `trace_marker` and Android atrace
 
-| Flag | May sleep? | Use |
-| ---- | ---------- | --- |
-| `GFP_KERNEL` | Yes (reclaim, I/O, even the OOM killer, §14) | Default in process context |
-| `GFP_ATOMIC` | **No**; may use emergency reserves | IRQ handlers, softirqs, under a spinlock |
-| `GFP_NOWAIT` | No; no reserves | Opportunistic allocations that can fail cheaply |
-| `GFP_NOIO` / `GFP_NOFS` | Yes, but no I/O / no filesystem calls | Inside block / filesystem code (avoids recursion deadlocks). Prefer `memalloc_noio_save()` / `memalloc_nofs_save()` scopes |
-| `GFP_USER` / `GFP_HIGHUSER` | Yes | Pages that are mapped to user space |
-| `GFP_DMA` / `GFP_DMA32` | n/a (zone modifier) | Memory below 16 MiB / 4 GiB for limited devices (prefer the DMA API) |
-| `__GFP_ZERO` | n/a (modifier) | Zero the memory (`kzalloc()` = `kmalloc(..., gfp \| __GFP_ZERO)`) |
-| `__GFP_NOWARN`, `__GFP_NORETRY`, `__GFP_RETRY_MAYFAIL`, `__GFP_NOFAIL` | n/a (modifiers) | Silence the failure warning / give up early / try hard but may fail / never fail (avoid) |
+```text
+ app / framework                          kernel
+ ATRACE_BEGIN("draw")  ─ write() ─>  /sys/kernel/tracing/trace_marker
+   "B|1234|draw"                            │
+ ATRACE_END()          ─ write() ─>         ▼
+   "E|1234"                        ftrace ring buffer  <── sched_switch, irq, kprobe events …
+                                            │
+                                    atrace / Perfetto  ──> one timeline (UI: ui.perfetto.dev)
+```
+
+- Anything written to `trace_marker` appears in the trace as a `tracing_mark_write:` event with the writer's PID and a timestamp.
+- Android atrace text format: `B|<pid>|<name>` begins a slice, `E|<pid>` ends it, and `C|<pid>|<name>|<value>` records a counter. **atrace** enables *categories* (`gfx`, `view`, `sched`, `freq`, …) and collects the buffer. **Perfetto** has replaced systrace as the recording/viewing tool.
+- `trace_marker_raw` accepts binary records instead of text.
+- **Why go through the kernel?** Timestamps come from the same trace clock as scheduler, IRQ and kprobe events, so user and kernel events line up accurately on one timeline. atrace is user-mode instrumentation piggybacking on kernel tracing, not a separate tracer.
+
+### ptrace and strace
+
+**`ptrace()`** is the system call behind debuggers and `strace`. The **tracer** attaches to a **tracee**. The kernel then stops the tracee at chosen points and wakes the tracer (via `waitpid()`), which can inspect and modify the tracee before letting it continue.
+
+```text
+ strace (tracer)                       kernel                       traced process (tracee)
+ ptrace(PTRACE_SEIZE, pid) ──────────> attach                        running …
+ ptrace(PTRACE_SYSCALL)    ──────────> resume, stop at next syscall  openat(...) ──┐
+ waitpid()  <────────────── syscall-entry stop  <────────────────────────────────┘
+ PTRACE_GET_SYSCALL_INFO: read nr + args, print "openat(AT_FDCWD, "/etc/hostname", …"
+ ptrace(PTRACE_SYSCALL)    ──────────> run syscall, stop at exit
+ waitpid()  <────────────── syscall-exit stop: print " = 3"
+             … two stops and four context switches per system call …
+```
+
+| Request | Purpose |
+| ------- | ------- |
+| `PTRACE_TRACEME` | Child asks to be traced by its parent (how `strace cmd` / `gdb cmd` start) |
+| `PTRACE_ATTACH` / `PTRACE_SEIZE` | Attach to a running process (`SEIZE` does not stop it; preferred) |
+| `PTRACE_SYSCALL` | Continue, stopping at the next syscall entry/exit (strace) |
+| `PTRACE_PEEKDATA` / `POKEDATA`, `GETREGS` / `SETREGS` | Read/write tracee memory and registers (gdb breakpoints) |
+| `PTRACE_CONT` / `PTRACE_DETACH` | Resume / detach |
+
+- **Permissions:** you can trace your own processes (same UID, no setuid). **Yama** `kernel.yama.ptrace_scope` restricts this further: 0 = classic, **1 = only your descendants** (Ubuntu default; test box = 1), 2 = only with `CAP_SYS_PTRACE`, 3 = no ptrace at all. `CAP_SYS_PTRACE` overrides (§7).
+- **Overhead:** each syscall stops the tracee twice, so `strace` can slow syscall-heavy programs by 10–100×. For low overhead, use `perf trace` or `bpftrace` (in-kernel, no stops).
+- A process can have only **one** tracer, so you cannot `strace` a process that `gdb` is already attached to. `TracerPid:` in `/proc/<pid>/status` shows who is tracing it.
+- `ltrace` traces **library** calls (via breakpoints on PLT entries, again using ptrace).
+
+```bash
+strace -f -e trace=openat,read -o out.txt ls    # follow children, only openat/read, write to out.txt
+strace -c ls > /dev/null                        # summary: count and time per syscall
+strace -T -tt -p <pid>                          # attach to a running process (needs ptrace permission), show time per call
+cat /proc/sys/kernel/yama/ptrace_scope          # current Yama ptrace restriction level
+grep TracerPid /proc/<pid>/status               # PID of the process tracing <pid> (0 = none)
+sudo perf trace -s ls                           # strace-like syscall summary without ptrace stops
+```
+
+### Cross-memory attach: `process_vm_readv()` / `process_vm_writev()`
+
+**Cross-memory attach (CMA)** (Linux 3.2+, `CONFIG_CROSS_MEMORY_ATTACH`, on by default) lets a process copy data **directly between its own memory and another process's memory** in one system call. The kernel copies straight from one address space to the other, so the data is copied only once. Nothing is mapped, and the target process does not need to stop. *Raw notes said "xma" and `process_vm_ready`; correct names are CMA and `process_vm_readv`.*
+
+```c
+ssize_t process_vm_readv(pid_t pid,	/* target process (TGID) */
+	const struct iovec *local_iov, unsigned long liovcnt,	/* where to put the data, in our memory */
+	const struct iovec *remote_iov, unsigned long riovcnt,	/* where to read from, in the target's memory */
+	unsigned long flags);	/* must be 0 */
+/* process_vm_writev() has the same arguments and copies the other way */
+```
+
+| Method | Copies | Target must stop? | Calls needed |
+| ------ | ------ | ----------------- | ------------ |
+| `PTRACE_PEEKDATA` / `POKEDATA` | One word (8 bytes) per call | Yes (ptrace-stopped) | One per word: very slow |
+| `/proc/<pid>/mem` + `pread()` / `pwrite()` | Any size, one region per call | No | `open()` plus one per region |
+| Pipe / socket / shared memory | Twice (in and out of a kernel buffer), or needs both sides to set up a mapping | No, but the target must cooperate | Several |
+| **`process_vm_readv()` / `writev()`** | **Once**, many scattered regions per call (`iovec`) | **No** | **One** |
+
+- **Why it is preferred:** single copy, scatter/gather in one call, no cooperation needed from the target. MPI libraries (Open MPI, MPICH) use it for large intra-node messages, and debuggers and profilers use it to read a target's memory quickly.
+- **Permission:** the same check as `ptrace` attach (`PTRACE_MODE_ATTACH_REALCREDS`): same user and not setuid, or `CAP_SYS_PTRACE`. **Yama** `ptrace_scope` applies too, so with the Ubuntu default of 1 you can only read your own descendants unless you have `CAP_SYS_PTRACE`.
+- **Not atomic:** the target keeps running and may change the data mid-copy. A short count is returned if a remote page is unmapped (`EFAULT` only if nothing was copied). Errors: `ESRCH` (no such process), `EPERM` (not allowed).
+- Kernel source: `mm/process_vm_access.c` (it pins the remote pages with `pin_user_pages_remote()` and copies with `copy_page_to_iter()` / `copy_page_from_iter()`).
+
+```bash
+grep CONFIG_CROSS_MEMORY_ATTACH /boot/config-$(uname -r)   # is CMA built in? (=y on Ubuntu)
+man 2 process_vm_readv                                     # full API and error codes
+strace -e trace=process_vm_readv gdb -p <pid> -batch       # see a debugger use it (needs ptrace permission)
+```
 
 ### Key APIs / structures
 
 | API | Header | Purpose | Context |
 | --- | ------ | ------- | ------- |
-| `kmalloc(size, gfp)`, `kzalloc()`, `kfree()` | `<linux/slab.h>` | General allocation (zeroed with `kzalloc`) | Per GFP flag; `kfree()` any context |
-| `kmalloc_array(n, size, gfp)`, `kcalloc()` | `<linux/slab.h>` | Arrays with **overflow-checked** `n * size` | Per GFP flag |
-| `kmalloc_obj(*p, gfp)`, `kmalloc_objs(*p, n, gfp)` | `<linux/slab.h>` | **Linux 7.0+:** type-aware forms of `kmalloc(sizeof(*p), gfp)` / `kmalloc_array()`; no `sizeof` to get wrong | Per GFP flag |
-| `krealloc()`, `kstrdup()`, `kmemdup()` | `<linux/slab.h>`, `<linux/string.h>` | Resize; duplicate a string / buffer | Per GFP flag |
-| `kmem_cache_create()` / `KMEM_CACHE()`, `kmem_cache_alloc()` / `kmem_cache_zalloc()`, `kmem_cache_free()`, `kmem_cache_destroy()` | `<linux/slab.h>` | Dedicated object cache | Create/destroy: process context |
-| `vmalloc()`, `vzalloc()`, `vfree()` | `<linux/vmalloc.h>` | Virtually contiguous memory | **Process context, may sleep** |
-| `kvmalloc()`, `kvfree()` | `<linux/slab.h>` | kmalloc, falling back to vmalloc | Process context (`GFP_KERNEL`-compatible flags) |
-| `alloc_pages(gfp, order)`, `__free_pages()`, `__get_free_pages()`, `free_pages()` | `<linux/gfp.h>` | Buddy allocator: 2^order pages | Per GFP flag |
-| `devm_kzalloc(dev, size, gfp)` | `<linux/device.h>` | Allocation freed automatically when the driver detaches | Probe path |
-| `dma_alloc_coherent(dev, size, &dma_handle, gfp)` | `<linux/dma-mapping.h>` | Buffer the device and the CPU can both access | Usually process context |
-| `virt_to_phys()`, `page_address()`, `is_vmalloc_addr()`, `vmalloc_to_page()` | `<linux/io.h>`, `<linux/mm.h>` | Translate between address kinds | Any |
-
-- `kmalloc_obj` example: `p = kmalloc(sizeof(*p), GFP_KERNEL);` becomes `p = kmalloc_obj(*p, GFP_KERNEL);`. It was added in **7.0**, and a tree-wide Coccinelle conversion is ongoing (7.x). It is **not** in 6.8 or 6.12 (the test box), so course code for 6.x must use `kmalloc()`. ⚠️ Verify the exact 7.x signature against the course kernel (some revisions of the series made the GFP argument optional).
+| `struct kprobe` | `<linux/kprobes.h>` | `.symbol_name` / `.addr` / `.offset`, `.pre_handler`, `.post_handler` | n/a |
+| `register_kprobe()` / `unregister_kprobe()` | `<linux/kprobes.h>` | Plant / remove a probe (`EXPORT_SYMBOL_GPL`) | Process; may sleep |
+| `struct kretprobe`, `register_kretprobe()` | `<linux/kprobes.h>` | Handler on function return; `regs_return_value(regs)` | Process; may sleep |
+| kprobe `pre_handler` | n/a | Your code at the probe point | **Atomic**: no sleep, preemption disabled |
+| `trace_printk()` | `<linux/kernel.h>` | Fast debug print into the ftrace buffer (debug only; prints a warning banner at boot/load) | Any context |
 
 ### Code example
 
-Complete module: [`examples/kmalloc_demo/kmalloc_demo.c`](examples/kmalloc_demo/kmalloc_demo.c) + [`Makefile`](examples/kmalloc_demo/Makefile). It allocates with `kzalloc()`, `vmalloc()`, a `KMEM_CACHE()` and `alloc_pages()`, prints each address kind, and unwinds in reverse order with `goto`. **Built on 6.8 x86_64** (not loaded).
-
-Core pattern:
+Minimal kprobe module (excerpt). Full file and `Makefile`: [`examples/kprobe_demo/`](examples/kprobe_demo/). **Built on 6.8 x86_64** (not loaded).
 
 ```c
-struct foo *p;                                /* pointer to the new object */
-
-p = kzalloc(sizeof(*p), GFP_KERNEL);          /* zeroed allocation; sizeof(*p) stays correct if the type changes */
-if (!p)                                       /* allocations can fail: always check */
-	return -ENOMEM;                       /* standard error for out of memory */
-/* ... use p ... */
-kfree(p);                                     /* free it; kfree(NULL) is a safe no-op */
+static int handler_pre(struct kprobe *p, struct pt_regs *regs)	/* called just before the probed instruction runs */
+{									/* start of handler_pre(): atomic context, must not sleep */
+	pr_info_ratelimited("kprobe_demo: %s hit by %s (pid %d)\n",	/* rate-limited so a busy probe cannot flood the log */
+			    p->symbol_name, current->comm,		/* probed symbol name and the calling task's name */
+			    task_pid_nr(current));			/* calling task's PID */
+	return 0;							/* 0 = continue and execute the probed instruction normally */
+}									/* end of handler_pre() */
+static struct kprobe kp = {		/* the probe descriptor, registered in init */
+	.pre_handler = handler_pre,	/* run handler_pre() on every hit */
+	.symbol_name = "kernel_clone",	/* probe the fork/clone path (the demo takes this from a module parameter) */
+};					/* end of kp */
+/* in init: ret = register_kprobe(&kp);  in exit: unregister_kprobe(&kp); */
 ```
 
 ### Commands / debugging
 
-```sh
-cat /proc/buddyinfo                           # free blocks per order per zone (fragmentation at a glance)
-sudo slabtop -o | head -20                    # biggest slab caches
-sudo cat /proc/slabinfo | grep kmalloc        # kmalloc-* size classes and object counts
-grep -E 'Slab|SReclaimable|SUnreclaim|VmallocUsed' /proc/meminfo   # slab and vmalloc totals
-sudo cat /proc/vmallocinfo | head             # every vmalloc area and who allocated it
-ls /sys/kernel/slab/                          # per-cache SLUB tunables and statistics
-cat /proc/zoneinfo | grep -E 'Node|free '     # free pages per zone
+kprobe without writing any code, using tracefs (needs root; ask first on the test box):
+
+```bash
+cd /sys/kernel/tracing                                          # tracefs control directory
+echo 'p:myclone kernel_clone' >> kprobe_events                  # define kprobe event "myclone" at kernel_clone entry
+echo 'r:myopen do_sys_openat2 ret=$retval' >> kprobe_events     # define kretprobe event recording the return value
+echo 1 > events/kprobes/enable                                  # enable all kprobe events
+cat trace_pipe                                                  # stream events live (Ctrl-C to stop)
+echo 0 > events/kprobes/enable                                  # disable the events again
+echo > kprobe_events                                            # delete all dynamic kprobe events
 ```
 
-Debug options: **KASAN** (`CONFIG_KASAN`: out-of-bounds and use-after-free), **kmemleak** (`CONFIG_DEBUG_KMEMLEAK`, then `cat /sys/kernel/debug/kmemleak`), `slub_debug=FZPU` boot parameter (red zones, poisoning, owner tracking).
+Same idea with eBPF, plus `trace_marker`:
+
+```bash
+sudo bpftrace -e 'kprobe:kernel_clone { printf("%s %d\n", comm, pid); }'        # print every fork/clone caller
+sudo bpftrace -e 'kretprobe:do_sys_openat2 { @ret[retval < 0] = count(); }'     # count failed vs successful opens
+echo "hello from user space" | sudo tee /sys/kernel/tracing/trace_marker        # write a marker into the ftrace buffer
+sudo cat /sys/kernel/tracing/trace | grep tracing_mark_write                    # find it in the trace
+sudo trace-cmd record -e sched_switch -e ftrace:print sleep 1                   # record scheduler events plus markers
+sudo cat /sys/kernel/debug/kprobes/list                                         # probes currently registered ([OPTIMIZED], [FTRACE] flags)
+```
 
 ### Pitfalls
 
-- `GFP_KERNEL` (or `vmalloc()`) in atomic context: "BUG: sleeping function called from invalid context".
-- Forgetting to check for `NULL`, or freeing on only some error paths (use the `goto` unwind pattern).
-- Mismatched free: `vfree()` for `vmalloc`, `kvfree()` for `kvmalloc`, `kmem_cache_free()` for caches, and the **same order** for `__free_pages()`.
-- `kmalloc(n * size)`: the multiplication can overflow. Use `kmalloc_array()` / `kcalloc()` / `array_size()`.
-- `virt_to_phys()` on vmalloc or stack memory: wrong address. DMA from such buffers corrupts memory. Use the DMA API.
-- Large `kmalloc()` (high order) after long uptime: may fail from fragmentation even with plenty of free memory. Use `kvmalloc()`.
-- Leaks: kernel memory is never freed at process exit. A leak in a module persists until reboot.
-
-### Corrections to raw notes
-
-| Raw notes said | Correct |
-| -------------- | ------- |
-| 16K = "default on Apple/Android 15+" | Apple silicon uses 16K. Android 15 *supports* 16K devices; 4K is still the common default (see §11). |
-| "VM_AREA: virtually contiguous allocation of physical pages" | A VMA is a range of *user* virtual addresses (§3). Kernel `vmalloc()` areas are a different thing (`struct vm_struct`, `/proc/vmallocinfo`). |
-| Physical contiguity: "you don't normally care" | True for virtual users. But `kmalloc()` *is* physically contiguous, and DMA buffers must be allocated with the DMA API. |
+- **Sleeping in a handler** (`kmalloc(GFP_KERNEL)`, `mutex_lock()`, `copy_from_user()`): "scheduling while atomic" or a deadlock.
+- **Forgetting `unregister_kprobe()`** in `module_exit`: the breakpoint stays and jumps into freed module memory, so the next hit crashes the kernel.
+- **Probing a hot path** (`schedule`, `kmalloc`) with `pr_info()` floods the log and slows the machine. Use rate-limiting, counters, or bpftrace maps.
+- **Relying on function names/arguments:** kprobes attach to internal, unstable functions. They can be renamed, inlined or change signature between kernel versions (e.g. `_do_fork` became `kernel_clone` in 5.10). Prefer stable **tracepoints** where one exists.
+- Leaving `kprobe_events` defined after an experiment: clear them with `echo > kprobe_events`.
 
 ### Revision questions
 
-1. Which GFP flag do you use in an interrupt handler, and why not `GFP_KERNEL`?
-2. When would you choose `vmalloc()` over `kmalloc()`, and what are its costs?
-3. Why can `kmalloc(64 KiB)` fail while `/proc/meminfo` shows gigabytes free?
-4. What does `kmalloc_obj()` improve over `kmalloc(sizeof(...))`?
+1. How does a kprobe get control at the probed address on x86, and what makes an "optimised" kprobe cheaper?
+2. What restrictions apply to code in a kprobe `pre_handler`, and why?
+3. How does Android atrace get app events onto the same timeline as scheduler events?
+4. Why might a kprobe-based tool break after a kernel upgrade, and what is the more stable alternative?
+5. What is the difference between the `function` and `function_graph` tracers, and why is function tracing cheap when disabled?
+6. Why is `strace` slow, and why can `strace -p` fail on Ubuntu even for your own process?
+7. How is a uprobe placed, and why does probing `malloc` in libc affect every process unless you filter?
 
 <details>
 <summary>Answers</summary>
 
-1. `GFP_ATOMIC`. `GFP_KERNEL` may sleep to reclaim memory, and sleeping in interrupt context is illegal (there is no task to put to sleep).
-2. For large buffers that only the CPU accesses, where physical contiguity is impossible or unnecessary. Costs: slower (page-table setup and TLB pressure), may sleep, not usable for DMA, `virt_to_phys()` is invalid.
-3. 64 KiB from kmalloc needs an order-4 block (16 contiguous pages). After fragmentation, free memory may exist only as scattered single pages (`/proc/buddyinfo`). Use `kvmalloc()`.
-4. The size comes from the pointer's type, so you cannot pass the wrong `sizeof`. The allocator can also see the type, which enables future hardening and alignment choices (7.0+).
+1. The first byte of the instruction is replaced with `int3`. The trap handler runs `pre_handler`, single-steps the saved original instruction, then resumes. An optimised probe replaces the instruction with a `jmp` to a detour buffer, which avoids the trap.
+2. It runs in atomic context (from a trap, with preemption disabled), so it must not sleep or take sleeping locks, and it should be short.
+3. The framework writes `B|pid|name` / `E|pid` strings to `/sys/kernel/tracing/trace_marker`. These land in the ftrace ring buffer alongside kernel events, with the same clock.
+4. kprobes hook internal functions, which can be renamed, inlined or change arguments. Static tracepoints (and `raw_tp` in BPF) are the more stable interface.
+5. `function` records each function entry; `function_graph` also hooks the exit, giving a call tree with durations. With dynamic ftrace, the `__fentry__` call sites are patched to NOPs until tracing is enabled.
+6. ptrace stops the tracee at every syscall entry and exit, costing context switches. Yama `ptrace_scope = 1` only allows tracing your own descendants, so attaching to an unrelated process needs `sudo` / `CAP_SYS_PTRACE`.
+7. The kernel writes a breakpoint into the file's page-cache page at the symbol's offset. Every process mapping libc shares that (inode, offset), so all of them trap into the handler.
 
 </details>
 
 ### Source pointers
 
-- `include/linux/slab.h`, `mm/slub.c`, `mm/slab_common.c` (kmalloc size classes), `mm/page_alloc.c` (buddy allocator), `mm/vmalloc.c`, `include/linux/gfp_types.h` (flag definitions and docs)
-- `Documentation/core-api/memory-allocation.rst` (which allocator and flags to use), `Documentation/core-api/dma-api.rst`, `Documentation/mm/slub.rst`, `Documentation/dev-tools/kasan.rst`, `Documentation/dev-tools/kmemleak.rst`
-
----
-
-## 16. Heterogeneous CPUs: big.LITTLE and Frequency Governors
-
-> **Remember**
->
-> - **big.LITTLE** (ARM; Intel calls it P-cores/E-cores) mixes fast, power-hungry cores with slow, efficient ones. Some SoCs have three tiers (big/medium/little).
-> - A higher frequency is not "better" by itself: power grows roughly with *f × V²*, so heat and battery drain rise faster than speed.
-> - **cpufreq governors** set each core's frequency dynamically. The scheduler's **EAS** (Energy Aware Scheduling) chooses *which kind* of core runs each task.
-
-### How it works
-
-```text
-             scheduler (EAS: picks a CPU using the energy model + task utilisation)
-                    │
-     ┌──────────────┼──────────────┐
-  little cores    medium         big cores        each cluster = one cpufreq "policy"
-  (A5x, in-order) (A7x)          (X-series)       sharing a clock
-     │               │               │
-  cpufreq governor per policy: schedutil reads the scheduler's utilisation → requests OPP
-     │
-  cpufreq driver (cppc, acpi-cpufreq, scmi, qcom-cpufreq-hw...) → sets the frequency/voltage pair (OPP)
-```
-
-| Governor | Behaviour |
-| -------- | --------- |
-| `schedutil` | Default on most modern kernels: frequency follows the scheduler's per-CPU utilisation (PELT) |
-| `performance` | Always the maximum frequency |
-| `powersave` | Always the minimum (with `intel_pstate` active mode, a different "balanced" algorithm) |
-| `ondemand` / `conservative` | Older load-sampling governors: jump / step up when busy |
-| `userspace` | User space writes the frequency |
-
-- **CPU capacity:** the kernel gives each CPU a relative capacity (`/sys/devices/system/cpu/cpu*/cpu_capacity`, 1024 = biggest), from Device Tree or ACPI. Unequal capacities enable **EAS** (`CONFIG_ENERGY_MODEL`, ARM64 mainly).
-- **Idle states (cpuidle)** are the other half of power management: governors `menu` / `teo` pick how deeply an idle core sleeps.
-- x86 hybrid CPUs (Alder Lake+) rely on hardware hints (**ITMT**, Thread Director) plus `intel_pstate`.
-
-### Commands / debugging
-
-```sh
-cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor             # active governor for CPU 0's policy
-cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors  # governors you can choose
-grep . /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq          # current frequency of every CPU (kHz)
-grep . /sys/devices/system/cpu/cpu*/cpu_capacity 2>/dev/null          # relative capacity (big = 1024), on ARM
-lscpu -e                                                              # per-CPU max/min MHz: reveals big vs little
-cpupower frequency-info                                               # driver, limits, governor (linux-tools)
-echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor   # (root) pin to max speed
-```
-
-The test box is a KVM guest, so it usually has **no cpufreq** directory (the host controls frequency). Try these on the Pi 5 (4 × Cortex-A76, all the same, so not big.LITTLE, but it has cpufreq; Raspberry Pi OS selects `ondemand`, checked on 6.12).
-
-### Revision questions
-
-1. Why might a phone run a background sync on a little core at low frequency even though a big core would finish sooner?
-2. What does `schedutil` use to choose a frequency?
-
-<details>
-<summary>Answers</summary>
-
-1. Energy per task: dynamic power grows roughly with *f·V²*. The little core at low voltage often uses less total energy, even though it takes longer, and the task is not latency-sensitive (race-to-idle does not always win).
-2. The scheduler's own utilisation signal (PELT) for the CPUs in the policy, scaled to the maximum frequency with some headroom. It updates on scheduler events, not by periodic sampling.
-
-</details>
-
-### Source pointers
-
-- `drivers/cpufreq/` (`cpufreq.c`, drivers), `kernel/sched/cpufreq_schedutil.c`, `kernel/sched/fair.c` (EAS: `find_energy_efficient_cpu()`), `drivers/cpuidle/`
-- `Documentation/admin-guide/pm/cpufreq.rst`, `Documentation/scheduler/sched-energy.rst`, `Documentation/scheduler/sched-capacity.rst`
+- `kernel/kprobes.c`, `arch/x86/kernel/kprobes/` (`core.c`, `opt.c`), `arch/arm64/kernel/probes/`
+- `kernel/trace/trace_kprobe.c`, `kernel/trace/trace.c` (`tracing_mark_write()`), `kernel/trace/ftrace.c`, `kernel/trace/trace_functions_graph.c`
+- `kernel/events/uprobes.c`, `arch/x86/kernel/uprobes.c`, `kernel/trace/trace_uprobe.c`, `Documentation/trace/uprobetracer.rst`
+- `kernel/ptrace.c`, `arch/x86/kernel/ptrace.c`, `security/yama/yama_lsm.c`
+- `samples/kprobes/kprobe_example.c`, `samples/kprobes/kretprobe_example.c`
+- `Documentation/trace/kprobes.rst`, `Documentation/trace/kprobetrace.rst`, `Documentation/trace/ftrace.rst`, `Documentation/admin-guide/LSM/Yama.rst`, `man 2 ptrace`
 
 ---
 
 ## Labs & Exercises
 
-*None yet.*
+Exercise sheets from the course (`ex1`–`ex4`). Each row lists the sections to revise first and the API traps for 6.x kernels.
+
+| Sheet | Tasks | Revise | 6.x notes and traps |
+| ----- | ----- | ------ | ------------------- |
+| **ex1** | Hello/goodbye module; inspect `MODULE_*` with `modinfo`/`objdump`/`readelf`; `int` and string parameters (`int_param`, `filename`); expose `int_param` in sysfs as `rw-r--r--` (`0644`); detect a parameter change | §5, §6 (module parameters) | A string parameter is `charp`, not `char`. To *detect* a change, use `module_param_cb()` with a `kernel_param_ops` `.set` callback; a plain `module_param()` gives no notification. |
+| **ex2** | Symbol resolver from a temporary kprobe; tracepoints on fork/exec/exit via `for_each_kernel_tracepoint()`; `bpftrace -l`/`-v` scripts for fork/exec/exit and `open`; a `bpftrace` network monitor on socket connects | §17 | `kallsyms_lookup_name()` has not been exported since 5.7: that is why the kprobe trick (`register_kprobe()`, read `kp.addr`, `unregister_kprobe()`) is used. Tracepoint names: `sched_process_fork`, `sched_process_exec`, `sched_process_exit`. |
+| **ex3** | Notifiers (`inetaddr_chain`, `register_netdevice_notifier()`), and what happens if you never unregister; a `/proc` file you can read and write; a 60-second timer, and unloading without deleting it; per-CPU variables (`DEFINE_PER_CPU`, `per_cpu()`) | §6, §14, §16 | procfs uses `struct proc_ops` (5.6+), not `file_operations`. Timers: `timer_setup()` + `mod_timer()`; delete with `timer_delete_sync()` (`del_timer_sync()` is a deprecated wrapper in 6.12). A forgotten unregister/delete leaves a pointer into freed module code: an oops on the next event. |
+| **ex4** | Add a syscall `sys_backdoor` that makes its caller root, rebuild and test the kernel; extend it to all processes; `/proc/proclist` listing all PIDs (`seq_file`); a proc writer that sets a task to `TASK_UNINTERRUPTIBLE` | §4, §7, §9 | Define syscalls with `SYSCALL_DEFINE0()` and add them to `arch/x86/entry/syscalls/syscall_64.tbl`. Change credentials with `prepare_creds()` / `commit_creds()`, never by writing `cred` fields. Boot the rebuilt kernel with `vng` (test box), not on the Pi. |
 
 ---
 
 ## Quick Reference
 
-### Boot and images (§1)
+### Top gotchas
+
+- Installed ≠ running.
+- Never hard-code a 4096 page size.
+- Kprobe handlers must not sleep and must be unregistered in `module_exit`.
+- Build modules against `uname -r`.
+- KASLR means `System.map` ≠ runtime addresses.
+- Distro/BSP kernels ≠ mainline of the same version.
+- Never dereference `__user` pointers.
+- Always stop your kthreads in `module_exit`.
+- `modules_disabled=1` cannot be undone without a reboot.
+- Never sleep under a spinlock or in an RCU read section.
+- `oom_score_adj = -1000` on a leaky process makes the kernel kill everything else.
+- Take an IRQ-shared lock with `spin_lock_irqsave()`.
+- `GFP_KERNEL` and `vmalloc()` may sleep.
+- `vmalloc` memory is not physically contiguous.
+
+### Kernel architecture (§1)
+
+| Item | Meaning |
+| ---- | ------- |
+| Monolithic (Linux) | All services in one kernel address space; direct calls; fast, no isolation |
+| x86_64 split (4-level) | 2^47 (128 TiB) user + 2^47 kernel; the rest of 2^64 is a non-canonical hole (#GP) |
+| Microkernel (QNX, seL4, MINIX 3) | IPC + sched + basic mm in kernel; servers in user space |
+| Hybrid (NT, XNU) | Microkernel structure, mostly monolithic in practice |
+| FUSE / UIO / VFIO / eBPF | Ways Linux moves or sandboxes work outside core kernel code |
+
+### Kernel origins (§2)
+
+| Item | Meaning |
+| ---- | ------- |
+| mainline → stable/LTS → distro / BSP | Where every kernel comes from |
+| GKI + KMI | Android: one core kernel + vendor modules against a stable interface |
+| GPL-2.0 | Distributing a modified kernel → must provide the source |
+
+### Boot and images (§3)
 
 | Item | Meaning |
 | ---- | ------- |
@@ -3080,35 +3239,7 @@ The test box is a KVM guest, so it usually has **no cpufreq** directory (the hos
 | `CONFIG_KERNEL_{XZ,LZ4,ZSTD}` | Smallest / fastest / best trade-off (Ubuntu default) |
 | `journalctl -k -b \| grep Memory:` | Kernel image size in RAM |
 
-### Kernel origins (§2)
-
-| Item | Meaning |
-| ---- | ------- |
-| mainline → stable/LTS → distro / BSP | Where every kernel comes from |
-| GKI + KMI | Android: one core kernel + vendor modules against a stable interface |
-| GPL-2.0 | Distributing a modified kernel → must provide the source |
-
-### Memory layout and vDSO (§3, §4)
-
-| Item | Meaning |
-| ---- | ------- |
-| x86_64 user / kernel (4-level) | `0x0`–`0x7fff_ffff_ffff` / from `0xffff_8000_0000_0000` |
-| `copy_{from,to}_user()` | Only safe way to touch user memory; may sleep |
-| `/proc/<pid>/maps` | range, perms (`p`/`s`), offset, dev, inode, path |
-| `/proc/<pid>/smaps` / `smaps_rollup` | Per-VMA (or summed) `Rss`, `Pss`, `Shared_*`/`Private_*`, `Swap`, `VmFlags`; slow (walks page tables) |
-| RSS vs PSS vs USS | RSS counts shared pages fully; PSS splits them by sharers; USS = private only |
-| `vm_area_struct` (VMA) | One `maps` line; in `mm->mm_mt` maple tree (6.1+); walk with `for_each_vma()` under `mmap_read_lock()` |
-| Maple tree (`<linux/maple_tree.h>`) | RCU-safe range B-tree, 16 slots/node (64-bit); `mtree_store_range()`/`mtree_load()` or `mas_*` with `MA_STATE()` |
-| `find_vma()` vs `vma_lookup()` | `find_vma()` = first VMA ending above addr (may not contain it); `vma_lookup()` = containing VMA or `NULL` |
-| `/proc/meminfo` | Kernel usage: `Slab`, `KernelStack`, `PageTables`, `VmallocUsed` |
-| `vm.mmap_min_addr` | Lowest mappable address (65536): NULL deref always faults |
-| `[vdso]` / `[vvar]` | Kernel-supplied library + data page: syscall-free `clock_gettime` |
-| `[vsyscall]` `0xffffffffff600000` | Legacy x86_64 fixed page; emulated |
-| x86_64 syscall entry | `syscall` instruction, number in `rax`; `__NR_read` = 0 (i386: 3) |
-| Page-table root | x86_64 `CR3` (per process); ARM64 `TTBR0_EL1` (user) / `TTBR1_EL1` (kernel) |
-| initramfs → real root | `/init` loads drivers, mounts root, `switch_root` (legacy initrd: `pivot_root`) |
-
-### Processes and kernel threads (§5)
+### Processes and kernel threads (§4)
 
 | Item | Meaning |
 | ---- | ------- |
@@ -3118,7 +3249,7 @@ The test box is a KVM guest, so it usually has **no cpufreq** directory (the hos
 | `/proc/<pid>/task/<tid>` | Per-thread entries |
 | `kthread_run()` / `kthread_should_stop()` / `kthread_stop()` | Kernel thread lifecycle |
 
-### Tasks (§5)
+### Tasks (§4)
 
 | Item | Meaning |
 | ---- | ------- |
@@ -3129,7 +3260,7 @@ The test box is a KVM guest, so it usually has **no cpufreq** directory (the hos
 | `for_each_process(p)` / `for_each_thread(p, t)` | Walk all processes / one process's threads under `rcu_read_lock()` |
 | `ps -eLf`, `/proc/<pid>/task/`, `Tgid:` in `/proc/<pid>/status` | See threads and their IDs |
 
-### Headers and modules (§6, §7)
+### Headers and modules (§5, §6)
 
 | Item | Meaning |
 | ---- | ------- |
@@ -3152,7 +3283,7 @@ The test box is a KVM guest, so it usually has **no cpufreq** directory (the hos
 | `echo 1 \| sudo tee /proc/sys/kernel/modules_disabled` | Block module load **and** unload until reboot (one-way) |
 | sched_ext (`CONFIG_SCHED_CLASS_EXT`, 6.12+) | Custom scheduling via BPF, not modules |
 
-### Capabilities (§8)
+### Capabilities (§7)
 
 | Item | Meaning |
 | ---- | ------- |
@@ -3161,17 +3292,101 @@ The test box is a KVM guest, so it usually has **no cpufreq** directory (the hos
 | `capable(CAP_X)` / `ns_capable()` | Kernel-side checks; return `-EPERM` if missing |
 | `CAP_SYS_MODULE` (16) | Load/unload modules |
 
-### Kernel architecture (§9)
+### Address space, vDSO and process memory (§8–§10)
 
 | Item | Meaning |
 | ---- | ------- |
-| Monolithic (Linux) | All services in one kernel address space; direct calls; fast, no isolation |
-| x86_64 split (4-level) | 2^47 (128 TiB) user + 2^47 kernel; the rest of 2^64 is a non-canonical hole (#GP) |
-| Microkernel (QNX, seL4, MINIX 3) | IPC + sched + basic mm in kernel; servers in user space |
-| Hybrid (NT, XNU) | Microkernel structure, mostly monolithic in practice |
-| FUSE / UIO / VFIO / eBPF | Ways Linux moves or sandboxes work outside core kernel code |
+| x86_64 user / kernel (4-level) | `0x0`–`0x7fff_ffff_ffff` / from `0xffff_8000_0000_0000` |
+| `copy_{from,to}_user()` | Only safe way to touch user memory; may sleep |
+| `/proc/<pid>/maps` | range, perms (`p`/`s`), offset, dev, inode, path |
+| `/proc/<pid>/smaps` / `smaps_rollup` | Per-VMA (or summed) `Rss`, `Pss`, `Shared_*`/`Private_*`, `Swap`, `VmFlags`; slow (walks page tables) |
+| RSS vs PSS vs USS | RSS counts shared pages fully; PSS splits them by sharers; USS = private only |
+| `vm_area_struct` (VMA) | One `maps` line; in `mm->mm_mt` maple tree (6.1+); walk with `for_each_vma()` under `mmap_read_lock()` |
+| Maple tree (`<linux/maple_tree.h>`) | RCU-safe range B-tree, 16 slots/node (64-bit); `mtree_store_range()`/`mtree_load()` or `mas_*` with `MA_STATE()` |
+| `find_vma()` vs `vma_lookup()` | `find_vma()` = first VMA ending above addr (may not contain it); `vma_lookup()` = containing VMA or `NULL` |
+| `/proc/meminfo` | Kernel usage: `Slab`, `KernelStack`, `PageTables`, `VmallocUsed` |
+| `vm.mmap_min_addr` | Lowest mappable address (65536): NULL deref always faults |
+| `[vdso]` / `[vvar]` | Kernel-supplied library + data page: syscall-free `clock_gettime` |
+| `[vsyscall]` `0xffffffffff600000` | Legacy x86_64 fixed page; emulated |
+| x86_64 syscall entry | `syscall` instruction, number in `rax`; `__NR_read` = 0 (i386: 3) |
+| Page-table root | x86_64 `CR3` (per process); ARM64 `TTBR0_EL1` (user) / `TTBR1_EL1` (kernel) |
+| initramfs → real root | `/init` loads drivers, mounts root, `switch_root` (legacy initrd: `pivot_root`) |
 
-### Tracing (§10)
+### Pages and page tables (§11)
+
+| Item | Meaning |
+| ---- | ------- |
+| `PAGE_SIZE` / `PAGE_SHIFT` / `PAGE_MASK` | 4096 / 12 / `~0xfff` on x86_64; `PAGE_SIZE = 1UL << PAGE_SHIFT`; page sizes are always powers of two (split address by shift/mask) |
+| `getconf PAGESIZE` / `sysconf(_SC_PAGESIZE)` | Page size at run time (never hard-code 4096) |
+| x86_64 page sizes | 4 KiB base; 2 MiB / 1 GiB huge |
+| ARM64 granule | `TCR_EL1.TG0/TG1`; 4K/16K/64K chosen by `CONFIG_ARM64_*_PAGES` at build |
+| `alloc_pages(gfp, order)` | 2^order contiguous pages; `get_order(size)` to compute the order |
+| `/proc/meminfo` `Hugepagesize`, `/sys/kernel/mm/transparent_hugepage/enabled` | Huge page size and THP mode |
+
+### Memory allocation (§12)
+
+| Item | Meaning |
+| ---- | ------- |
+| `kmalloc(size, gfp)` / `kzalloc()` / `kfree()` | Slab, physically contiguous; check `NULL` |
+| `kmalloc_obj(*p, gfp)` | 7.0+ type-aware `kmalloc(sizeof(*p), gfp)`; not in 6.x |
+| `GFP_KERNEL` / `GFP_ATOMIC` | May sleep (process ctx) / never sleeps (IRQ, spinlock) |
+| `vmalloc()` / `vfree()` | Large, virtually contiguous only; may sleep; no DMA |
+| `kvmalloc()` / `kvfree()` | kmalloc with vmalloc fallback |
+| `kmem_cache_create()` / `KMEM_CACHE()` | Dedicated cache for many same-size objects |
+| `alloc_pages(gfp, order)` | 2^order contiguous pages (buddy); free with the same order |
+| `dma_alloc_coherent()` | Buffers hardware can DMA to |
+| `/proc/buddyinfo`, `slabtop`, `/proc/vmallocinfo` | Fragmentation, slab usage, vmalloc areas |
+
+### OOM killer (§13)
+
+| Item | Meaning |
+| ---- | ------- |
+| `/proc/<pid>/oom_score` | Read-only badness; 6.x scale `(1000 + badness·1000/total)·2/3`, idle ≈ 666, 0 = not eligible |
+| `/proc/<pid>/oom_score_adj` | −1000 (never kill) … +1000 (kill first); lowering needs `CAP_SYS_RESOURCE`; inherited on `fork()` |
+| `/proc/<pid>/oom_adj` | **Deprecated** −17 (`OOM_DISABLE`) … +15; mapped to `oom_score_adj` |
+| Badness | RSS + swap entries + page-table pages + `adj × total/1000`; PID 1 and kthreads exempt |
+| `vm.overcommit_memory` / `vm.panic_on_oom` | 0/1/2 overcommit policy; panic instead of kill |
+| `choom`, `OOMScoreAdjust=` | Set the adj from the shell / a systemd unit |
+| `dmesg \| grep -i oom` | Find "Out of memory: Killed process ..." |
+| `memory.oom.group` (cgroup v2) | Kill the whole cgroup together |
+
+### Synchronisation (§14)
+
+| Item | Meaning |
+| ---- | ------- |
+| `spin_lock()` / `_bh()` / `_irqsave(&l, flags)` | Process-only / + softirq users / + hardirq users; never sleep while held |
+| `raw_spinlock_t` | Always spins, even on `PREEMPT_RT` (where `spinlock_t` sleeps) |
+| `read_lock()` / `write_lock()` | `rwlock_t`: many readers or one writer; prefer RCU or seqlock |
+| `rcu_read_lock()` → `rcu_dereference()` → `rcu_read_unlock()` | Lock-free reader; no sleeping inside |
+| `rcu_assign_pointer()` + `synchronize_rcu()` / `kfree_rcu()` | Publish new version; free old after a grace period |
+| `rcu_barrier()` | In `module_exit`: wait for pending `call_rcu()`/`kfree_rcu()` callbacks |
+| `CONFIG_PROVE_LOCKING`, `CONFIG_DEBUG_ATOMIC_SLEEP`, `perf lock` | Lockdep, sleep-in-atomic checks, contention analysis |
+| `mutex` vs `semaphore` vs `spinlock` | Sleeps, one owner / sleeps, counting / spins, no sleeping, any context |
+
+### CPUs and frequency (§15)
+
+| Item | Meaning |
+| ---- | ------- |
+| big.LITTLE / P+E cores | Mixed fast and efficient cores; EAS places tasks |
+| `scaling_governor` | `schedutil` (default), `performance`, `powersave`, `ondemand`, `userspace` |
+| `/sys/devices/system/cpu/cpu*/cpufreq/`, `cpu_capacity` | Per-CPU frequency controls; relative capacity (1024 = biggest) |
+
+### Devices (§16)
+
+| Item | Meaning |
+| ---- | ------- |
+| `c` / `b` in `ls -l /dev`; `1, 3` | Char / block node; major, minor |
+| `/proc/devices`, `lsblk`, `/sys/class/net` | Registered majors; block devices; network interfaces |
+| `alloc_chrdev_region()` → `cdev_add()` → `class_create()` → `device_create()` | Classic char device setup (undo in reverse) |
+| `misc_register(&miscdev)` | Simplest char device (major 10, dynamic minor) |
+| `blk_mq_alloc_disk()` + `add_disk()` | Block device (6.x) |
+| `dmsetup ls` / `dmsetup table`; `/dev/mapper/` | Device mapper: virtual block devices (LVM, dm-crypt, dm-verity) |
+| `alloc_etherdev()` + `register_netdev()`; `ndo_start_xmit()` is atomic | Network device |
+| `sync` / `fsync()` / `fdatasync()` / `syncfs()` | Flush dirty page cache to disk: all / one file / one file's data / one filesystem. On Linux, `sync` waits, so one is enough. |
+| `grep -E 'Dirty|Writeback' /proc/meminfo` | Data still waiting for writeback |
+| `sync; echo 3 > /proc/sys/vm/drop_caches` | Flush, then drop clean caches (cold-cache benchmarks) |
+
+### Tracing (§17)
 
 | Item | Meaning |
 | ---- | ------- |
@@ -3192,83 +3407,6 @@ The test box is a KVM guest, so it usually has **no cpufreq** directory (the hos
 | `kernel.yama.ptrace_scope` | 0 classic, 1 descendants only (Ubuntu), 2 `CAP_SYS_PTRACE` only, 3 disabled |
 | `perf trace` | Low-overhead strace alternative |
 | `process_vm_readv()` / `process_vm_writev()` | Cross-memory attach (3.2+): one-copy read/write of another process's memory; ptrace-attach permission |
-
-
-### Pages (§11)
-
-| Item | Meaning |
-| ---- | ------- |
-| `PAGE_SIZE` / `PAGE_SHIFT` / `PAGE_MASK` | 4096 / 12 / `~0xfff` on x86_64; `PAGE_SIZE = 1UL << PAGE_SHIFT`; page sizes are always powers of two (split address by shift/mask) |
-| `getconf PAGESIZE` / `sysconf(_SC_PAGESIZE)` | Page size at run time (never hard-code 4096) |
-| x86_64 page sizes | 4 KiB base; 2 MiB / 1 GiB huge |
-| ARM64 granule | `TCR_EL1.TG0/TG1`; 4K/16K/64K chosen by `CONFIG_ARM64_*_PAGES` at build |
-| `alloc_pages(gfp, order)` | 2^order contiguous pages; `get_order(size)` to compute the order |
-| `/proc/meminfo` `Hugepagesize`, `/sys/kernel/mm/transparent_hugepage/enabled` | Huge page size and THP mode |
-
-### Synchronisation (§12)
-
-| Item | Meaning |
-| ---- | ------- |
-| `spin_lock()` / `_bh()` / `_irqsave(&l, flags)` | Process-only / + softirq users / + hardirq users; never sleep while held |
-| `raw_spinlock_t` | Always spins, even on `PREEMPT_RT` (where `spinlock_t` sleeps) |
-| `read_lock()` / `write_lock()` | `rwlock_t`: many readers or one writer; prefer RCU or seqlock |
-| `rcu_read_lock()` → `rcu_dereference()` → `rcu_read_unlock()` | Lock-free reader; no sleeping inside |
-| `rcu_assign_pointer()` + `synchronize_rcu()` / `kfree_rcu()` | Publish new version; free old after a grace period |
-| `rcu_barrier()` | In `module_exit`: wait for pending `call_rcu()`/`kfree_rcu()` callbacks |
-| `CONFIG_PROVE_LOCKING`, `CONFIG_DEBUG_ATOMIC_SLEEP`, `perf lock` | Lockdep, sleep-in-atomic checks, contention analysis |
-| `mutex` vs `semaphore` vs `spinlock` | Sleeps, one owner / sleeps, counting / spins, no sleeping, any context |
-
-### Devices (§13)
-
-| Item | Meaning |
-| ---- | ------- |
-| `c` / `b` in `ls -l /dev`; `1, 3` | Char / block node; major, minor |
-| `/proc/devices`, `lsblk`, `/sys/class/net` | Registered majors; block devices; network interfaces |
-| `alloc_chrdev_region()` → `cdev_add()` → `class_create()` → `device_create()` | Classic char device setup (undo in reverse) |
-| `misc_register(&miscdev)` | Simplest char device (major 10, dynamic minor) |
-| `blk_mq_alloc_disk()` + `add_disk()` | Block device (6.x) |
-| `dmsetup ls` / `dmsetup table`; `/dev/mapper/` | Device mapper: virtual block devices (LVM, dm-crypt, dm-verity) |
-| `alloc_etherdev()` + `register_netdev()`; `ndo_start_xmit()` is atomic | Network device |
-| `sync` / `fsync()` / `fdatasync()` / `syncfs()` | Flush dirty page cache to disk: all / one file / one file's data / one filesystem. On Linux, `sync` waits, so one is enough. |
-| `grep -E 'Dirty|Writeback' /proc/meminfo` | Data still waiting for writeback |
-| `sync; echo 3 > /proc/sys/vm/drop_caches` | Flush, then drop clean caches (cold-cache benchmarks) |
-
-### OOM killer (§14)
-
-| Item | Meaning |
-| ---- | ------- |
-| `/proc/<pid>/oom_score` | Read-only badness; 6.x scale `(1000 + badness·1000/total)·2/3`, idle ≈ 666, 0 = not eligible |
-| `/proc/<pid>/oom_score_adj` | −1000 (never kill) … +1000 (kill first); lowering needs `CAP_SYS_RESOURCE`; inherited on `fork()` |
-| `/proc/<pid>/oom_adj` | **Deprecated** −17 (`OOM_DISABLE`) … +15; mapped to `oom_score_adj` |
-| Badness | RSS + swap entries + page-table pages + `adj × total/1000`; PID 1 and kthreads exempt |
-| `vm.overcommit_memory` / `vm.panic_on_oom` | 0/1/2 overcommit policy; panic instead of kill |
-| `choom`, `OOMScoreAdjust=` | Set the adj from the shell / a systemd unit |
-| `dmesg \| grep -i oom` | Find "Out of memory: Killed process ..." |
-| `memory.oom.group` (cgroup v2) | Kill the whole cgroup together |
-
-### Memory allocation (§15)
-
-| Item | Meaning |
-| ---- | ------- |
-| `kmalloc(size, gfp)` / `kzalloc()` / `kfree()` | Slab, physically contiguous; check `NULL` |
-| `kmalloc_obj(*p, gfp)` | 7.0+ type-aware `kmalloc(sizeof(*p), gfp)`; not in 6.x |
-| `GFP_KERNEL` / `GFP_ATOMIC` | May sleep (process ctx) / never sleeps (IRQ, spinlock) |
-| `vmalloc()` / `vfree()` | Large, virtually contiguous only; may sleep; no DMA |
-| `kvmalloc()` / `kvfree()` | kmalloc with vmalloc fallback |
-| `kmem_cache_create()` / `KMEM_CACHE()` | Dedicated cache for many same-size objects |
-| `alloc_pages(gfp, order)` | 2^order contiguous pages (buddy); free with the same order |
-| `dma_alloc_coherent()` | Buffers hardware can DMA to |
-| `/proc/buddyinfo`, `slabtop`, `/proc/vmallocinfo` | Fragmentation, slab usage, vmalloc areas |
-
-### CPUs and frequency (§16)
-
-| Item | Meaning |
-| ---- | ------- |
-| big.LITTLE / P+E cores | Mixed fast and efficient cores; EAS places tasks |
-| `scaling_governor` | `schedutil` (default), `performance`, `powersave`, `ondemand`, `userspace` |
-| `/sys/devices/system/cpu/cpu*/cpufreq/`, `cpu_capacity` | Per-CPU frequency controls; relative capacity (1024 = biggest) |
-
-**Gotchas:** installed ≠ running; never hard-code a 4096 page size; kprobe handlers must not sleep and must be unregistered in `module_exit`; build modules against `uname -r`; KASLR means `System.map` ≠ runtime addresses; distro/BSP kernels ≠ mainline of the same version; never dereference `__user` pointers; always stop your kthreads in `module_exit`; `modules_disabled=1` cannot be undone without a reboot; never sleep under a spinlock or in an RCU read section; `oom_score_adj = -1000` on a leaky process makes the kernel kill everything else; take an IRQ-shared lock with `spin_lock_irqsave()`; `GFP_KERNEL` and `vmalloc()` may sleep; `vmalloc` memory is not physically contiguous.
 
 ---
 
@@ -3440,6 +3578,6 @@ The test box is a KVM guest, so it usually has **no cpufreq** directory (the hos
 - Does the course expect us to boot custom kernels via `vng` only, or also install them into `/boot` on the test box?
 - Page size, "AAPL/A12/M1 16k by default": why A12 specifically? Apple used 16K pages on earlier A-series chips too.
 - "Android 15+ 16k page size by default": did the instructor mean 16K is *supported* from Android 15 (and required of apps on Play), or that specific devices ship 16K by default?
-- Synchronisation (§12): raw notes so far are only the heading "Synchronization RCU, RWLocks and Spinlocks". Section 12 is background material; check it against the lecture as notes come in.
-- Devices (§13): raw notes had only "sync; sync". Was this about flushing buffered block-device writes, or something else? (One `sync` is enough on Linux.)
+- Synchronisation (§14): raw notes so far are only the heading "Synchronization RCU, RWLocks and Spinlocks". Section 12 is background material; check it against the lecture as notes come in.
+- Devices (§16): raw notes had only "sync; sync". Was this about flushing buffered block-device writes, or something else? (One `sync` is enough on Linux.)
 - `kmalloc_obj()` (Linux 7.0): which kernel version does the course target, and does its `kmalloc_obj()` take a GFP argument? The test box (6.8) and the `linux-6.12.y` clone do not have it.
