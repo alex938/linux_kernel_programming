@@ -3033,7 +3033,7 @@ cpupower frequency-info                                               # driver, 
 echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor   # (root) pin to max speed
 ```
 
-The test box is a KVM guest, so it usually has **no cpufreq** directory (the host controls frequency). Try these on the Pi 5 (4 × Cortex-A76, all the same, so not big.LITTLE, but it has cpufreq).
+The test box is a KVM guest, so it usually has **no cpufreq** directory (the host controls frequency). Try these on the Pi 5 (4 × Cortex-A76, all the same, so not big.LITTLE, but it has cpufreq; Raspberry Pi OS selects `ondemand`, checked on 6.12).
 
 ### Revision questions
 
